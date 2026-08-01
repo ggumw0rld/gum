@@ -1857,6 +1857,13 @@ function Window.new(config)
     config = config or {}
     local title = config.Title or "Selenix"
     local size = config.Size or UDim2.new(0, 460, 0, 390)
+    -- Optional titlebar icon. Pass an asset id string (e.g. "rbxassetid://123"
+    -- or just the numeric id, both accepted below). Leave nil/"" to omit the
+    -- icon entirely — the title text then shifts left to fill the freed space
+    -- instead of leaving an empty gap where the icon would have been.
+    local icon = config.Icon
+    if type(icon) == "number" then icon = "rbxassetid://" .. tostring(icon) end
+    if icon == "" then icon = nil end
 
     local playerGui = Player:WaitForChild("PlayerGui")
     destroyExisting(playerGui, title)
@@ -1872,6 +1879,7 @@ function Window.new(config)
 
     local self = setmetatable({
         _title = title,
+        _icon = icon,
         _screenGui = screenGui,
         _connMgr = connMgr,
         _theme = theme,
@@ -1930,17 +1938,31 @@ function Window:_buildChrome(title, originalSize)
     Utils.AddCorner(titleBar, UDim.new(0, 12))
     self._titleBar = titleBar
 
-    local titleIcon = Instance.new("ImageLabel")
-    titleIcon.AnchorPoint = Vector2.new(0, 0.5)
-    titleIcon.Position = UDim2.new(0, 5, 0.5, 0)
-    titleIcon.Size = UDim2.new(0, 34, 0, 34)
-    titleIcon.BackgroundTransparency = 1
-    titleIcon.Image = "rbxassetid://18133642729"
-    titleIcon.Parent = titleBar
+    -- Icon is only created when one was provided in CreateWindow's config;
+    -- without it there's nothing reserving that left-hand space, so the
+    -- title label starts further left (15px, matching the titlebar's other
+    -- edge paddings) and claims the width the icon would have used instead
+    -- of leaving a blank gap.
+    local hasIcon = self._icon ~= nil
+    local titleIcon
+    if hasIcon then
+        titleIcon = Instance.new("ImageLabel")
+        titleIcon.AnchorPoint = Vector2.new(0, 0.5)
+        titleIcon.Position = UDim2.new(0, 5, 0.5, 0)
+        titleIcon.Size = UDim2.new(0, 34, 0, 34)
+        titleIcon.BackgroundTransparency = 1
+        titleIcon.Image = self._icon
+        titleIcon.Parent = titleBar
+    end
 
     local titleLabel = Instance.new("TextLabel")
-    titleLabel.Size = UDim2.new(1, -122, 1, 0)
-    titleLabel.Position = UDim2.new(0, 36, 0, 0)
+    if hasIcon then
+        titleLabel.Size = UDim2.new(1, -122, 1, 0)
+        titleLabel.Position = UDim2.new(0, 36, 0, 0)
+    else
+        titleLabel.Size = UDim2.new(1, -101, 1, 0)
+        titleLabel.Position = UDim2.new(0, 15, 0, 0)
+    end
     titleLabel.BackgroundTransparency = 1
     titleLabel.Text = title
     titleLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
