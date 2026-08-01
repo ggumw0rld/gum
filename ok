@@ -334,7 +334,6 @@ function Components.Label(parent, theme, connMgr, opts)
     label.Size = UDim2.new(1, 0, 1, 0)
     label.BackgroundTransparency = 1
     label.Text = opts.Text or ""
-    label.TextColor3 = opts.Muted and Color3.fromRGB(190, 190, 200) or Color3.fromRGB(255, 255, 255)
     label.TextXAlignment = Enum.TextXAlignment.Left
     label.TextYAlignment = Enum.TextYAlignment.Top
     label.Font = opts.Bold and Enum.Font.GothamBold or Enum.Font.Gotham
@@ -344,7 +343,25 @@ function Components.Label(parent, theme, connMgr, opts)
     if opts.Padded ~= false then Utils.AddPadding(label, UDim.new(0, 15)) end
 
     local self = { Instance = holder }
-    function self:ApplyTheme() end -- labels are theme-neutral by design
+    -- Labels sit directly on mainFrame's background (no panel of their own),
+    -- so their contrast-safe color is computed against the live theme.Color
+    -- itself rather than the brightened "panel" background other controls
+    -- use. opts.Muted dims that same contrast-safe color instead of using a
+    -- fixed gray, so muted labels stay readable on both dark and light themes.
+    function self:ApplyTheme(color, accent, isInitial)
+        local textColor = Utils.GetTextColorFor(color, accent)
+        if opts.Muted then
+            textColor = (Utils.GetLuminance(color) > 0.55)
+                and Color3.new(textColor.r * 0.7, textColor.g * 0.7, textColor.b * 0.7)
+                or Color3.new(0.7 + textColor.r * 0.3, 0.7 + textColor.g * 0.3, 0.7 + textColor.b * 0.3)
+        end
+        if isInitial then
+            label.TextColor3 = textColor
+        else
+            TweenService:Create(label, THEME_TWEEN_INFO, { TextColor3 = textColor }):Play()
+        end
+    end
+    theme:Subscribe(function(c, a, initial) self:ApplyTheme(c, a, initial) end)
     return self
 end
 
@@ -2131,25 +2148,16 @@ function Window:_buildChrome(title, originalSize)
     Utils.AddPadding(tabContainer, UDim.new(0, 10), UDim.new(0, 10))
     self._tabContainer = tabContainer
 
-    local tabFadeOverlay = Instance.new("Frame")
+    -- Still used as the horizontal offset new pages slide in from during a
+    -- tab switch (see CreateTab's switchTo) — kept even though the cover
+    -- overlay that used to size itself off of it is gone.
     local SLIDE_OFFSET = 26
-    tabFadeOverlay.Size = UDim2.new(1, -20 + SLIDE_OFFSET * 2, 1, -110)
-    tabFadeOverlay.Position = UDim2.new(0, 10 - SLIDE_OFFSET, 0, 95)
-    tabFadeOverlay.BackgroundTransparency = 1
-    tabFadeOverlay.BorderSizePixel = 0
-    tabFadeOverlay.Active = false
-    tabFadeOverlay.Selectable = false
-    tabFadeOverlay.ZIndex = 5
-    tabFadeOverlay.Parent = mainFrame
-    local tabFadeGradient = Instance.new("UIGradient"); tabFadeGradient.Rotation = 45; tabFadeGradient.Enabled = false; tabFadeGradient.Parent = tabFadeOverlay
-    self._tabFadeOverlay = tabFadeOverlay
     self._slideOffset = SLIDE_OFFSET
 
     self._gradients = {
         { Gradient = mainGradient, Tint = 1 },
         { Gradient = titleGradient, Tint = 0.7 },
         { Gradient = tabContainerGradient, Tint = 0.85 },
-        { Gradient = tabFadeGradient, Tint = 1 },
     }
 
     -- Minimize overlay
@@ -2183,7 +2191,6 @@ function Window:_buildChrome(title, originalSize)
             titleBar.BackgroundColor3 = darkTitle
             tabContainer.BackgroundColor3 = darkTab
             stroke.Color = strokeColor
-            tabFadeOverlay.BackgroundColor3 = color
             titleLabel.TextColor3 = titleTextColor
         else
             local info = THEME_TWEEN_INFO
@@ -2192,7 +2199,6 @@ function Window:_buildChrome(title, originalSize)
             TweenService:Create(titleBar, info, { BackgroundColor3 = darkTitle }):Play()
             TweenService:Create(tabContainer, info, { BackgroundColor3 = darkTab }):Play()
             TweenService:Create(stroke, info, { Color = strokeColor }):Play()
-            TweenService:Create(tabFadeOverlay, info, { BackgroundColor3 = color }):Play()
             TweenService:Create(titleLabel, info, { TextColor3 = titleTextColor }):Play()
         end
 
@@ -2480,22 +2486,16 @@ function Window:CreateTab(name)
         self._activeTabIndex = index
         self:_restyleTabButtons(theme.Color, theme.Accent)
 
-        local cover = Animator.Tween(self._tabFadeOverlay, { BackgroundTransparency = 0 }, 0.2)
-        cover.Completed:Connect(function()
-            self._pages[previousIndex].Visible = false
-            self._pages[previousIndex].Position = PAGE_BASE_POS
+        self._pages[previousIndex].Visible = false
+        self._pages[previousIndex].Position = PAGE_BASE_POS
 
-            local newPage = self._pages[index]
-            newPage.Position = UDim2.new(0, 10 + direction * self._slideOffset, 0, 95)
-            newPage.Visible = true
+        local newPage = self._pages[index]
+        newPage.Position = UDim2.new(0, 10 + direction * self._slideOffset, 0, 95)
+        newPage.Visible = true
 
-            local reveal = Animator.Tween(self._tabFadeOverlay, { BackgroundTransparency = 1 }, 0.25)
-            local slide = Animator.Tween(newPage, { Position = PAGE_BASE_POS }, 0.35)
-            reveal.Completed:Connect(function() switching = false end)
-            reveal:Play()
-            slide:Play()
-        end)
-        cover:Play()
+        local slide = Animator.Tween(newPage, { Position = PAGE_BASE_POS }, 0.35)
+        slide.Completed:Connect(function() switching = false end)
+        slide:Play()
     end
     connMgr:Track(btn.MouseButton1Click:Connect(switchTo))
 
