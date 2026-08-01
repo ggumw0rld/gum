@@ -2160,20 +2160,8 @@ function Window:_buildChrome(title, originalSize)
         { Gradient = tabContainerGradient, Tint = 0.85 },
     }
 
-    -- Minimize overlay
-    local overlay = Instance.new("Frame")
-    overlay.Size = UDim2.new(1, 0, 1, -40)
-    overlay.Position = UDim2.new(0, 0, 0, 40)
-    overlay.BackgroundTransparency = 1
-    overlay.BorderSizePixel = 0
-    overlay.Active = false
-    overlay.Selectable = false
-    overlay.ZIndex = 10
-    overlay.Parent = mainFrame
-    Utils.AddCorner(overlay, UDim.new(0, 12))
-
     self:_setupResize(mainFrame, originalSize)
-    self:_setupMinimize(mainFrame, minimizeBtn, overlay)
+    self:_setupMinimize(mainFrame, minimizeBtn)
 
     -- Theme subscription for chrome pieces. isInitial=true on the first
     -- (synchronous) call snaps every color instantly; every call after that
@@ -2187,7 +2175,6 @@ function Window:_buildChrome(title, originalSize)
 
         if isInitial then
             mainFrame.BackgroundColor3 = color
-            overlay.BackgroundColor3 = color
             titleBar.BackgroundColor3 = darkTitle
             tabContainer.BackgroundColor3 = darkTab
             stroke.Color = strokeColor
@@ -2195,7 +2182,6 @@ function Window:_buildChrome(title, originalSize)
         else
             local info = THEME_TWEEN_INFO
             TweenService:Create(mainFrame, info, { BackgroundColor3 = color }):Play()
-            TweenService:Create(overlay, info, { BackgroundColor3 = color }):Play()
             TweenService:Create(titleBar, info, { BackgroundColor3 = darkTitle }):Play()
             TweenService:Create(tabContainer, info, { BackgroundColor3 = darkTab }):Play()
             TweenService:Create(stroke, info, { Color = strokeColor }):Play()
@@ -2365,7 +2351,7 @@ function Window:_setupResize(mainFrame, originalSize)
     end))
 end
 
-function Window:_setupMinimize(mainFrame, minimizeBtn, overlay)
+function Window:_setupMinimize(mainFrame, minimizeBtn)
     local connMgr = self._connMgr
     self._minimized = false
     self._animating = false
@@ -2377,7 +2363,6 @@ function Window:_setupMinimize(mainFrame, minimizeBtn, overlay)
         if self._minimized then
             minimizeBtn.Text = "▢"
             self._resizeHandle.Visible = false
-            Animator.Tween(overlay, { BackgroundTransparency = 0.05 }, 0.5):Play()
             self._tabContainer.Visible = false
             for _, p in ipairs(self._pages) do p.Visible = false end
             Animator.Tween(mainFrame, { Size = UDim2.new(mainFrame.Size.X.Scale, mainFrame.Size.X.Offset, 0, 40) }, 0.45):Play()
@@ -2389,7 +2374,6 @@ function Window:_setupMinimize(mainFrame, minimizeBtn, overlay)
                 p.Visible = (i == self._activeTabIndex)
                 p.Position = UDim2.new(0, 10, 0, 95)
             end
-            Animator.Tween(overlay, { BackgroundTransparency = 1 }, 0.5):Play()
             self._resizeHandle.Visible = true
         end
         task.delay(0.45, function() self._animating = false end)
