@@ -195,8 +195,8 @@ end
 --                           time MouseLeave fires.
 --   * a Color3             -> "static" mode: fixed base/hover colors, used for
 --                           chrome buttons whose colors never depend on theme.
-function Animator.AddHoverEffect(btn, connMgr, baseColor, hoverColor)
-    Animator.AddThickenStroke(btn, connMgr)
+function Animator.AddHoverEffect(btn, connMgr, baseColor, hoverColor, skipStroke)
+    if not skipStroke then Animator.AddThickenStroke(btn, connMgr) end
     local isDynamic = (type(baseColor) == "function")
     local liveMode = (baseColor == nil)
     local storedBase
@@ -1984,7 +1984,7 @@ function Window:_buildChrome(title, originalSize)
         b.Font = Enum.Font.GothamBold
         b.Parent = titleBar
         Utils.AddCorner(b, UDim.new(0, 6))
-        Animator.AddHoverEffect(b, connMgr, bgColor, hoverColor)
+        Animator.AddHoverEffect(b, connMgr, bgColor, hoverColor, true) -- skipStroke: no hover-outline frame on chrome buttons
         return b
     end
 
@@ -2455,7 +2455,6 @@ function Window:CreateTab(name)
 
     btn.TextColor3 = tabTextColor() -- initial paint, matches the theme active at creation time
 
-    Animator.AddThickenStroke(btn, connMgr)
     connMgr:Track(btn.MouseEnter:Connect(function()
         local hoverBg = Utils.Brighten(tabBaseColor(), 1.2)
         TweenService:Create(btn, TweenInfo.new(0.25, EASE, EASE_OUT), {
