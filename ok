@@ -8,7 +8,7 @@
         Utils      -> color math, corner/padding/stroke helpers, hex <-> Color3
         Animator   -> hover/press stroke effect, generic tween + gradient-lerp helper
         Theme      -> holds the current {Color, Accent}, notifies subscribers on change
-        Window     -> chrome: loading screen, titlebar, drag, resize, minimize, close-confirm
+        Window     -> chrome: loading screen, titlebar, drag, resize, minimize
         Components -> factory functions for each control (Button, Label, Toggle, Slider,
                        Textbox, Dropdown, MultiDropdown, ColorPicker, ThemeGrid, GradientPicker,
                        Notification)
@@ -25,6 +25,9 @@
     and reused instead of copy-pasted three times (the old Dropdown /
     MultiDropdown / ColorPicker collapsible-header logic is now one
     `Components.ExpandableHeader` helper shared by all three).
+
+    The window has no in-UI close button / close-confirm dialog — it is
+    closed programmatically instead, via `Selenix:Destroy()`.
     ============================================================
 ]]
 
@@ -1934,8 +1937,10 @@ TabMeta.__index = TabMeta
 --============================================================
 -- MODULE: Window
 -- Owns the ScreenGui, loading screen, chrome (titlebar/drag/resize/
--- minimize/close-confirm) and the tab strip. Delegates page content
--- to Tab objects, which delegate individual controls to Components.
+-- minimize) and the tab strip. Delegates page content to Tab objects,
+-- which delegate individual controls to Components. There is no in-UI
+-- close button — the window is closed programmatically instead, via
+-- Library:Destroy() (or Window:Destroy() directly).
 --============================================================
 local Window = {}
 Window.__index = Window
@@ -2081,7 +2086,7 @@ function Window:_buildChrome(title, originalSize)
         b.AnchorPoint = Vector2.new(0.5, 0.5)
         b.Position = UDim2.new(1, xOffset + 15, 0, 5 + 15)
         b.BackgroundColor3 = bgColor
-        b.BackgroundTransparency = 1
+        b.BackgroundTransparency = 1 -- fully invisible background; only the glyph shows
         b.Text = text
         b.TextColor3 = Color3.fromRGB(255, 255, 255)
         b.TextSize = 18
@@ -2092,13 +2097,11 @@ function Window:_buildChrome(title, originalSize)
         return b
     end
 
-    -- Using "×" (U+00D7) instead of "✕" (U+2715): the multiplication sign is
-    -- present in virtually every font, while the heavy X glyph renders as a
-    -- blank box on devices whose Gotham fallback lacks it.
-    local closeBtn = chromeButton(-40, "×", Color3.fromRGB(200, 50, 50), Color3.fromRGB(230, 70, 70))
-    local minimizeBtn = chromeButton(-75, "—", Color3.fromRGB(60, 60, 70), Color3.fromRGB(80, 80, 95))
-    -- (resize/expand titlebar button removed — resizing is still available
-    -- via the drag handle in the window's bottom-right corner)
+    local minimizeBtn = chromeButton(-40, "—", Color3.fromRGB(60, 60, 70), Color3.fromRGB(80, 80, 95))
+    -- (close button removed — the window is closed programmatically via
+    -- Selenix:Destroy(); the resize/expand titlebar button was removed
+    -- earlier too — resizing is still available via the drag handle in the
+    -- window's bottom-right corner)
 
     self:_setupDrag(titleBar, mainFrame)
 
@@ -2116,7 +2119,7 @@ function Window:_buildChrome(title, originalSize)
     tabContainer.CanvasSize = UDim2.new(0, 0, 0, 0)
     tabContainer.AutomaticCanvasSize = Enum.AutomaticSize.X
     tabContainer.ElasticBehavior = Enum.ElasticBehavior.WhenScrollable
-    tabContainer.BackgroundTransparency = 1
+    tabContainer.BackgroundTransparency = 1 -- hidden; blends straight into mainFrame
     tabContainer.Parent = mainFrame
     local tabContainerGradient = Instance.new("UIGradient"); tabContainerGradient.Rotation = 45; tabContainerGradient.Enabled = false; tabContainerGradient.Parent = tabContainer
     local tabLayout = Instance.new("UIListLayout")
@@ -2163,7 +2166,6 @@ function Window:_buildChrome(title, originalSize)
 
     self:_setupResize(mainFrame, originalSize)
     self:_setupMinimize(mainFrame, minimizeBtn, overlay)
-    self:_setupCloseConfirm(closeBtn)
 
     -- Theme subscription for chrome pieces. isInitial=true on the first
     -- (synchronous) call snaps every color instantly; every call after that
@@ -2388,126 +2390,6 @@ function Window:_setupMinimize(mainFrame, minimizeBtn, overlay)
     end))
 end
 
-function Window:_setupCloseConfirm(closeBtn)
-    local screenGui, connMgr, theme = self._screenGui, self._connMgr, self._theme
-
-    local overlay = Instance.new("Frame")
-    overlay.Size = UDim2.new(1, 0, 1, 0)
-    overlay.BackgroundColor3 = Color3.fromRGB(0, 0, 0)
-    overlay.BackgroundTransparency = 1
-    overlay.BorderSizePixel = 0
-    overlay.ZIndex = 50
-    overlay.Visible = false
-    overlay.Active = true
-    pcall(function() overlay.Modal = true end)
-    overlay.Parent = screenGui
-
-    local box = Instance.new("Frame")
-    box.AnchorPoint = Vector2.new(0.5, 0.5)
-    box.Position = UDim2.new(0.5, 0, 0.5, 0)
-    box.Size = UDim2.new(0, 320, 0, 190)
-    box.BackgroundColor3 = Utils.Brighten(theme.Color, 1.2)
-    box.BorderSizePixel = 0
-    box.ZIndex = 51
-    box.Parent = overlay
-    Utils.AddCorner(box, UDim.new(0, 12))
-    local boxStroke = Instance.new("UIStroke")
-    boxStroke.Color = Utils.Brighten(theme.Color, 1.5)
-    boxStroke.Thickness = 1
-    boxStroke.Parent = box
-    local boxScale = Instance.new("UIScale")
-    boxScale.Scale = 0.8
-    boxScale.Parent = box
-
-    local text = Instance.new("TextLabel")
-    text.Size = UDim2.new(1, -30, 0, 60)
-    text.Position = UDim2.new(0, 15, 0, 26)
-    text.BackgroundTransparency = 1
-    text.Text = "Bạn có muốn đóng UI không?"
-    text.TextColor3 = Color3.fromRGB(255, 255, 255)
-    text.Font = Enum.Font.GothamBold
-    text.TextSize = 20
-    text.TextWrapped = true
-    text.TextXAlignment = Enum.TextXAlignment.Center
-    text.TextYAlignment = Enum.TextYAlignment.Center
-    text.ZIndex = 52
-    text.Parent = box
-
-    -- Icon-only square buttons (✓ confirm / ✕ cancel), replacing the old
-    -- text-labeled "Không"/"Đồng ý" pair to match the requested reference look.
-    local function dialogIconButton(centerX, icon, bgColorFn)
-        local b = Instance.new("TextButton")
-        b.Size = UDim2.new(0, 104, 0, 76)
-        b.AnchorPoint = Vector2.new(0.5, 0.5)
-        b.Position = UDim2.new(0, centerX, 0, 140)
-        b.BackgroundColor3 = bgColorFn()
-        b.Text = icon
-        b.TextColor3 = Color3.fromRGB(255, 255, 255)
-        b.Font = Enum.Font.GothamBold
-        b.TextSize = 30
-        b.ZIndex = 52
-        b.Parent = box
-        Utils.AddCorner(b, UDim.new(0, 16))
-        -- Reactive mode: same fix as Button/ExpandableHeader — recompute the
-        -- base color fresh from the live theme instead of restoring a value
-        -- captured once at MouseEnter, which used to fight with the theme
-        -- retint below if the mouse left mid-transition.
-        Animator.AddHoverEffect(b, connMgr, bgColorFn)
-        return b
-    end
-    local confirmBtn = dialogIconButton(100, "✓", function() return Utils.Darken(theme.Color, 0.8) end)
-    local cancelBtn = dialogIconButton(220, "✕", function() return Utils.Darken(theme.Color, 0.8) end)
-
-    local animating = false
-    local function openDialog()
-        if animating then return end
-        animating = true
-        overlay.Visible = true
-        Animator.Tween(overlay, { BackgroundTransparency = 0.5 }, 0.3):Play()
-        Animator.Tween(boxScale, { Scale = 1 }, 0.35):Play()
-        task.delay(0.35, function() animating = false end)
-    end
-    local function closeDialog()
-        if animating then return end
-        animating = true
-        Animator.Tween(overlay, { BackgroundTransparency = 1 }, 0.3, EASE, EASE_IN):Play()
-        Animator.Tween(boxScale, { Scale = 0.8 }, 0.25, EASE, EASE_IN):Play()
-        task.delay(0.3, function()
-            overlay.Visible = false
-            animating = false
-        end)
-    end
-
-    connMgr:Track(closeBtn.MouseButton1Click:Connect(openDialog))
-    connMgr:Track(cancelBtn.MouseButton1Click:Connect(closeDialog))
-    connMgr:Track(confirmBtn.MouseButton1Click:Connect(function()
-        closeDialog()
-        self:Destroy()
-    end))
-
-    theme:Subscribe(function(color, accent, isInitial)
-        local panelBg = Utils.Brighten(color, 1.2)
-        local strokeBg = Utils.Brighten(color, 1.5)
-        local textColor = Utils.GetTextColorFor(panelBg, accent)
-        local btnColor = Utils.Darken(color, 0.8)
-
-        if isInitial then
-            box.BackgroundColor3 = panelBg
-            boxStroke.Color = strokeBg
-            text.TextColor3 = textColor
-            confirmBtn.BackgroundColor3 = btnColor
-            cancelBtn.BackgroundColor3 = btnColor
-        else
-            local info = THEME_TWEEN_INFO
-            TweenService:Create(box, info, { BackgroundColor3 = panelBg }):Play()
-            TweenService:Create(boxStroke, info, { Color = strokeBg }):Play()
-            TweenService:Create(text, info, { TextColor3 = textColor }):Play()
-            TweenService:Create(confirmBtn, info, { BackgroundColor3 = btnColor }):Play()
-            TweenService:Create(cancelBtn, info, { BackgroundColor3 = btnColor }):Play()
-        end
-    end)
-end
-
 -- Tab text colors are theme-driven: active tab uses a contrast-safe color
 -- computed against the accent (like Button/Toggle do), inactive tabs use
 -- contrast-safe color against the dark inactive background, instead of the
@@ -2650,7 +2532,7 @@ function Window:GetGradients() return self._gradients end
 -- Notification layer
 -- Independent of mainFrame (parented directly to the ScreenGui) so
 -- toasts keep showing even while the window is minimized, and stay
--- on top of the close-confirm dialog's overlay via ZIndex.
+-- visible above the rest of the chrome via ZIndex.
 --============================================================
 function Window:_buildNotificationLayer()
     local screenGui = self._screenGui
@@ -2780,8 +2662,26 @@ end
 -- Public Library API
 --============================================================
 local Library = {}
+
+-- Tracks the most recently created window so Library:Destroy() (i.e.
+-- `Selenix:Destroy()`) has something to close without the caller needing
+-- to hold onto the Window object themselves.
+Library._activeWindow = nil
+
 function Library:CreateWindow(config)
-    return Window.new(config)
+    local window = Window.new(config)
+    Library._activeWindow = window
+    return window
+end
+
+-- Closes the UI programmatically — e.g. `Selenix:Destroy()` — running the
+-- same fade/scale-down teardown as Window:Destroy(). No-op if there is no
+-- active window (already destroyed, or never created).
+function Library:Destroy()
+    if Library._activeWindow then
+        Library._activeWindow:Destroy()
+        Library._activeWindow = nil
+    end
 end
 
 return Library
