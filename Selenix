@@ -2064,6 +2064,12 @@ function Window:_buildChrome(title, originalSize)
     -- inside theme:Subscribe (initial paint), everything after that is a real
     -- theme change from ThemeGrid, so it should animate like every other
     -- component instead of snapping instantly.
+    --
+    -- NOTE: mainFrame is intentionally left out of this restyle. It stays
+    -- permanently transparent (BackgroundTransparency = 1, set above and in
+    -- the loading-screen handoff) so the window has no solid background
+    -- panel behind the titlebar/tabs/content — only its UIStroke outline and
+    -- UIShadow remain visible.
     local chromeThemeInitialized = false
     theme:Subscribe(function(color, accent)
         local darkTitle = Utils.Darken(color, 0.7)
@@ -2073,7 +2079,6 @@ function Window:_buildChrome(title, originalSize)
 
         if chromeThemeInitialized then
             local info = THEME_TWEEN_INFO
-            TweenService:Create(mainFrame, info, { BackgroundColor3 = color }):Play()
             TweenService:Create(overlay, info, { BackgroundColor3 = color }):Play()
             TweenService:Create(titleBar, info, { BackgroundColor3 = darkTitle }):Play()
             TweenService:Create(tabContainer, info, { BackgroundColor3 = darkTab }):Play()
@@ -2081,7 +2086,6 @@ function Window:_buildChrome(title, originalSize)
             TweenService:Create(tabFadeOverlay, info, { BackgroundColor3 = color }):Play()
             TweenService:Create(titleLabel, info, { TextColor3 = titleTextColor }):Play()
         else
-            mainFrame.BackgroundColor3 = color
             overlay.BackgroundColor3 = color
             titleBar.BackgroundColor3 = darkTitle
             tabContainer.BackgroundColor3 = darkTab
@@ -2165,7 +2169,8 @@ function Window:_buildLoadingScreen(title, mainFrame, mainScale, mainShadow)
             loading:Destroy()
             mainFrame.Visible = true
             Animator.Tween(mainScale, { Scale = 1 }, 0.35):Play()
-            Animator.Tween(mainFrame, { BackgroundTransparency = 0 }, 0.45):Play()
+            -- mainFrame's BackgroundTransparency is intentionally left at 1
+            -- (no fade-in to a solid panel) — only the shadow fades in.
             Animator.Tween(mainShadow, { Transparency = 0.45 }, 0.5):Play()
         end)
         fadeOut:Play()
