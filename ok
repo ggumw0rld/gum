@@ -1653,6 +1653,2674 @@ end
 -- Not theme-subscribed like other controls: notifications are transient and
 -- keep whatever color they were created with, except for the semantic type
 -- stripe/icon color which stays fixed regardless of theme.
+--
+-- opts.Duration: seconds before auto-dismiss. Omit/nil defaults to 4s.
+-- Pass 0 or false to make the notification "sticky" — no progress bar, and
+-- it never auto-dismisses; it only closes via the × button or a manual
+-- :Dismiss() call.
+--
+-- FIXES vs the previous version:
+--  1) Entrance animation + the auto-dismiss countdown now both wait two
+--     Heartbeat frames before starting. `card` nests two levels of
+--     AutomaticSize (labels -> textHolder -> card), so its true height
+--     isn't known on the very first frame; starting the slide/scale/fade
+--     tween before that settles is what made the card visibly pop in at
+--     the wrong size and made the text look like it "landed" too low.
+--  2) The hover-to-pause countdown no longer works by Cancel()-ing a Tween
+--     and reading back its live interpolated Size to guess "how much time
+--     is left". That could desync (e.g. if MouseEnter/MouseLeave fire more
+--     than once in quick succession) and leave the auto-dismiss timer
+--     effectively stuck forever. It's now a single Heartbeat-driven
+--     countdown with an explicit `remainingTime` value — pausing/resuming
+--     is just disconnecting/reconnecting that one connection.
+--  3) Sticky notifications (Duration = 0/false) never create a progress
+--     bar at all, instead of relying on Lua's "0 is truthy" behavior to
+--     accidentally skip it.
+local NOTIF_TYPES = {
+    success = { Color3.fromRGB(60, 200, 120), "✓" },
+    error   = { Color3.fromRGB(220, 70, 70),  "×" },
+    warning = { Color3.fromRGB(230, 170, 50), "!" },
+    info    = { Color3.fromRGB(70, 140, 230), "i" },
+}
+
+function Components.Notification(parent, theme, connMgr, opts)
+    local typeInfo = NOTIF_TYPES[opts.Type] or NOTIF_TYPES.info
+    local accentColor, iconText = typeInfo[1], typeInfo[2]
+
+    local duration = opts.Duration
+    if duration == nil then duration = 4 end
+    if duration == false then duration = 0 end
+    local isSticky = not (duration and duration > 0)
+
+    -- Notifications are laid out by a UIListLayout on `parent` (the toast
+    -- container). UIListLayout re-applies its own computed Position to every
+    -- direct child whenever it recalculates the stack (new toast added,
+    -- another toast resized/removed, etc), which fights any tween that's
+    -- also driving that child's Position. Fix: give each toast its own
+    -- invisible "slot" that IS the direct list-managed child (reserves the
+    -- correct stacking space via AutomaticSize, never has its Position
+    -- tweened), and make the visible `card` a child of that slot instead of
+    -- of `parent` directly.
+    local slot = Instance.new("Frame")
+    slot.Name = "NotificationSlot"
+    slot.Size = UDim2.new(1, 0, 0, 0)
+    slot.AutomaticSize = Enum.AutomaticSize.Y
+    slot.LayoutOrder = opts.LayoutOrder or 0
+    slot.BackgroundTransparency = 1
+    slot.Parent = parent
+
+    local card = Instance.new("Frame")
+    card.Size = UDim2.new(1, 0, 0, 0)
+    card.AutomaticSize = Enum.AutomaticSize.Y
+    card.BackgroundColor3 = Utils.Brighten(theme.Color, 1.25)
+    card.BorderSizePixel = 0
+    -- Left un-clipped until Dismiss() explicitly turns it on, so the nested
+    -- AutomaticSize convergence (see note above) never gets caught mid-
+    -- computation and visibly cropped.
+    card.ClipsDescendants = false
+    card.Parent = slot
+    Utils.AddCorner(card, UDim.new(0, 10))
+
+    local stroke = Instance.new("UIStroke")
+    stroke.Color = Utils.Brighten(theme.Color, 1.5)
+    stroke.Thickness = 1
+    stroke.Parent = card
+
+    local accentBar = Instance.new("Frame")
+    accentBar.Size = UDim2.new(0, 4, 1, 0)
+    accentBar.BackgroundColor3 = accentColor
+    accentBar.BorderSizePixel = 0
+    accentBar.Parent = card
+    Utils.AddCorner(accentBar, UDim.new(0, 2))
+
+    local iconHolder = Instance.new("Frame")
+    iconHolder.Size = UDim2.new(0, 26, 0, 26)
+    iconHolder.Position = UDim2.new(0, 14, 0, 14)
+    iconHolder.BackgroundColor3 = accentColor
+    iconHolder.BackgroundTransparency = 0.8
+    iconHolder.BorderSizePixel = 0
+    iconHolder.Parent = card
+    Utils.AddCorner(iconHolder, UDim.new(1, 0))
+
+    local icon = Instance.new("TextLabel")
+    icon.Size = UDim2.new(1, 0, 1, 0)
+    icon.BackgroundTransparency = 1
+    icon.Text = iconText
+    icon.TextColor3 = accentColor
+    icon.Font = Enum.Font.GothamBold
+    icon.TextSize = 14
+    icon.Parent = iconHolder
+
+    -- Text block now starts at the same Y offset as the icon (14, was 12)
+    -- so the title's first line lines up with the icon instead of sitting
+    -- a couple pixels off from it.
+    local textHolder = Instance.new("Frame")
+    textHolder.Position = UDim2.new(0, 52, 0, 14)
+    textHolder.Size = UDim2.new(1, -90, 0, 0)
+    textHolder.AutomaticSize = Enum.AutomaticSize.Y
+    textHolder.BackgroundTransparency = 1
+    textHolder.Parent = card
+    local textLayout = Instance.new("UIListLayout")
+    textLayout.Padding = UDim.new(0, 2)
+    textLayout.Parent = textHolder
+
+    local titleLabel = Instance.new("TextLabel")
+    titleLabel.Size = UDim2.new(1, 0, 0, 0)
+    titleLabel.AutomaticSize = Enum.AutomaticSize.Y
+    titleLabel.LayoutOrder = 1
+    titleLabel.BackgroundTransparency = 1
+    titleLabel.Text = opts.Title or "Thông báo"
+    titleLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
+    titleLabel.TextXAlignment = Enum.TextXAlignment.Left
+    titleLabel.TextYAlignment = Enum.TextYAlignment.Top
+    titleLabel.TextWrapped = true
+    titleLabel.Font = Enum.Font.GothamBold
+    titleLabel.TextSize = 15
+    titleLabel.Parent = textHolder
+
+    local bodyLabel = Instance.new("TextLabel")
+    bodyLabel.Size = UDim2.new(1, 0, 0, 0)
+    bodyLabel.AutomaticSize = Enum.AutomaticSize.Y
+    bodyLabel.LayoutOrder = 2
+    bodyLabel.BackgroundTransparency = 1
+    bodyLabel.Text = opts.Text or ""
+    bodyLabel.TextColor3 = Color3.fromRGB(195, 195, 205)
+    bodyLabel.TextXAlignment = Enum.TextXAlignment.Left
+    bodyLabel.TextYAlignment = Enum.TextYAlignment.Top
+    bodyLabel.TextWrapped = true
+    bodyLabel.Font = Enum.Font.Gotham
+    bodyLabel.TextSize = 13
+    bodyLabel.Parent = textHolder
+
+    local closeBtn = Instance.new("TextButton")
+    closeBtn.AnchorPoint = Vector2.new(1, 0)
+    closeBtn.Position = UDim2.new(1, -10, 0, 10)
+    closeBtn.Size = UDim2.new(0, 22, 0, 22)
+    closeBtn.BackgroundTransparency = 1
+    closeBtn.Text = "×"
+    closeBtn.TextColor3 = Color3.fromRGB(180, 180, 190)
+    closeBtn.Font = Enum.Font.GothamBold
+    closeBtn.TextSize = 13
+    closeBtn.Parent = card
+
+    local bottomSpacer = Instance.new("Frame")
+    bottomSpacer.Size = UDim2.new(1, 0, 0, 16)
+    bottomSpacer.LayoutOrder = 3
+    bottomSpacer.BackgroundTransparency = 1
+    bottomSpacer.Parent = textHolder
+
+    -- Progress bar only exists for non-sticky notifications. Its fill is
+    -- driven directly (no Tween) by the Heartbeat countdown below, so it's
+    -- always exactly in sync with the actual time remaining.
+    local progressTrack, progressFill
+    if not isSticky then
+        progressTrack = Instance.new("Frame")
+        progressTrack.Size = UDim2.new(1, 0, 0, 3)
+        progressTrack.AnchorPoint = Vector2.new(0, 1)
+        progressTrack.Position = UDim2.new(0, 0, 1, 0)
+        progressTrack.BackgroundColor3 = Utils.Darken(theme.Color, 0.8)
+        progressTrack.BorderSizePixel = 0
+        progressTrack.Parent = card
+        progressFill = Instance.new("Frame")
+        progressFill.Size = UDim2.new(1, 0, 1, 0)
+        progressFill.BackgroundColor3 = accentColor
+        progressFill.BorderSizePixel = 0
+        progressFill.Parent = progressTrack
+    end
+
+    connMgr:Track(closeBtn.MouseEnter:Connect(function()
+        TweenService:Create(closeBtn, TweenInfo.new(0.2, EASE, EASE_OUT), { TextColor3 = Color3.fromRGB(255, 255, 255) }):Play()
+    end))
+    connMgr:Track(closeBtn.MouseLeave:Connect(function()
+        TweenService:Create(closeBtn, TweenInfo.new(0.2, EASE, EASE_OUT), { TextColor3 = Color3.fromRGB(180, 180, 190) }):Play()
+    end))
+
+    -- Whole-card scale for a springy pop on entrance/exit (Size itself is
+    -- driven by AutomaticSize, so scale is layered on top via UIScale instead
+    -- of tweening Size directly).
+    local cardScale = Instance.new("UIScale")
+    cardScale.Scale = 0.9
+    cardScale.Parent = card
+
+    local iconScale = Instance.new("UIScale")
+    iconScale.Scale = 0
+    iconScale.Parent = iconHolder
+
+    local baseCardColor = Utils.Brighten(theme.Color, 1.25)
+    local baseStrokeColor = Utils.Brighten(theme.Color, 1.5)
+    local dismissed = false
+    local remainingTime = duration
+    local countdownConn = nil
+    local self = { Instance = slot }
+
+    card.Active = true -- lets a plain Frame receive MouseEnter/MouseLeave for hover-to-pause
+
+    local function stopCountdown()
+        if countdownConn then
+            countdownConn:Disconnect()
+            countdownConn = nil
+        end
+    end
+
+    -- Single Heartbeat connection drives both the visible progress bar and
+    -- the actual auto-dismiss off the same `remainingTime` clock, so the bar
+    -- reaching empty and the dismiss firing can never drift apart or get
+    -- stuck mid-way the way the old Tween-based version could.
+    local function startCountdown()
+        if isSticky or dismissed then return end
+        stopCountdown()
+        local startClock = os.clock()
+        local startRemaining = remainingTime
+        countdownConn = RunService.Heartbeat:Connect(function()
+            local elapsed = os.clock() - startClock
+            remainingTime = math.max(startRemaining - elapsed, 0)
+            if progressFill then
+                progressFill.Size = UDim2.new(math.max(remainingTime / duration, 0), 0, 1, 0)
+            end
+            if remainingTime <= 0 then
+                stopCountdown()
+                self:Dismiss()
+            end
+        end)
+        connMgr:Track(countdownConn)
+    end
+
+    function self:Dismiss()
+        if dismissed then return end
+        dismissed = true
+        stopCountdown()
+
+        -- Now that the entrance/hover phase is fully done, clip again for
+        -- the exit — this hides the slide-out overshoot and the height
+        -- collapse in step 2 from spilling outside the card's rounded corners.
+        card.ClipsDescendants = true
+
+        -- Step 1: slide the whole card out to the right, clear past its own
+        -- width, so the exit reads as a deliberate "swipe away". `card`
+        -- lives inside `slot` (not directly inside the list-managed
+        -- container), so this Position tween is free to run without a
+        -- UIListLayout recompute snapping it back mid-flight.
+        local slideDistance = card.AbsoluteSize.X + 60
+        Animator.Tween(cardScale, { Scale = 0.94 }, 0.28, EASE, EASE_IN):Play()
+        Animator.Tween(stroke, { Transparency = 1 }, 0.22, EASE, EASE_IN):Play()
+        Animator.Tween(accentBar, { BackgroundTransparency = 1 }, 0.22, EASE, EASE_IN):Play()
+        Animator.Tween(titleLabel, { TextTransparency = 1 }, 0.18, EASE, EASE_IN):Play()
+        Animator.Tween(bodyLabel, { TextTransparency = 1 }, 0.18, EASE, EASE_IN):Play()
+        Animator.Tween(icon, { TextTransparency = 1 }, 0.18, EASE, EASE_IN):Play()
+        Animator.Tween(iconHolder, { BackgroundTransparency = 1 }, 0.18, EASE, EASE_IN):Play()
+        Animator.Tween(closeBtn, { TextTransparency = 1 }, 0.18, EASE, EASE_IN):Play()
+        local slideOut = Animator.Tween(card, { Position = UDim2.new(0, slideDistance, 0, 0), BackgroundTransparency = 1 }, 0.3, EASE, EASE_IN)
+        slideOut:Play()
+
+        slideOut.Completed:Connect(function()
+            -- Step 2: collapse height smoothly so notifications below slide
+            -- up into place instead of jumping the instant this one is gone.
+            -- Shrinking `card`'s height shrinks `slot`'s AutomaticSize right
+            -- along with it, which is what actually drives the list reflow.
+            card.AutomaticSize = Enum.AutomaticSize.None
+            card.Size = UDim2.new(1, 0, 0, card.AbsoluteSize.Y)
+            local collapse = Animator.Tween(card, { Size = UDim2.new(1, 0, 0, 0) }, 0.22, EASE, EASE_IN)
+            collapse.Completed:Connect(function()
+                if opts.OnDismiss then opts.OnDismiss() end
+                slot:Destroy()
+            end)
+            collapse:Play()
+        end)
+    end
+
+    connMgr:Track(closeBtn.MouseButton1Click:Connect(function() self:Dismiss() end))
+
+    -- Hovering a notification pauses its countdown (classic toast-UX
+    -- courtesy so it doesn't vanish while you're reading it) and gives a
+    -- subtle highlight so the card reads as interactive.
+    connMgr:Track(card.MouseEnter:Connect(function()
+        if dismissed then return end
+        stopCountdown()
+        TweenService:Create(card, TweenInfo.new(0.2, EASE, EASE_OUT), { BackgroundColor3 = Utils.Brighten(baseCardColor, 1.1) }):Play()
+        TweenService:Create(stroke, TweenInfo.new(0.2, EASE, EASE_OUT), { Color = accentColor, Thickness = 1.5 }):Play()
+    end))
+    connMgr:Track(card.MouseLeave:Connect(function()
+        if dismissed then return end
+        TweenService:Create(card, TweenInfo.new(0.2, EASE, EASE_OUT), { BackgroundColor3 = baseCardColor }):Play()
+        TweenService:Create(stroke, TweenInfo.new(0.2, EASE, EASE_OUT), { Color = baseStrokeColor, Thickness = 1 }):Play()
+        if not isSticky then
+            if remainingTime > 0.05 then
+                startCountdown()
+            else
+                self:Dismiss()
+            end
+        end
+    end))
+
+    -- Entrance: slide in from the side + fade + a small springy scale
+    -- overshoot (Back easing), with the icon popping in a beat later. We
+    -- wait two Heartbeat frames first so `card`'s AutomaticSize has fully
+    -- converged — this is what fixes both the jerky entrance and the text
+    -- appearing to "land" in the wrong spot.
+    card.Position = UDim2.new(0, 36, 0, 0)
+    card.BackgroundTransparency = 1
+    stroke.Transparency = 1
+    task.defer(function()
+        RunService.Heartbeat:Wait()
+        RunService.Heartbeat:Wait()
+        if dismissed then return end
+        Animator.Tween(card, { Position = UDim2.new(0, 0, 0, 0), BackgroundTransparency = 0 }, 0.4, Enum.EasingStyle.Back, EASE_OUT):Play()
+        Animator.Tween(cardScale, { Scale = 1 }, 0.4, Enum.EasingStyle.Back, EASE_OUT):Play()
+        Animator.Tween(stroke, { Transparency = 0 }, 0.3):Play()
+        task.delay(0.1, function()
+            if dismissed then return end
+            Animator.Tween(iconScale, { Scale = 1 }, 0.35, Enum.EasingStyle.Back, EASE_OUT):Play()
+        end)
+        startCountdown()
+    end)
+
+    function self:ApplyTheme() end -- notifications keep their creation-time look; they're short-lived
+    return self
+end
+
+--============================================================
+-- MODULE: Tab (forward-declared; methods attached after Window below)
+--============================================================
+local TabMeta = {}
+TabMeta.__index = TabMeta
+
+--============================================================
+-- MODULE: Window
+-- Owns the ScreenGui, loading screen, chrome (titlebar/drag/resize/
+-- minimize) and the tab strip. Delegates page content to Tab objects,
+-- which delegate individual controls to Components. There is no in-UI
+-- close button — the window is closed programmatically instead, via
+-- Library:Destroy() (or Window:Destroy() directly).
+--============================================================
+local Window = {}
+Window.__index = Window
+
+-- Maps a window Title -> its ConnectionManager, for the currently-live
+-- window using that title. Lets destroyExisting() fully tear down a
+-- previous run's connections (drag/resize/hover/heartbeat tweens) instead
+-- of only deleting its ScreenGui and leaking every connection it made,
+-- which is what re-running this script used to do every single time.
+local activeWindows = {}
+
+local function destroyExisting(playerGui, name)
+    local prevConnMgr = activeWindows[name]
+    if prevConnMgr then
+        prevConnMgr:DisconnectAll()
+        activeWindows[name] = nil
+    end
+    local existing = playerGui:FindFirstChild(name)
+    if existing then existing:Destroy() end
+end
+
+function Window.new(config)
+    config = config or {}
+    local title = config.Title or "Selenix"
+    local size = config.Size or UDim2.new(0, 460, 0, 390)
+    -- Optional titlebar icon. Pass an asset id string (e.g. "rbxassetid://123"
+    -- or just the numeric id, both accepted below). Leave nil/"" to omit the
+    -- icon entirely — the title text then shifts left to fill the freed space
+    -- instead of leaving an empty gap where the icon would have been.
+    local icon = config.Icon
+    if type(icon) == "number" then icon = "rbxassetid://" .. tostring(icon) end
+    if icon == "" then icon = nil end
+
+    local playerGui = Player:WaitForChild("PlayerGui")
+    destroyExisting(playerGui, title)
+
+    local screenGui = Instance.new("ScreenGui")
+    screenGui.Name = title
+    screenGui.ResetOnSpawn = false
+    screenGui.Parent = playerGui
+
+    local connMgr = ConnectionManager.new()
+    local theme = Theme.new(config.Color or Color3.fromRGB(30, 30, 35), config.Accent or Color3.fromRGB(60, 60, 70))
+    activeWindows[title] = connMgr
+
+    local self = setmetatable({
+        _title = title,
+        _icon = icon,
+        _screenGui = screenGui,
+        _connMgr = connMgr,
+        _theme = theme,
+        _tabs = {},
+        _tabButtons = {},
+        _pages = {},
+        _activeTabIndex = 1,
+    }, Window)
+
+    self:_buildChrome(title, size)
+    self:_buildNotificationLayer()
+    return self
+end
+
+function Window:_buildChrome(title, originalSize)
+    local screenGui, connMgr, theme = self._screenGui, self._connMgr, self._theme
+
+    -- Main frame
+    local mainFrame = Instance.new("Frame")
+    mainFrame.AnchorPoint = Vector2.new(0.5, 0)
+    mainFrame.Size = originalSize
+    mainFrame.Position = UDim2.new(0.5, 0, 0.5, -originalSize.Y.Offset / 2)
+    mainFrame.BorderSizePixel = 0
+    mainFrame.ClipsDescendants = true
+    mainFrame.Active = true
+    mainFrame.Visible = false
+    mainFrame.BackgroundTransparency = 1
+    mainFrame.Parent = screenGui
+    Utils.AddCorner(mainFrame, UDim.new(0, 12))
+    self._mainFrame = mainFrame
+
+    local stroke = Instance.new("UIStroke")
+    stroke.Thickness = 1
+    stroke.Parent = mainFrame
+
+    local shadow = Instance.new("UIShadow")
+    shadow.Color = Color3.fromRGB(0, 0, 0)
+    shadow.Transparency = 1
+    shadow.BlurRadius = UDim.new(0, 18)
+    shadow.Offset = UDim2.new(0, 0, 0, 6)
+    shadow.Parent = mainFrame
+
+    local mainScale = Instance.new("UIScale")
+    mainScale.Scale = 0.8
+    mainScale.Parent = mainFrame
+
+    -- Loading screen
+    self:_buildLoadingScreen(title, mainFrame, mainScale, shadow)
+
+    -- Titlebar
+    local titleBar = Instance.new("Frame")
+    titleBar.Size = UDim2.new(1, 0, 0, 40)
+    titleBar.BorderSizePixel = 0
+    titleBar.Active = true
+    titleBar.Parent = mainFrame
+    Utils.AddCorner(titleBar, UDim.new(0, 12))
+    self._titleBar = titleBar
+
+    -- Icon is only created when one was provided in CreateWindow's config;
+    -- without it there's nothing reserving that left-hand space, so the
+    -- title label starts further left (15px, matching the titlebar's other
+    -- edge paddings) and claims the width the icon would have used instead
+    -- of leaving a blank gap.
+    local hasIcon = self._icon ~= nil
+    local titleIcon
+    if hasIcon then
+        titleIcon = Instance.new("ImageLabel")
+        titleIcon.AnchorPoint = Vector2.new(0, 0.5)
+        titleIcon.Position = UDim2.new(0, 5, 0.5, 0)
+        titleIcon.Size = UDim2.new(0, 34, 0, 34)
+        titleIcon.BackgroundTransparency = 1
+        titleIcon.Image = self._icon
+        titleIcon.Parent = titleBar
+    end
+
+    local titleLabel = Instance.new("TextLabel")
+    if hasIcon then
+        titleLabel.Size = UDim2.new(1, -122, 1, 0)
+        titleLabel.Position = UDim2.new(0, 36, 0, 0)
+    else
+        titleLabel.Size = UDim2.new(1, -101, 1, 0)
+        titleLabel.Position = UDim2.new(0, 15, 0, 0)
+    end
+    titleLabel.BackgroundTransparency = 1
+    titleLabel.Text = title
+    titleLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
+    titleLabel.TextXAlignment = Enum.TextXAlignment.Left
+    titleLabel.Font = Enum.Font.GothamBold
+    titleLabel.TextSize = 18
+    titleLabel.Parent = titleBar
+
+    local function chromeButton(xOffset, text, bgColor, hoverColor)
+        local b = Instance.new("TextButton")
+        b.Size = UDim2.new(0, 30, 0, 30)
+        b.AnchorPoint = Vector2.new(0.5, 0.5)
+        b.Position = UDim2.new(1, xOffset + 15, 0, 5 + 15)
+        b.BackgroundColor3 = bgColor
+        b.BackgroundTransparency = 1 -- fully invisible background; only the glyph shows
+        b.Text = text
+        b.TextColor3 = Color3.fromRGB(255, 255, 255)
+        b.TextSize = 18
+        b.Font = Enum.Font.GothamBold
+        b.Parent = titleBar
+        Utils.AddCorner(b, UDim.new(0, 6))
+        Animator.AddHoverEffect(b, connMgr, bgColor, hoverColor, true) -- skipStroke: no hover-outline frame on chrome buttons
+        return b
+    end
+
+    local minimizeBtn = chromeButton(-40, "—", Color3.fromRGB(60, 60, 70), Color3.fromRGB(80, 80, 95))
+    -- (close button removed — the window is closed programmatically via
+    -- Selenix:Destroy(); the resize/expand titlebar button was removed
+    -- earlier too — resizing is still available via the drag handle in the
+    -- window's bottom-right corner)
+
+    self:_setupDrag(titleBar, mainFrame)
+
+    -- Theme-driven gradients (used by GradientPicker component)
+    local mainGradient = Instance.new("UIGradient"); mainGradient.Rotation = 45; mainGradient.Enabled = false; mainGradient.Parent = mainFrame
+    local titleGradient = Instance.new("UIGradient"); titleGradient.Rotation = 45; titleGradient.Enabled = false; titleGradient.Parent = titleBar
+
+    -- Tab strip
+    local tabContainer = Instance.new("ScrollingFrame")
+    tabContainer.Size = UDim2.new(1, 0, 0, 45)
+    tabContainer.Position = UDim2.new(0, 0, 0, 40)
+    tabContainer.BorderSizePixel = 0
+    tabContainer.ScrollingDirection = Enum.ScrollingDirection.X
+    tabContainer.ScrollBarThickness = 0
+    tabContainer.CanvasSize = UDim2.new(0, 0, 0, 0)
+    tabContainer.AutomaticCanvasSize = Enum.AutomaticSize.X
+    tabContainer.ElasticBehavior = Enum.ElasticBehavior.WhenScrollable
+    tabContainer.BackgroundTransparency = 1 -- hidden; blends straight into mainFrame
+    tabContainer.Parent = mainFrame
+    local tabContainerGradient = Instance.new("UIGradient"); tabContainerGradient.Rotation = 45; tabContainerGradient.Enabled = false; tabContainerGradient.Parent = tabContainer
+    local tabLayout = Instance.new("UIListLayout")
+    tabLayout.FillDirection = Enum.FillDirection.Horizontal
+    tabLayout.SortOrder = Enum.SortOrder.LayoutOrder
+    tabLayout.VerticalAlignment = Enum.VerticalAlignment.Center
+    tabLayout.Padding = UDim.new(0, 10)
+    tabLayout.Parent = tabContainer
+    Utils.AddPadding(tabContainer, UDim.new(0, 10), UDim.new(0, 10))
+    self._tabContainer = tabContainer
+
+    -- Still used as the horizontal offset new pages slide in from during a
+    -- tab switch (see CreateTab's switchTo) — kept even though the cover
+    -- overlay that used to size itself off of it is gone.
+    local SLIDE_OFFSET = 26
+    self._slideOffset = SLIDE_OFFSET
+
+    self._gradients = {
+        { Gradient = mainGradient, Tint = 1 },
+        { Gradient = titleGradient, Tint = 0.7 },
+        { Gradient = tabContainerGradient, Tint = 0.85 },
+    }
+
+    self:_setupResize(mainFrame, originalSize)
+    self:_setupMinimize(mainFrame, minimizeBtn)
+
+    -- Theme subscription for chrome pieces. isInitial=true on the first
+    -- (synchronous) call snaps every color instantly; every call after that
+    -- is a real theme change from ThemeGrid, so it animates like every other
+    -- component instead of the old hand-rolled `chromeThemeInitialized` flag.
+    theme:Subscribe(function(color, accent, isInitial)
+        local darkTitle = Utils.Darken(color, 0.7)
+        local darkTab = Utils.Darken(color, 0.85)
+        local strokeColor = Utils.Brighten(color, 1.3)
+        local titleTextColor = Utils.GetTextColorFor(darkTitle, accent)
+
+        if isInitial then
+            mainFrame.BackgroundColor3 = color
+            titleBar.BackgroundColor3 = darkTitle
+            tabContainer.BackgroundColor3 = darkTab
+            stroke.Color = strokeColor
+            titleLabel.TextColor3 = titleTextColor
+        else
+            local info = THEME_TWEEN_INFO
+            TweenService:Create(mainFrame, info, { BackgroundColor3 = color }):Play()
+            TweenService:Create(titleBar, info, { BackgroundColor3 = darkTitle }):Play()
+            TweenService:Create(tabContainer, info, { BackgroundColor3 = darkTab }):Play()
+            TweenService:Create(stroke, info, { Color = strokeColor }):Play()
+            TweenService:Create(titleLabel, info, { TextColor3 = titleTextColor }):Play()
+        end
+
+        self:_restyleTabButtons(color, accent)
+    end)
+end
+
+function Window:_buildLoadingScreen(title, mainFrame, mainScale, mainShadow)
+    local screenGui = self._screenGui
+    local theme = self._theme
+
+    local loading = Instance.new("Frame")
+    loading.AnchorPoint = Vector2.new(0.5, 0.5)
+    loading.Position = UDim2.new(0.5, 0, 0.5, 0)
+    loading.Size = UDim2.new(0, 280, 0, 130)
+    loading.BackgroundColor3 = theme.Color
+    loading.BorderSizePixel = 0
+    loading.Parent = screenGui
+    Utils.AddCorner(loading, UDim.new(0, 12))
+    local loadingStroke = Instance.new("UIStroke")
+    loadingStroke.Color = Utils.Brighten(theme.Color, 1.3)
+    loadingStroke.Thickness = 1
+    loadingStroke.Parent = loading
+
+    local loadingTitle = Instance.new("TextLabel")
+    loadingTitle.Size = UDim2.new(1, -30, 0, 28)
+    loadingTitle.Position = UDim2.new(0, 15, 0, 26)
+    loadingTitle.BackgroundTransparency = 1
+    loadingTitle.Text = title
+    loadingTitle.TextColor3 = Color3.fromRGB(255, 255, 255)
+    loadingTitle.TextXAlignment = Enum.TextXAlignment.Left
+    loadingTitle.Font = Enum.Font.GothamBold
+    loadingTitle.TextSize = 20
+    loadingTitle.Parent = loading
+
+    local loadingSubtitle = Instance.new("TextLabel")
+    loadingSubtitle.Size = UDim2.new(1, -30, 0, 18)
+    loadingSubtitle.Position = UDim2.new(0, 15, 0, 56)
+    loadingSubtitle.BackgroundTransparency = 1
+    loadingSubtitle.Text = "Đang khởi tạo..."
+    loadingSubtitle.TextColor3 = Color3.fromRGB(180, 180, 190)
+    loadingSubtitle.TextXAlignment = Enum.TextXAlignment.Left
+    loadingSubtitle.Font = Enum.Font.Gotham
+    loadingSubtitle.TextSize = 13
+    loadingSubtitle.Parent = loading
+
+    local barTrack = Instance.new("Frame")
+    barTrack.Size = UDim2.new(1, -30, 0, 6)
+    barTrack.Position = UDim2.new(0, 15, 1, -28)
+    barTrack.BackgroundColor3 = Utils.Darken(theme.Color, 0.8)
+    barTrack.BorderSizePixel = 0
+    barTrack.Parent = loading
+    Utils.AddCorner(barTrack, UDim.new(1, 0))
+
+    local barFill = Instance.new("Frame")
+    barFill.Size = UDim2.new(0, 0, 1, 0)
+    barFill.BackgroundColor3 = theme.Accent
+    barFill.BorderSizePixel = 0
+    barFill.Parent = barTrack
+    Utils.AddCorner(barFill, UDim.new(1, 0))
+
+    local loadingScale = Instance.new("UIScale")
+    loadingScale.Scale = 0.85
+    loadingScale.Parent = loading
+    loading.BackgroundTransparency = 1
+
+    Animator.Tween(loadingScale, { Scale = 1 }, 0.35):Play()
+    Animator.Tween(loading, { BackgroundTransparency = 0 }, 0.35):Play()
+    Animator.Tween(barFill, { Size = UDim2.new(1, 0, 1, 0) }, 1.35):Play()
+
+    task.delay(1.6, function()
+        Animator.Tween(loadingScale, { Scale = 0.85 }, 0.3, EASE, EASE_IN):Play()
+        local fadeOut = Animator.Tween(loading, { BackgroundTransparency = 1 }, 0.3, EASE, EASE_IN)
+        fadeOut.Completed:Connect(function()
+            loading:Destroy()
+            mainFrame.Visible = true
+            Animator.Tween(mainScale, { Scale = 1 }, 0.35):Play()
+            Animator.Tween(mainFrame, { BackgroundTransparency = 0 }, 0.45):Play()
+            Animator.Tween(mainShadow, { Transparency = 0.45 }, 0.5):Play()
+        end)
+        fadeOut:Play()
+    end)
+end
+
+function Window:_setupDrag(titleBar, mainFrame)
+    local connMgr = self._connMgr
+    local dragging, dragInput, dragStart, startPos
+    local dragEndConn
+
+    connMgr:Track(titleBar.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = true
+            dragStart = input.Position
+            startPos = mainFrame.Position
+            if dragEndConn then dragEndConn:Disconnect() end
+            dragEndConn = input.Changed:Connect(function()
+                if input.UserInputState == Enum.UserInputState.End then dragging = false end
+            end)
+        end
+    end))
+    connMgr:Track(titleBar.InputChanged:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then
+            dragInput = input
+        end
+    end))
+    connMgr:Track(UserInputService.InputChanged:Connect(function(input)
+        if input == dragInput and dragging then
+            local delta = input.Position - dragStart
+            mainFrame.Position = UDim2.new(
+                startPos.X.Scale, startPos.X.Offset + delta.X,
+                startPos.Y.Scale, startPos.Y.Offset + delta.Y
+            )
+        end
+    end))
+end
+
+function Window:_setupResize(mainFrame, originalSize)
+    local connMgr = self._connMgr
+    local MIN_W, MIN_H, MAX_W, MAX_H = 340, 260, 700, 650
+    self._currentTargetSize = originalSize
+
+    local handle = Instance.new("TextButton")
+    handle.AnchorPoint = Vector2.new(1, 1)
+    handle.Size = UDim2.new(0, 22, 0, 22)
+    handle.Position = UDim2.new(1, -2, 1, -2)
+    handle.BackgroundTransparency = 1
+    handle.Text = "◢"
+    handle.TextColor3 = Color3.fromRGB(150, 150, 165)
+    handle.TextSize = 16
+    handle.Font = Enum.Font.GothamBold
+    handle.ZIndex = 15
+    handle.Active = true
+    handle.Parent = mainFrame
+    self._resizeHandle = handle
+
+    local dragging, dragStart, startSize
+    connMgr:Track(handle.InputBegan:Connect(function(input)
+        if self._minimized or self._animating then return end
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = true
+            dragStart = input.Position
+            startSize = mainFrame.Size
+        end
+    end))
+    connMgr:Track(UserInputService.InputEnded:Connect(function(input)
+        if dragging and (input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch) then
+            dragging = false
+            self._currentTargetSize = mainFrame.Size
+        end
+    end))
+    connMgr:Track(UserInputService.InputChanged:Connect(function(input)
+        if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+            local delta = input.Position - dragStart
+            local w = math.clamp(startSize.X.Offset + delta.X, MIN_W, MAX_W)
+            local h = math.clamp(startSize.Y.Offset + delta.Y, MIN_H, MAX_H)
+            mainFrame.Size = UDim2.new(0, w, 0, h)
+        end
+    end))
+    connMgr:Track(handle.MouseEnter:Connect(function()
+        if not self._minimized then Animator.Tween(handle, { TextColor3 = Color3.fromRGB(220, 220, 230) }, 0.25):Play() end
+    end))
+    connMgr:Track(handle.MouseLeave:Connect(function()
+        Animator.Tween(handle, { TextColor3 = Color3.fromRGB(150, 150, 165) }, 0.25):Play()
+    end))
+end
+
+function Window:_setupMinimize(mainFrame, minimizeBtn)
+    local connMgr = self._connMgr
+    self._minimized = false
+    self._animating = false
+
+    connMgr:Track(minimizeBtn.MouseButton1Click:Connect(function()
+        if self._animating then return end
+        self._animating = true
+        self._minimized = not self._minimized
+        if self._minimized then
+            minimizeBtn.Text = "▢"
+            self._resizeHandle.Visible = false
+            self._tabContainer.Visible = false
+            for _, p in ipairs(self._pages) do p.Visible = false end
+            Animator.Tween(mainFrame, { Size = UDim2.new(mainFrame.Size.X.Scale, mainFrame.Size.X.Offset, 0, 40) }, 0.45):Play()
+        else
+            minimizeBtn.Text = "—"
+            Animator.Tween(mainFrame, { Size = self._currentTargetSize }, 0.45):Play()
+            self._tabContainer.Visible = true
+            for i, p in ipairs(self._pages) do
+                p.Visible = (i == self._activeTabIndex)
+                p.Position = UDim2.new(0, 10, 0, 95)
+            end
+            self._resizeHandle.Visible = true
+        end
+        task.delay(0.45, function() self._animating = false end)
+    end))
+end
+
+-- Tab text colors are theme-driven: active tab uses a contrast-safe color
+-- computed against the accent (like Button/Toggle do), inactive tabs use
+-- contrast-safe color against the dark inactive background, instead of the
+-- old hardcoded white/gray pair that never adapted to the live theme.
+function Window:_restyleTabButtons(color, accent)
+    local inactiveBg = Utils.Darken(color, 0.82)
+    for i, btn in ipairs(self._tabButtons) do
+        local isActive = (i == self._activeTabIndex)
+        local bg = isActive and accent or inactiveBg
+        Animator.Tween(btn, {
+            BackgroundColor3 = bg,
+            TextColor3 = Utils.GetTextColorFor(bg, accent),
+        }, 0.25):Play()
+    end
+end
+
+function Window:CreateTab(name)
+    local index = #self._tabButtons + 1
+    local connMgr, theme, mainFrame = self._connMgr, self._theme, self._mainFrame
+
+    local btn = Instance.new("TextButton")
+    btn.Size = UDim2.new(0, 120, 0, 35)
+    btn.LayoutOrder = index
+    btn.BackgroundColor3 = (index == 1) and theme.Accent or Utils.Darken(theme.Color, 0.82)
+    btn.Text = name
+    btn.Font = Enum.Font.GothamBold
+    btn.TextSize = 15
+    -- Without this, Roblox's own built-in button-hover recolor runs on top
+    -- of BackgroundColor3 alongside our tween below, fighting it every frame.
+    btn.AutoButtonColor = false
+    btn.Parent = self._tabContainer
+    Utils.AddCorner(btn, UDim.new(0, 6))
+
+    local function tabBaseColor()
+        return (index == self._activeTabIndex) and theme.Accent or Utils.Darken(theme.Color, 0.82)
+    end
+    -- Text color is now computed for contrast against the live theme instead
+    -- of a hardcoded white/gray pair, so it stays readable (and tweens
+    -- correctly) on any theme, including light ones.
+    local function tabTextColor()
+        return Utils.GetTextColorFor(tabBaseColor(), theme.Accent)
+    end
+    local function tabHoverTextColor()
+        return Utils.GetTextColorFor(Utils.Brighten(tabBaseColor(), 1.2), theme.Accent)
+    end
+
+    btn.TextColor3 = tabTextColor() -- initial paint, matches the theme active at creation time
+
+    connMgr:Track(btn.MouseEnter:Connect(function()
+        local hoverBg = Utils.Brighten(tabBaseColor(), 1.2)
+        TweenService:Create(btn, TweenInfo.new(0.25, EASE, EASE_OUT), {
+            BackgroundColor3 = hoverBg,
+            TextColor3 = tabHoverTextColor(),
+        }):Play()
+    end))
+    connMgr:Track(btn.MouseLeave:Connect(function()
+        TweenService:Create(btn, TweenInfo.new(0.25, EASE, EASE_OUT), {
+            BackgroundColor3 = tabBaseColor(),
+            TextColor3 = tabTextColor(),
+        }):Play()
+    end))
+    table.insert(self._tabButtons, btn)
+
+    local page = Instance.new("ScrollingFrame")
+    page.Size = UDim2.new(1, -20, 1, -110)
+    page.Position = UDim2.new(0, 10, 0, 95)
+    page.BackgroundTransparency = 1
+    page.BorderSizePixel = 0
+    page.ScrollBarThickness = 0
+    page.CanvasSize = UDim2.new(0, 0, 0, 0)
+    page.AutomaticCanvasSize = Enum.AutomaticSize.Y
+    page.Parent = mainFrame
+    page.Visible = (index == 1)
+    local layout = Instance.new("UIListLayout")
+    layout.SortOrder = Enum.SortOrder.LayoutOrder
+    layout.Padding = UDim.new(0, 10)
+    layout.Parent = page
+    Utils.AddPadding(page, UDim.new(0, 4), UDim.new(0, 4), UDim.new(0, 4), UDim.new(0, 4))
+    table.insert(self._pages, page)
+
+    local switching = false
+    local PAGE_BASE_POS = UDim2.new(0, 10, 0, 95)
+    local function switchTo()
+        if switching or index == self._activeTabIndex then return end
+        switching = true
+        local previousIndex = self._activeTabIndex
+        local direction = (index > previousIndex) and 1 or -1
+        self._activeTabIndex = index
+        self:_restyleTabButtons(theme.Color, theme.Accent)
+
+        self._pages[previousIndex].Visible = false
+        self._pages[previousIndex].Position = PAGE_BASE_POS
+
+        local newPage = self._pages[index]
+        newPage.Position = UDim2.new(0, 10 + direction * self._slideOffset, 0, 95)
+        newPage.Visible = true
+
+        local slide = Animator.Tween(newPage, { Position = PAGE_BASE_POS }, 0.35)
+        slide.Completed:Connect(function() switching = false end)
+        slide:Play()
+    end
+    connMgr:Track(btn.MouseButton1Click:Connect(switchTo))
+
+    theme:Subscribe(function(color, accent) self:_restyleTabButtons(color, accent) end)
+
+    local tab = setmetatable({
+        _page = page,
+        _button = btn,
+        _theme = theme,
+        _connMgr = connMgr,
+        _order = 0,
+    }, TabMeta)
+    table.insert(self._tabs, tab)
+    return tab
+end
+
+function Window:Destroy()
+    if activeWindows[self._title] == self._connMgr then
+        activeWindows[self._title] = nil
+    end
+    self._connMgr:DisconnectAll()
+    local mainScale = self._mainFrame:FindFirstChildOfClass("UIScale")
+    local shadow = self._mainFrame:FindFirstChildOfClass("UIShadow")
+    if mainScale then Animator.Tween(mainScale, { Scale = 0.5 }, 0.3, EASE, EASE_IN):Play() end
+    Animator.Tween(self._mainFrame, { BackgroundTransparency = 1 }, 0.3, EASE, EASE_IN):Play()
+    if shadow then Animator.Tween(shadow, { Transparency = 1 }, 0.3, EASE, EASE_IN):Play() end
+    task.delay(0.3, function() self._screenGui:Destroy() end)
+end
+
+function Window:GetTheme() return self._theme end
+function Window:GetGradients() return self._gradients end
+
+--============================================================
+-- Notification layer
+-- Independent of mainFrame (parented directly to the ScreenGui) so
+-- toasts keep showing even while the window is minimized, and stay
+-- visible above the rest of the chrome via ZIndex.
+--============================================================
+function Window:_buildNotificationLayer()
+    local screenGui = self._screenGui
+
+    local container = Instance.new("Frame")
+    container.Name = "Notifications"
+    container.AnchorPoint = Vector2.new(1, 0)
+    container.Position = UDim2.new(1, -20, 0, 20)
+    container.BackgroundTransparency = 1
+    container.ZIndex = 100
+    container.Parent = screenGui
+
+    -- Width caps at 300px but shrinks on narrow/mobile screens, always
+    -- keeping a 20px margin on both sides so the rounded card never clips
+    -- off the left edge of the viewport.
+    local MAX_WIDTH = 300
+    local MIN_MARGIN = 20
+    local function updateContainerSize()
+        local viewport = workspace.CurrentCamera.ViewportSize
+        local w = math.min(MAX_WIDTH, viewport.X - MIN_MARGIN * 2)
+        container.Size = UDim2.new(0, w, 1, -40)
+    end
+    updateContainerSize()
+    self._connMgr:Track(workspace.CurrentCamera:GetPropertyChangedSignal("ViewportSize"):Connect(updateContainerSize))
+
+    local layout = Instance.new("UIListLayout")
+    layout.SortOrder = Enum.SortOrder.LayoutOrder
+    layout.HorizontalAlignment = Enum.HorizontalAlignment.Right
+    layout.Padding = UDim.new(0, 8)
+    layout.Parent = container
+
+    self._notifContainer = container
+    self._notifOrder = 0
+
+    -- Caps the number of simultaneous toasts so a spammy Notify() loop can't
+    -- flood the whole viewport; oldest visible toast is dismissed to make
+    -- room for a new one instead of growing the stack unbounded.
+    self._activeNotifs = {}
+    self._maxNotifs = 5
+end
+
+-- opts: { Title, Text, Type = "success"|"error"|"warning"|"info",
+--         Duration (seconds; default 4, pass 0 or false for sticky/no auto-dismiss) }
+function Window:Notify(opts)
+    opts = opts or {}
+    self._notifOrder = self._notifOrder + 1
+    opts.LayoutOrder = self._notifOrder
+
+    if #self._activeNotifs >= self._maxNotifs then
+        local oldest = table.remove(self._activeNotifs, 1)
+        if oldest and oldest.Dismiss then oldest:Dismiss() end
+    end
+
+    local notif = Components.Notification(self._notifContainer, self._theme, self._connMgr, opts)
+    local userOnDismiss = opts.OnDismiss
+    opts.OnDismiss = function()
+        for i, n in ipairs(self._activeNotifs) do
+            if n == notif then table.remove(self._activeNotifs, i); break end
+        end
+        if userOnDismiss then userOnDismiss() end
+    end
+    table.insert(self._activeNotifs, notif)
+    return notif
+end
+
+--============================================================
+-- Tab methods
+-- Thin wrappers that assign a LayoutOrder and forward to Components.*
+--============================================================
+local function nextOrder(tab)
+    tab._order = tab._order + 1
+    return tab._order
+end
+
+function TabMeta:CreateLabel(opts)
+    opts = opts or {}
+    opts.LayoutOrder = nextOrder(self)
+    return Components.Label(self._page, self._theme, self._connMgr, opts)
+end
+function TabMeta:CreateButton(opts)
+    opts = opts or {}
+    opts.LayoutOrder = nextOrder(self)
+    return Components.Button(self._page, self._theme, self._connMgr, opts)
+end
+function TabMeta:CreateToggle(opts)
+    opts = opts or {}
+    opts.LayoutOrder = nextOrder(self)
+    return Components.Toggle(self._page, self._theme, self._connMgr, opts)
+end
+function TabMeta:CreateSlider(opts)
+    opts = opts or {}
+    opts.LayoutOrder = nextOrder(self)
+    return Components.Slider(self._page, self._theme, self._connMgr, opts)
+end
+function TabMeta:CreateTextbox(opts)
+    opts = opts or {}
+    opts.LayoutOrder = nextOrder(self)
+    return Components.Textbox(self._page, self._theme, self._connMgr, opts)
+end
+function TabMeta:CreateDropdown(opts)
+    opts = opts or {}
+    opts.LayoutOrder = nextOrder(self)
+    return Components.Dropdown(self._page, self._theme, self._connMgr, opts)
+end
+function TabMeta:CreateMultiDropdown(opts)
+    opts = opts or {}
+    opts.LayoutOrder = nextOrder(self)
+    return Components.MultiDropdown(self._page, self._theme, self._connMgr, opts)
+end
+function TabMeta:CreateColorPicker(opts)
+    opts = opts or {}
+    opts.LayoutOrder = nextOrder(self)
+    return Components.ColorPicker(self._page, self._theme, self._connMgr, opts)
+end
+function TabMeta:CreateThemeGrid(opts)
+    opts = opts or {}
+    opts.LayoutOrder = nextOrder(self)
+    return Components.ThemeGrid(self._page, self._theme, self._connMgr, opts)
+end
+function TabMeta:CreateGradientPicker(opts)
+    opts = opts or {}
+    opts.LayoutOrder = nextOrder(self)
+    nextOrder(self) -- GradientPicker also creates the grid one order below
+    return Components.GradientPicker(self._page, self._theme, self._connMgr, opts)
+end
+
+--============================================================
+-- Public Library API
+--============================================================
+local Library = {}
+
+-- Tracks the most recently created window so Library:Destroy() (i.e.
+-- `Selenix:Destroy()`) has something to close without the caller needing
+-- to hold onto the Window object themselves.
+Library._activeWindow = nil
+
+function Library:CreateWindow(config)
+    local window = Window.new(config)
+    Library._activeWindow = window
+    return window
+end
+
+-- Closes the UI programmatically — e.g. `Selenix:Destroy()` — running the
+-- same fade/scale-down teardown as Window:Destroy(). No-op if there is no
+-- active window (already destroyed, or never created).
+function Library:Destroy()
+    if Library._activeWindow then
+        Library._activeWindow:Destroy()
+        Library._activeWindow = nil
+    end
+end
+
+return Library
+local Player = Players.LocalPlayer
+
+local EASE = Enum.EasingStyle.Quint
+local EASE_OUT = Enum.EasingDirection.Out
+local EASE_IN = Enum.EasingDirection.In
+
+-- Shared duration for the "theme changed" recolor tween used by every
+-- component's ApplyTheme(). Previously most components just snapped their
+-- colors straight to the new theme instead of tweening, so picking a new
+-- theme in ThemeGrid looked jarring/inconsistent (only the tab buttons
+-- actually animated). Everything below now tweens using this constant.
+local THEME_TWEEN_DURATION = 0.3
+local THEME_TWEEN_INFO = TweenInfo.new(THEME_TWEEN_DURATION, EASE, EASE_OUT)
+
+--============================================================
+-- MODULE: Utils
+--============================================================
+local Utils = {}
+
+function Utils.Brighten(color, factor)
+    return Color3.new(
+        math.min(color.r * factor, 1),
+        math.min(color.g * factor, 1),
+        math.min(color.b * factor, 1)
+    )
+end
+Utils.Darken = Utils.Brighten -- factor < 1 darkens, factor > 1 brightens; same math either way
+
+function Utils.GetLuminance(c)
+    return 0.299 * c.r + 0.587 * c.g + 0.114 * c.b
+end
+
+-- Contrast-safe text color for a given background, lightly tinted with `tint` (usually the accent)
+function Utils.GetTextColorFor(bg, tint)
+    if Utils.GetLuminance(bg) > 0.55 then
+        return Color3.new(
+            math.min(tint.r * 0.55 + 0.02, 1),
+            math.min(tint.g * 0.55 + 0.02, 1),
+            math.min(tint.b * 0.55 + 0.02, 1)
+        )
+    else
+        return Color3.new(
+            math.min(0.82 + tint.r * 0.18, 1),
+            math.min(0.82 + tint.g * 0.18, 1),
+            math.min(0.82 + tint.b * 0.18, 1)
+        )
+    end
+end
+
+function Utils.AddCorner(parent, radius)
+    local c = Instance.new("UICorner")
+    c.CornerRadius = radius or UDim.new(0, 8)
+    c.Parent = parent
+    return c
+end
+
+function Utils.AddPadding(parent, left, right, top, bottom)
+    local p = Instance.new("UIPadding")
+    if left then p.PaddingLeft = left end
+    if right then p.PaddingRight = right end
+    if top then p.PaddingTop = top end
+    if bottom then p.PaddingBottom = bottom end
+    p.Parent = parent
+    return p
+end
+
+function Utils.ToHex(color)
+    return string.format("#%02X%02X%02X",
+        math.floor(color.R * 255 + 0.5),
+        math.floor(color.G * 255 + 0.5),
+        math.floor(color.B * 255 + 0.5))
+end
+
+-- Returns color, success
+function Utils.HexToColor3(text)
+    local hex = text:gsub("#", ""):gsub("%s", "")
+    if #hex ~= 6 or hex:match("[^0-9a-fA-F]") then
+        return nil, false
+    end
+    local r = tonumber(hex:sub(1, 2), 16)
+    local g = tonumber(hex:sub(3, 4), 16)
+    local b = tonumber(hex:sub(5, 6), 16)
+    return Color3.fromRGB(r, g, b), true
+end
+
+--============================================================
+-- MODULE: ConnectionManager
+-- Central place to track every RBXScriptConnection created by the
+-- UI so Window:Destroy() can cleanly tear everything down (fixes
+-- the "leak on rerun" class of bugs from the original script).
+--============================================================
+local ConnectionManager = {}
+ConnectionManager.__index = ConnectionManager
+
+function ConnectionManager.new()
+    return setmetatable({ _connections = {} }, ConnectionManager)
+end
+
+function ConnectionManager:Track(conn)
+    table.insert(self._connections, conn)
+    return conn
+end
+
+function ConnectionManager:DisconnectAll()
+    for _, conn in ipairs(self._connections) do
+        if conn.Connected then conn:Disconnect() end
+    end
+    table.clear(self._connections)
+end
+
+--============================================================
+-- MODULE: Animator
+--============================================================
+local Animator = {}
+
+local HOVER_THICKNESS = 1.5
+local PRESSED_THICKNESS = 1.5
+
+-- Adds the thin "outline grows on hover/press" stroke used by every clickable control.
+function Animator.AddThickenStroke(btn, connMgr)
+    local stroke = Instance.new("UIStroke")
+    stroke.Name = "ThickenStroke"
+    stroke.Thickness = 0
+    stroke.Color = Color3.fromRGB(255, 255, 255)
+    stroke.Transparency = 0.5
+    stroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+    stroke.Parent = btn
+
+    local function to(thickness, dur)
+        TweenService:Create(stroke, TweenInfo.new(dur, EASE, EASE_OUT), { Thickness = thickness }):Play()
+    end
+
+    connMgr:Track(btn.MouseEnter:Connect(function() to(HOVER_THICKNESS, 0.25) end))
+    connMgr:Track(btn.MouseLeave:Connect(function() to(0, 0.25) end))
+    connMgr:Track(btn.MouseButton1Down:Connect(function() to(PRESSED_THICKNESS, 0.12) end))
+    connMgr:Track(btn.MouseButton1Up:Connect(function() to(HOVER_THICKNESS, 0.18) end))
+    connMgr:Track(btn.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.Touch then to(PRESSED_THICKNESS, 0.12) end
+    end))
+    connMgr:Track(btn.InputEnded:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.Touch then to(0, 0.25) end
+    end))
+
+    return stroke
+end
+
+-- Background-color hover effect.
+-- baseColor can be:
+--   * nil                -> "live" mode: auto-brighten whatever BackgroundColor3
+--                           currently is when the mouse enters, and restore that
+--                           captured value on leave. Only safe for buttons whose
+--                           color is never changed by anything else afterwards.
+--   * a function          -> "reactive" mode: on both enter and leave, the base
+--                           color is *recomputed* by calling baseColor() fresh,
+--                           instead of relying on a value captured at MouseEnter
+--                           time. Use this whenever the button's real base color
+--                           is also being retweened elsewhere (e.g. by
+--                           Theme:Apply()) — otherwise a theme change that lands
+--                           while the mouse is still hovering gets silently
+--                           overwritten by the *stale* pre-change color the next
+--                           time MouseLeave fires.
+--   * a Color3             -> "static" mode: fixed base/hover colors, used for
+--                           chrome buttons whose colors never depend on theme.
+function Animator.AddHoverEffect(btn, connMgr, baseColor, hoverColor, skipStroke)
+    if not skipStroke then Animator.AddThickenStroke(btn, connMgr) end
+    local isDynamic = (type(baseColor) == "function")
+    local liveMode = (baseColor == nil)
+    local storedBase
+
+    connMgr:Track(btn.MouseEnter:Connect(function()
+        if isDynamic then
+            TweenService:Create(btn, TweenInfo.new(0.25, EASE, EASE_OUT), { BackgroundColor3 = Utils.Brighten(baseColor(), 1.2) }):Play()
+        elseif liveMode then
+            storedBase = btn.BackgroundColor3
+            TweenService:Create(btn, TweenInfo.new(0.25, EASE, EASE_OUT), { BackgroundColor3 = Utils.Brighten(storedBase, 1.2) }):Play()
+        elseif hoverColor then
+            TweenService:Create(btn, TweenInfo.new(0.25, EASE, EASE_OUT), { BackgroundColor3 = hoverColor }):Play()
+        end
+    end))
+    connMgr:Track(btn.MouseLeave:Connect(function()
+        if isDynamic then
+            TweenService:Create(btn, TweenInfo.new(0.25, EASE, EASE_OUT), { BackgroundColor3 = baseColor() }):Play()
+        elseif liveMode then
+            if storedBase then
+                TweenService:Create(btn, TweenInfo.new(0.25, EASE, EASE_OUT), { BackgroundColor3 = storedBase }):Play()
+            end
+        elseif baseColor then
+            TweenService:Create(btn, TweenInfo.new(0.25, EASE, EASE_OUT), { BackgroundColor3 = baseColor }):Play()
+        end
+    end))
+end
+
+function Animator.Tween(obj, props, duration, style, dir)
+    return TweenService:Create(obj, TweenInfo.new(duration or 0.3, style or EASE, dir or EASE_OUT), props)
+end
+
+-- TweenService cannot tween ColorSequence, so gradient recoloring is done with a
+-- manual per-frame lerp between two flat colors (start/end keypoints).
+local activeGradientLerps = setmetatable({}, { __mode = "k" }) -- weak keys: entries self-clean if `grad` is GC'd/destroyed mid-lerp
+function Animator.TweenGradientColor(grad, colorSeq, duration, connMgr, instant)
+    if activeGradientLerps[grad] then
+        activeGradientLerps[grad]:Disconnect()
+        activeGradientLerps[grad] = nil
+    end
+    if instant then
+        grad.Color = colorSeq
+        return
+    end
+    local targetC1 = colorSeq.Keypoints[1].Value
+    local targetC2 = colorSeq.Keypoints[#colorSeq.Keypoints].Value
+    local startSeq = grad.Color
+    local startC1 = startSeq.Keypoints[1].Value
+    local startC2 = startSeq.Keypoints[#startSeq.Keypoints].Value
+    local startTime = tick()
+
+    local conn
+    conn = RunService.Heartbeat:Connect(function()
+        -- grad may have been Destroy()'d while this Heartbeat connection was
+        -- still pending disconnect (e.g. Window:Destroy() mid-lerp); guard
+        -- against writing to / reading a dead Instance instead of relying
+        -- solely on ConnectionManager's teardown timing.
+        if not grad.Parent then
+            conn:Disconnect()
+            activeGradientLerps[grad] = nil
+            return
+        end
+        local alpha = math.clamp((tick() - startTime) / (duration or 0.35), 0, 1)
+        grad.Color = ColorSequence.new(startC1:Lerp(targetC1, alpha), startC2:Lerp(targetC2, alpha))
+        if alpha >= 1 then
+            conn:Disconnect()
+            activeGradientLerps[grad] = nil
+        end
+    end)
+    if connMgr then connMgr:Track(conn) end
+    activeGradientLerps[grad] = conn
+end
+
+--============================================================
+-- MODULE: Theme
+-- Single source of truth for {Color, Accent}. Components register
+-- themselves once and get restyled automatically on every change,
+-- instead of the old approach of manually listing every object in
+-- one giant ApplyTheme() function.
+--============================================================
+local Theme = {}
+Theme.__index = Theme
+
+function Theme.new(color, accent)
+    return setmetatable({
+        Color = color,
+        Accent = accent,
+        _subscribers = {},
+    }, Theme)
+end
+
+-- fn(color, accent, isInitial) is called immediately once with isInitial=true,
+-- then again with isInitial=false on every subsequent Apply(). Passing this
+-- flag lets every subscriber snap on the first paint and only tween on real
+-- theme changes, instead of each component having to hand-roll its own
+-- "initialized" flag (which most of them previously didn't, causing a
+-- visible flash-then-tween on creation — see Components.* ApplyTheme below).
+function Theme:Subscribe(fn)
+    table.insert(self._subscribers, fn)
+    fn(self.Color, self.Accent, true)
+end
+
+function Theme:Apply(color, accent)
+    self.Color, self.Accent = color, accent
+    for _, fn in ipairs(self._subscribers) do
+        fn(color, accent, false)
+    end
+end
+
+function Theme:PanelColors()
+    local panelBg = Utils.Brighten(self.Color, 1.2)
+    local darkBg = Utils.Darken(self.Color, 0.8)
+    return panelBg, darkBg,
+        Utils.GetTextColorFor(panelBg, self.Accent),
+        Utils.GetTextColorFor(darkBg, self.Accent)
+end
+
+--============================================================
+-- MODULE: Components
+-- Every factory returns { Instance, ApplyTheme(color,accent), Destroy() }
+--============================================================
+local Components = {}
+
+-- ---------- Label ----------
+function Components.Label(parent, theme, connMgr, opts)
+    local holder = Instance.new("Frame")
+    holder.Size = opts.Size or UDim2.new(1, 0, 0, 34)
+    holder.LayoutOrder = opts.LayoutOrder or 0
+    holder.BackgroundTransparency = 1
+    holder.Parent = parent
+
+    local label = Instance.new("TextLabel")
+    label.Size = UDim2.new(1, 0, 1, 0)
+    label.BackgroundTransparency = 1
+    label.Text = opts.Text or ""
+    label.TextXAlignment = Enum.TextXAlignment.Left
+    label.TextYAlignment = Enum.TextYAlignment.Top
+    label.Font = opts.Bold and Enum.Font.GothamBold or Enum.Font.Gotham
+    label.TextSize = opts.TextSize or 14
+    label.TextWrapped = true
+    label.Parent = holder
+    if opts.Padded ~= false then Utils.AddPadding(label, UDim.new(0, 15)) end
+
+    local self = { Instance = holder }
+    -- Labels sit directly on mainFrame's background (no panel of their own),
+    -- so their contrast-safe color is computed against the live theme.Color
+    -- itself rather than the brightened "panel" background other controls
+    -- use. opts.Muted dims that same contrast-safe color instead of using a
+    -- fixed gray, so muted labels stay readable on both dark and light themes.
+    function self:ApplyTheme(color, accent, isInitial)
+        local textColor = Utils.GetTextColorFor(color, accent)
+        if opts.Muted then
+            textColor = (Utils.GetLuminance(color) > 0.55)
+                and Color3.new(textColor.r * 0.7, textColor.g * 0.7, textColor.b * 0.7)
+                or Color3.new(0.7 + textColor.r * 0.3, 0.7 + textColor.g * 0.3, 0.7 + textColor.b * 0.3)
+        end
+        if isInitial then
+            label.TextColor3 = textColor
+        else
+            TweenService:Create(label, THEME_TWEEN_INFO, { TextColor3 = textColor }):Play()
+        end
+    end
+    theme:Subscribe(function(c, a, initial) self:ApplyTheme(c, a, initial) end)
+    return self
+end
+
+-- ---------- Button ----------
+function Components.Button(parent, theme, connMgr, opts)
+    local holder = Instance.new("Frame")
+    holder.Size = opts.Size or UDim2.new(1, 0, 0, 40)
+    holder.LayoutOrder = opts.LayoutOrder or 0
+    holder.BackgroundTransparency = 1
+    holder.Parent = parent
+
+    local btn = Instance.new("TextButton")
+    btn.Size = UDim2.new(1, 0, 1, 0)
+    btn.Text = opts.Text or "Button"
+    btn.TextColor3 = Color3.fromRGB(255, 255, 255)
+    btn.Font = Enum.Font.GothamBold
+    btn.TextSize = 16
+    btn.TextXAlignment = Enum.TextXAlignment.Left
+    btn.Parent = holder
+    Utils.AddPadding(btn, UDim.new(0, 15))
+    Utils.AddCorner(btn, UDim.new(0, 8))
+    -- Reactive mode: base color is recomputed fresh from the live theme on
+    -- every enter/leave, so a theme change landing mid-hover can't get
+    -- clobbered by a stale pre-change color when the mouse leaves.
+    Animator.AddHoverEffect(btn, connMgr, function() return Utils.Brighten(theme.Color, 1.2) end)
+
+    if opts.Callback then
+        connMgr:Track(btn.MouseButton1Click:Connect(opts.Callback))
+    end
+
+    local self = { Instance = holder }
+    function self:ApplyTheme(color, accent, isInitial)
+        local panelBg = Utils.Brighten(color, 1.2)
+        local textColor = Utils.GetTextColorFor(panelBg, accent)
+        if isInitial then
+            btn.BackgroundColor3 = panelBg
+            btn.TextColor3 = textColor
+        else
+            TweenService:Create(btn, THEME_TWEEN_INFO, {
+                BackgroundColor3 = panelBg,
+                TextColor3 = textColor,
+            }):Play()
+        end
+    end
+    theme:Subscribe(function(c, a, initial) self:ApplyTheme(c, a, initial) end)
+    return self
+end
+
+-- ---------- Toggle ----------
+function Components.Toggle(parent, theme, connMgr, opts)
+    local frame = Instance.new("Frame")
+    frame.Size = opts.Size or UDim2.new(1, 0, 0, 40)
+    frame.LayoutOrder = opts.LayoutOrder or 0
+    frame.Parent = parent
+    Utils.AddCorner(frame, UDim.new(0, 8))
+
+    local label = Instance.new("TextLabel")
+    label.Size = UDim2.new(1, -85, 1, 0)
+    label.Position = UDim2.new(0, 10, 0, 0)
+    label.BackgroundTransparency = 1
+    label.TextColor3 = Color3.fromRGB(255, 255, 255)
+    label.TextXAlignment = Enum.TextXAlignment.Left
+    label.Font = Enum.Font.GothamBold
+    label.TextSize = 16
+    label.Parent = frame
+
+    local track = Instance.new("TextButton")
+    track.AnchorPoint = Vector2.new(1, 0.5)
+    track.Position = UDim2.new(1, -15, 0.5, 0)
+    track.Size = UDim2.new(0, 52, 0, 28)
+    track.Text = ""
+    track.AutoButtonColor = false
+    track.Parent = frame
+    Utils.AddCorner(track, UDim.new(1, 0))
+
+    local knob = Instance.new("Frame")
+    knob.AnchorPoint = Vector2.new(0, 0.5)
+    knob.Position = UDim2.new(0, 3, 0.5, 0)
+    knob.Size = UDim2.new(0, 22, 0, 22)
+    knob.BackgroundColor3 = Color3.fromRGB(220, 220, 225)
+    knob.BorderSizePixel = 0
+    knob.Parent = track
+    Utils.AddCorner(knob, UDim.new(1, 0))
+
+    local state = opts.Default or false
+    local function labelText()
+        return (opts.Text or "Trạng thái") .. ": " .. (state and (opts.OnText or "Bật") or (opts.OffText or "Tắt"))
+    end
+    label.Text = labelText()
+
+    local function restyle(instant)
+        local darkBg = Utils.Darken(theme.Color, 0.8)
+        local trackColor = state and Utils.Brighten(theme.Accent, 1.15) or darkBg
+        local knobX = state and (52 - 22 - 3) or 3
+        local info = TweenInfo.new(instant and 0 or 0.3, EASE, EASE_OUT)
+        TweenService:Create(track, info, { BackgroundColor3 = trackColor }):Play()
+        TweenService:Create(knob, info, { Position = UDim2.new(0, knobX, 0.5, 0) }):Play()
+    end
+
+    connMgr:Track(track.MouseButton1Click:Connect(function()
+        state = not state
+        label.Text = labelText()
+        restyle(false)
+        if opts.Callback then opts.Callback(state) end
+    end))
+
+    local self = { Instance = frame }
+    function self:Get() return state end
+    function self:Set(v)
+        if v == state then return end
+        state = v
+        label.Text = labelText()
+        restyle(false)
+    end
+    function self:ApplyTheme(color, accent, isInitial)
+        local panelBg = Utils.Brighten(color, 1.2)
+        local textColor = Utils.GetTextColorFor(panelBg, accent)
+        if isInitial then
+            frame.BackgroundColor3 = panelBg
+            label.TextColor3 = textColor
+        else
+            TweenService:Create(frame, THEME_TWEEN_INFO, { BackgroundColor3 = panelBg }):Play()
+            TweenService:Create(label, THEME_TWEEN_INFO, { TextColor3 = textColor }):Play()
+        end
+        restyle(isInitial)
+    end
+    theme:Subscribe(function(c, a, initial) self:ApplyTheme(c, a, initial) end)
+    return self
+end
+
+-- ---------- Slider ----------
+-- opts.Decimals (integer, default 0) lets the slider represent fractional
+-- values (e.g. 0.0-1.0 uniforms) instead of always rounding to whole
+-- numbers — previously `value = math.round(...)` made it impossible to
+-- drive a 0-1 float parameter from this control at all.
+function Components.Slider(parent, theme, connMgr, opts)
+    local min, max = opts.Min or 0, opts.Max or 100
+    -- Guard against a misconfigured Min == Max (or Min > Max): every alpha
+    -- calculation below divides by (max - min), which previously produced
+    -- NaN positions/sizes (and a NaN drag value) instead of just clamping.
+    local range = (max > min) and (max - min) or 1
+    local decimals = math.max(math.floor(opts.Decimals or 0), 0)
+    local step = 10 ^ (-decimals) -- smallest representable increment at this precision
+
+    local function roundTo(n)
+        local mult = 10 ^ decimals
+        return math.round(n * mult) / mult
+    end
+    local function fmt(n)
+        if decimals <= 0 then return tostring(math.floor(n + 0.5)) end
+        return string.format("%." .. decimals .. "f", n)
+    end
+
+    local value = roundTo(math.clamp(opts.Default or min, min, max))
+    local suffix = opts.Suffix or "%"
+
+    local frame = Instance.new("Frame")
+    frame.Size = opts.Size or UDim2.new(1, 0, 0, 40)
+    frame.LayoutOrder = opts.LayoutOrder or 0
+    frame.Parent = parent
+    Utils.AddCorner(frame, UDim.new(0, 8))
+
+    local label = Instance.new("TextLabel")
+    label.Size = UDim2.new(0.45, 0, 1, 0)
+    label.Position = UDim2.new(0, 10, 0, 0)
+    label.BackgroundTransparency = 1
+    label.TextColor3 = Color3.fromRGB(255, 255, 255)
+    label.TextXAlignment = Enum.TextXAlignment.Left
+    label.Font = Enum.Font.GothamBold
+    label.TextSize = 15
+    label.Parent = frame
+
+    local function labelText() return (opts.Text or "Giá trị") .. ": " .. fmt(value) .. suffix end
+    label.Text = labelText()
+
+    local bar = Instance.new("Frame")
+    bar.Size = UDim2.new(0.35, 0, 0, 4)
+    bar.Position = UDim2.new(0.58, 0, 0, 18)
+    bar.BorderSizePixel = 0
+    bar.Parent = frame
+    Utils.AddCorner(bar, UDim.new(1, 0))
+
+    local fill = Instance.new("Frame")
+    fill.Size = UDim2.new((value - min) / range, 0, 1, 0)
+    fill.BorderSizePixel = 0
+    fill.Parent = bar
+    Utils.AddCorner(fill, UDim.new(1, 0))
+
+    local drag = Instance.new("TextButton")
+    drag.Size = UDim2.new(0, 20, 0, 20)
+    drag.AnchorPoint = Vector2.new(0.5, 0.5)
+    drag.Position = UDim2.new((value - min) / range, 0, 0.5, 0)
+    drag.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+    drag.Text = ""
+    drag.ZIndex = 2
+    drag.Parent = bar
+    Utils.AddCorner(drag, UDim.new(1, 0))
+
+    local dragging = false
+    local function update(inputPos)
+        local absPos, absSize = bar.AbsolutePosition, bar.AbsoluteSize
+        local alpha = math.clamp((inputPos.X - absPos.X) / absSize.X, 0, 1)
+        value = roundTo(min + alpha * range)
+        alpha = (value - min) / range
+        label.Text = labelText()
+        fill.Size = UDim2.new(alpha, 0, 1, 0)
+        drag.Position = UDim2.new(alpha, 0, 0.5, 0)
+        if opts.Callback then opts.Callback(value) end
+    end
+
+    connMgr:Track(drag.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = true
+        end
+    end))
+    connMgr:Track(bar.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = true
+            update(input.Position)
+        end
+    end))
+    connMgr:Track(UserInputService.InputEnded:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = false
+        end
+    end))
+    connMgr:Track(UserInputService.InputChanged:Connect(function(input)
+        if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+            update(input.Position)
+        end
+    end))
+
+    local self = { Instance = frame }
+    function self:Get() return value end
+    function self:ApplyTheme(color, accent, isInitial)
+        local panelBg = Utils.Brighten(color, 1.2)
+        local textColor = Utils.GetTextColorFor(panelBg, accent)
+        local darkBg = Utils.Darken(color, 0.8)
+        if isInitial then
+            frame.BackgroundColor3 = panelBg
+            label.TextColor3 = textColor
+            bar.BackgroundColor3 = darkBg
+            fill.BackgroundColor3 = accent
+        else
+            TweenService:Create(frame, THEME_TWEEN_INFO, { BackgroundColor3 = panelBg }):Play()
+            TweenService:Create(label, THEME_TWEEN_INFO, { TextColor3 = textColor }):Play()
+            TweenService:Create(bar, THEME_TWEEN_INFO, { BackgroundColor3 = darkBg }):Play()
+            TweenService:Create(fill, THEME_TWEEN_INFO, { BackgroundColor3 = accent }):Play()
+        end
+    end
+    theme:Subscribe(function(c, a, initial) self:ApplyTheme(c, a, initial) end)
+    return self
+end
+
+-- ---------- Textbox ----------
+function Components.Textbox(parent, theme, connMgr, opts)
+    local frame = Instance.new("Frame")
+    frame.Size = opts.Size or UDim2.new(1, 0, 0, 40)
+    frame.LayoutOrder = opts.LayoutOrder or 0
+    frame.Parent = parent
+    Utils.AddCorner(frame, UDim.new(0, 8))
+
+    local label = Instance.new("TextLabel")
+    label.Size = UDim2.new(0, 90, 1, 0)
+    label.Position = UDim2.new(0, 10, 0, 0)
+    label.BackgroundTransparency = 1
+    label.Text = opts.Text or "Nhập:"
+    label.TextColor3 = Color3.fromRGB(255, 255, 255)
+    label.TextXAlignment = Enum.TextXAlignment.Left
+    label.Font = Enum.Font.GothamBold
+    label.TextSize = 15
+    label.Parent = frame
+
+    local box = Instance.new("TextBox")
+    box.AnchorPoint = Vector2.new(1, 0.5)
+    box.Position = UDim2.new(1, -10, 0.5, 0)
+    box.Size = UDim2.new(0, 150, 0, 28)
+    box.Text = opts.Default or ""
+    box.PlaceholderText = opts.Placeholder or "Nhập nội dung..."
+    box.PlaceholderColor3 = Color3.fromRGB(150, 150, 160)
+    box.TextColor3 = Color3.fromRGB(255, 255, 255)
+    box.Font = Enum.Font.Gotham
+    box.TextSize = 14
+    box.ClearTextOnFocus = false
+    box.ClipsDescendants = true
+    box.Parent = frame
+    Utils.AddPadding(box, UDim.new(0, 10), UDim.new(0, 10))
+    Utils.AddCorner(box, UDim.new(0, 6))
+
+    local stroke = Instance.new("UIStroke")
+    stroke.Thickness = 1.5
+    stroke.Transparency = 1
+    stroke.Parent = box
+
+    connMgr:Track(box.Focused:Connect(function()
+        TweenService:Create(stroke, TweenInfo.new(0.25, EASE, EASE_OUT), { Transparency = 0 }):Play()
+    end))
+    connMgr:Track(box.FocusLost:Connect(function(enterPressed)
+        TweenService:Create(stroke, TweenInfo.new(0.25, EASE, EASE_OUT), { Transparency = 1 }):Play()
+        if enterPressed and opts.Callback then opts.Callback(box.Text) end
+    end))
+
+    local self = { Instance = frame }
+    function self:Get() return box.Text end
+    function self:ApplyTheme(color, accent, isInitial)
+        local panelBg = Utils.Brighten(color, 1.2)
+        local darkBg = Utils.Darken(color, 0.8)
+        local labelTextColor = Utils.GetTextColorFor(panelBg, accent)
+        local boxTextColor = Utils.GetTextColorFor(darkBg, accent)
+        if isInitial then
+            frame.BackgroundColor3 = panelBg
+            label.TextColor3 = labelTextColor
+            box.BackgroundColor3 = darkBg
+            box.TextColor3 = boxTextColor
+            stroke.Color = accent
+        else
+            TweenService:Create(frame, THEME_TWEEN_INFO, { BackgroundColor3 = panelBg }):Play()
+            TweenService:Create(label, THEME_TWEEN_INFO, { TextColor3 = labelTextColor }):Play()
+            TweenService:Create(box, THEME_TWEEN_INFO, {
+                BackgroundColor3 = darkBg,
+                TextColor3 = boxTextColor,
+            }):Play()
+            TweenService:Create(stroke, THEME_TWEEN_INFO, { Color = accent }):Play()
+        end
+    end
+    theme:Subscribe(function(c, a, initial) self:ApplyTheme(c, a, initial) end)
+    return self
+end
+
+-- ---------- ExpandableHeader ----------
+-- Shared "header row that expands into a body panel" used by Dropdown,
+-- MultiDropdown and ColorPicker. Collapses three near-identical blocks
+-- from the original script into one reusable piece.
+function Components.ExpandableHeader(parent, theme, connMgr, opts)
+    local closedHeight = opts.ClosedHeight or 46
+    local bodyHeight = opts.BodyHeight or 200
+    local openHeight = closedHeight + bodyHeight + 6
+
+    local container = Instance.new("Frame")
+    container.Size = opts.Size or UDim2.new(1, 0, 0, closedHeight)
+    container.LayoutOrder = opts.LayoutOrder or 0
+    container.BackgroundTransparency = 1
+    container.ClipsDescendants = true
+    container.Parent = parent
+
+    local header = Instance.new("TextButton")
+    header.Size = UDim2.new(1, -4, 0, 40)
+    header.Position = UDim2.new(0, 2, 0, 3)
+    header.Text = ""
+    header.AutoButtonColor = false
+    header.Parent = container
+    Utils.AddCorner(header, UDim.new(0, 8))
+
+    local titleLabel = Instance.new("TextLabel")
+    titleLabel.Name = "Title"
+    titleLabel.Size = UDim2.new(1, -95, 1, 0)
+    titleLabel.Position = UDim2.new(0, 10, 0, 0)
+    titleLabel.BackgroundTransparency = 1
+    titleLabel.Text = opts.Text or ""
+    titleLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
+    titleLabel.TextXAlignment = Enum.TextXAlignment.Left
+    titleLabel.Font = Enum.Font.GothamBold
+    titleLabel.TextSize = 15
+    titleLabel.Parent = header
+
+    local arrow = Instance.new("TextLabel")
+    arrow.AnchorPoint = Vector2.new(1, 0.5)
+    arrow.Position = UDim2.new(1, -12, 0.5, 0)
+    arrow.Size = UDim2.new(0, 18, 0, 18)
+    arrow.BackgroundTransparency = 1
+    arrow.Text = "▾"
+    arrow.TextColor3 = Color3.fromRGB(255, 255, 255)
+    arrow.Font = Enum.Font.GothamBold
+    arrow.TextSize = 16
+    arrow.Parent = header
+
+    local body = Instance.new("Frame")
+    body.Position = UDim2.new(0, 2, 0, 47)
+    body.Size = UDim2.new(1, -4, 0, bodyHeight)
+    body.BackgroundTransparency = 1
+    body.Parent = container
+
+    -- Reactive mode: recompute the header's base color fresh from the live
+    -- theme on every enter/leave (see Animator.AddHoverEffect) instead of
+    -- capturing it once — otherwise a theme change while the header is
+    -- hovered gets overwritten by the stale color on MouseLeave.
+    Animator.AddHoverEffect(header, connMgr, function() return Utils.Brighten(theme.Color, 1.2) end)
+
+    local open, animating = false, false
+    local function setOpen(v)
+        if animating or v == open then return end
+        animating = true
+        open = v
+        TweenService:Create(arrow, TweenInfo.new(0.3, EASE, EASE_OUT), { Rotation = open and 180 or 0 }):Play()
+        local tw = TweenService:Create(container, TweenInfo.new(0.33, EASE, EASE_OUT), {
+            Size = UDim2.new(1, 0, 0, open and openHeight or closedHeight)
+        })
+        tw.Completed:Connect(function() animating = false end)
+        tw:Play()
+        if opts.OnToggle then opts.OnToggle(open) end
+    end
+    connMgr:Track(header.MouseButton1Click:Connect(function() setOpen(not open) end))
+
+    return {
+        Container = container,
+        Header = header,
+        TitleLabel = titleLabel,
+        Arrow = arrow,
+        Body = body,
+        SetOpen = setOpen,
+    }
+end
+
+-- ---------- Dropdown (single select) ----------
+function Components.Dropdown(parent, theme, connMgr, opts)
+    local options = opts.Options or {}
+    local optionHeight = 32
+    local bodyHeight = #options * optionHeight + math.max(#options - 1, 0) * 6
+    local selected = opts.Default or options[1]
+
+    local exp = Components.ExpandableHeader(parent, theme, connMgr, {
+        Text = opts.Text or "Chọn mục:",
+        LayoutOrder = opts.LayoutOrder,
+        BodyHeight = bodyHeight,
+    })
+
+    local valueLabel = Instance.new("TextLabel")
+    valueLabel.AnchorPoint = Vector2.new(1, 0.5)
+    valueLabel.Position = UDim2.new(1, -35, 0.5, 0)
+    valueLabel.Size = UDim2.new(0, 110, 1, 0)
+    valueLabel.BackgroundTransparency = 1
+    valueLabel.Text = selected or ""
+    valueLabel.TextColor3 = Color3.fromRGB(190, 190, 200)
+    valueLabel.TextXAlignment = Enum.TextXAlignment.Right
+    valueLabel.Font = Enum.Font.Gotham
+    valueLabel.TextSize = 14
+    valueLabel.TextTruncate = Enum.TextTruncate.AtEnd
+    valueLabel.Parent = exp.Header
+
+    local list = Instance.new("Frame")
+    list.Size = UDim2.new(1, 0, 1, 0)
+    list.BackgroundTransparency = 1
+    list.Parent = exp.Body
+    local layout = Instance.new("UIListLayout")
+    layout.SortOrder = Enum.SortOrder.LayoutOrder
+    layout.Padding = UDim.new(0, 6)
+    layout.Parent = list
+
+    local optionButtons = {}
+    local function baseColorFor(text)
+        return (text == selected) and theme.Accent or Utils.Darken(theme.Color, 0.8)
+    end
+
+    local function select(text)
+        selected = text
+        valueLabel.Text = text
+        for _, row in ipairs(optionButtons) do
+            local isSel = (row.text == text)
+            TweenService:Create(row.btn, TweenInfo.new(0.25, EASE, EASE_OUT), {
+                BackgroundColor3 = isSel and theme.Accent or Utils.Darken(theme.Color, 0.8)
+            }):Play()
+        end
+        if opts.Callback then opts.Callback(text) end
+    end
+
+    for i, text in ipairs(options) do
+        local btn = Instance.new("TextButton")
+        btn.Size = UDim2.new(1, 0, 0, optionHeight)
+        btn.LayoutOrder = i
+        btn.BackgroundColor3 = baseColorFor(text)
+        btn.Text = text
+        btn.TextXAlignment = Enum.TextXAlignment.Left
+        btn.TextColor3 = Color3.fromRGB(255, 255, 255)
+        btn.Font = Enum.Font.Gotham
+        btn.TextSize = 14
+        btn.Parent = list
+        Utils.AddCorner(btn, UDim.new(0, 6))
+        Utils.AddPadding(btn, UDim.new(0, 10))
+        Animator.AddThickenStroke(btn, connMgr)
+
+        connMgr:Track(btn.MouseEnter:Connect(function()
+            TweenService:Create(btn, TweenInfo.new(0.18, EASE, EASE_OUT), { BackgroundColor3 = Utils.Brighten(baseColorFor(text), 1.2) }):Play()
+        end))
+        connMgr:Track(btn.MouseLeave:Connect(function()
+            TweenService:Create(btn, TweenInfo.new(0.18, EASE, EASE_OUT), { BackgroundColor3 = baseColorFor(text) }):Play()
+        end))
+        connMgr:Track(btn.MouseButton1Click:Connect(function() select(text) end))
+
+        table.insert(optionButtons, { btn = btn, text = text })
+    end
+
+    local self = { Instance = exp.Container }
+    function self:Get() return selected end
+    function self:ApplyTheme(color, accent, isInitial)
+        local panelBg = Utils.Brighten(color, 1.2)
+        local headerTextColor = Utils.GetTextColorFor(panelBg, accent)
+        local valueTextColor = (Utils.GetLuminance(panelBg) > 0.55) and Color3.fromRGB(90, 90, 100) or Color3.fromRGB(190, 190, 200)
+        if isInitial then
+            exp.Header.BackgroundColor3 = panelBg
+            exp.TitleLabel.TextColor3 = headerTextColor
+            valueLabel.TextColor3 = valueTextColor
+            for _, row in ipairs(optionButtons) do row.btn.BackgroundColor3 = baseColorFor(row.text) end
+        else
+            TweenService:Create(exp.Header, THEME_TWEEN_INFO, { BackgroundColor3 = panelBg }):Play()
+            TweenService:Create(exp.TitleLabel, THEME_TWEEN_INFO, { TextColor3 = headerTextColor }):Play()
+            TweenService:Create(valueLabel, THEME_TWEEN_INFO, { TextColor3 = valueTextColor }):Play()
+            for _, row in ipairs(optionButtons) do
+                TweenService:Create(row.btn, THEME_TWEEN_INFO, { BackgroundColor3 = baseColorFor(row.text) }):Play()
+            end
+        end
+    end
+    theme:Subscribe(function(c, a, initial) self:ApplyTheme(c, a, initial) end)
+    return self
+end
+
+-- ---------- MultiDropdown ----------
+function Components.MultiDropdown(parent, theme, connMgr, opts)
+    local options = opts.Options or {}
+    local optionHeight = 32
+    local bodyHeight = #options * optionHeight + math.max(#options - 1, 0) * 6
+    local selectedSet = {}
+    for _, v in ipairs(opts.Default or {}) do selectedSet[v] = true end
+
+    local exp = Components.ExpandableHeader(parent, theme, connMgr, {
+        Text = opts.Text or "Chọn nhiều:",
+        LayoutOrder = opts.LayoutOrder,
+        BodyHeight = bodyHeight,
+    })
+
+    local function summaryText()
+        local names = {}
+        for _, text in ipairs(options) do
+            if selectedSet[text] then table.insert(names, text) end
+        end
+        if #names == 0 then return "Chưa chọn" end
+        if #names == 1 then return names[1] end
+        return #names .. " đã chọn"
+    end
+
+    local valueLabel = Instance.new("TextLabel")
+    valueLabel.AnchorPoint = Vector2.new(1, 0.5)
+    valueLabel.Position = UDim2.new(1, -35, 0.5, 0)
+    valueLabel.Size = UDim2.new(0, 110, 1, 0)
+    valueLabel.BackgroundTransparency = 1
+    valueLabel.Text = summaryText()
+    valueLabel.TextColor3 = Color3.fromRGB(190, 190, 200)
+    valueLabel.TextXAlignment = Enum.TextXAlignment.Right
+    valueLabel.Font = Enum.Font.Gotham
+    valueLabel.TextSize = 14
+    valueLabel.TextTruncate = Enum.TextTruncate.AtEnd
+    valueLabel.Parent = exp.Header
+
+    local list = Instance.new("Frame")
+    list.Size = UDim2.new(1, 0, 1, 0)
+    list.BackgroundTransparency = 1
+    list.Parent = exp.Body
+    local layout = Instance.new("UIListLayout")
+    layout.SortOrder = Enum.SortOrder.LayoutOrder
+    layout.Padding = UDim.new(0, 6)
+    layout.Parent = list
+
+    local rows = {}
+    local function baseColorFor(text)
+        return selectedSet[text] and theme.Accent or Utils.Darken(theme.Color, 0.8)
+    end
+
+    local function toggle(text)
+        selectedSet[text] = (not selectedSet[text]) or nil
+        for _, row in ipairs(rows) do
+            if row.text == text then
+                local isSel = selectedSet[text] and true or false
+                TweenService:Create(row.btn, TweenInfo.new(0.25, EASE, EASE_OUT), { BackgroundColor3 = baseColorFor(text) }):Play()
+                TweenService:Create(row.check, TweenInfo.new(0.25, EASE, EASE_OUT), { TextTransparency = isSel and 0 or 1 }):Play()
+            end
+        end
+        valueLabel.Text = summaryText()
+        if opts.Callback then
+            local out = {}
+            for _, t in ipairs(options) do if selectedSet[t] then table.insert(out, t) end end
+            opts.Callback(out)
+        end
+    end
+
+    for i, text in ipairs(options) do
+        local btn = Instance.new("TextButton")
+        btn.Size = UDim2.new(1, 0, 0, optionHeight)
+        btn.LayoutOrder = i
+        btn.BackgroundColor3 = baseColorFor(text)
+        btn.Text = "   " .. text
+        btn.TextXAlignment = Enum.TextXAlignment.Left
+        btn.TextColor3 = Color3.fromRGB(255, 255, 255)
+        btn.Font = Enum.Font.Gotham
+        btn.TextSize = 14
+        btn.Parent = list
+        Utils.AddCorner(btn, UDim.new(0, 6))
+        Utils.AddPadding(btn, UDim.new(0, 10))
+
+        local check = Instance.new("TextLabel")
+        check.AnchorPoint = Vector2.new(1, 0.5)
+        check.Position = UDim2.new(1, -10, 0.5, 0)
+        check.Size = UDim2.new(0, 20, 1, 0)
+        check.BackgroundTransparency = 1
+        check.Text = "✓"
+        check.TextColor3 = Color3.fromRGB(255, 255, 255)
+        check.Font = Enum.Font.GothamBold
+        check.TextSize = 16
+        check.TextTransparency = selectedSet[text] and 0 or 1
+        check.Parent = btn
+
+        Animator.AddThickenStroke(btn, connMgr)
+        connMgr:Track(btn.MouseEnter:Connect(function()
+            TweenService:Create(btn, TweenInfo.new(0.18, EASE, EASE_OUT), { BackgroundColor3 = Utils.Brighten(baseColorFor(text), 1.2) }):Play()
+        end))
+        connMgr:Track(btn.MouseLeave:Connect(function()
+            TweenService:Create(btn, TweenInfo.new(0.18, EASE, EASE_OUT), { BackgroundColor3 = baseColorFor(text) }):Play()
+        end))
+        connMgr:Track(btn.MouseButton1Click:Connect(function() toggle(text) end))
+
+        table.insert(rows, { btn = btn, check = check, text = text })
+    end
+
+    local self = { Instance = exp.Container }
+    function self:Get()
+        local out = {}
+        for _, t in ipairs(options) do if selectedSet[t] then table.insert(out, t) end end
+        return out
+    end
+    function self:ApplyTheme(color, accent, isInitial)
+        local panelBg = Utils.Brighten(color, 1.2)
+        local headerTextColor = Utils.GetTextColorFor(panelBg, accent)
+        local valueTextColor = (Utils.GetLuminance(panelBg) > 0.55) and Color3.fromRGB(90, 90, 100) or Color3.fromRGB(190, 190, 200)
+        if isInitial then
+            exp.Header.BackgroundColor3 = panelBg
+            exp.TitleLabel.TextColor3 = headerTextColor
+            valueLabel.TextColor3 = valueTextColor
+            for _, row in ipairs(rows) do row.btn.BackgroundColor3 = baseColorFor(row.text) end
+        else
+            TweenService:Create(exp.Header, THEME_TWEEN_INFO, { BackgroundColor3 = panelBg }):Play()
+            TweenService:Create(exp.TitleLabel, THEME_TWEEN_INFO, { TextColor3 = headerTextColor }):Play()
+            TweenService:Create(valueLabel, THEME_TWEEN_INFO, { TextColor3 = valueTextColor }):Play()
+            for _, row in ipairs(rows) do
+                TweenService:Create(row.btn, THEME_TWEEN_INFO, { BackgroundColor3 = baseColorFor(row.text) }):Play()
+            end
+        end
+    end
+    theme:Subscribe(function(c, a, initial) self:ApplyTheme(c, a, initial) end)
+    return self
+end
+
+-- ---------- ColorPicker ----------
+function Components.ColorPicker(parent, theme, connMgr, opts)
+    local hue, sat, val = 0, 0, 1
+    if opts.Default then hue, sat, val = opts.Default:ToHSV() end
+
+    local BODY_HEIGHT = 406
+    local exp = Components.ExpandableHeader(parent, theme, connMgr, {
+        Text = opts.Text or "Chọn màu:",
+        LayoutOrder = opts.LayoutOrder,
+        BodyHeight = BODY_HEIGHT,
+    })
+
+    local function current() return Color3.fromHSV(hue, sat, val) end
+
+    local hexLabel = Instance.new("TextLabel")
+    hexLabel.AnchorPoint = Vector2.new(1, 0.5)
+    hexLabel.Position = UDim2.new(1, -60, 0.5, 0)
+    hexLabel.Size = UDim2.new(0, 80, 1, 0)
+    hexLabel.BackgroundTransparency = 1
+    hexLabel.Text = Utils.ToHex(current())
+    hexLabel.TextColor3 = Color3.fromRGB(190, 190, 200)
+    hexLabel.TextXAlignment = Enum.TextXAlignment.Right
+    hexLabel.Font = Enum.Font.Gotham
+    hexLabel.TextSize = 14
+    hexLabel.Parent = exp.Header
+
+    local swatch = Instance.new("Frame")
+    swatch.AnchorPoint = Vector2.new(1, 0.5)
+    swatch.Position = UDim2.new(1, -38, 0.5, 0)
+    swatch.Size = UDim2.new(0, 22, 0, 22)
+    swatch.BackgroundColor3 = current()
+    swatch.BorderSizePixel = 0
+    swatch.Parent = exp.Header
+    Utils.AddCorner(swatch, UDim.new(0, 6))
+    local swatchStroke = Instance.new("UIStroke")
+    swatchStroke.Color = Color3.fromRGB(255, 255, 255)
+    swatchStroke.Transparency = 0.6
+    swatchStroke.Parent = swatch
+
+    -- SV box
+    local sv = Instance.new("TextButton")
+    sv.Size = UDim2.new(1, 0, 0, 150)
+    sv.BackgroundColor3 = Color3.fromHSV(hue, 1, 1)
+    sv.Text = ""
+    sv.AutoButtonColor = false
+    sv.ClipsDescendants = true
+    sv.Parent = exp.Body
+    Utils.AddCorner(sv, UDim.new(0, 8))
+
+    local svWhite = Instance.new("Frame")
+    svWhite.Size = UDim2.new(1, 0, 1, 0)
+    svWhite.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+    svWhite.BorderSizePixel = 0
+    svWhite.ZIndex = 1
+    svWhite.Parent = sv
+    Utils.AddCorner(svWhite, UDim.new(0, 8))
+    local svSatGrad = Instance.new("UIGradient")
+    svSatGrad.Color = ColorSequence.new(Color3.fromRGB(255, 255, 255), Color3.fromRGB(255, 255, 255))
+    svSatGrad.Transparency = NumberSequence.new(0, 1)
+    svSatGrad.Parent = svWhite
+
+    local svBlack = Instance.new("Frame")
+    svBlack.Size = UDim2.new(1, 0, 1, 0)
+    svBlack.BackgroundColor3 = Color3.fromRGB(0, 0, 0)
+    svBlack.BorderSizePixel = 0
+    svBlack.ZIndex = 2
+    svBlack.Parent = sv
+    Utils.AddCorner(svBlack, UDim.new(0, 8))
+    local svValGrad = Instance.new("UIGradient")
+    svValGrad.Rotation = 90
+    svValGrad.Color = ColorSequence.new(Color3.fromRGB(0, 0, 0), Color3.fromRGB(0, 0, 0))
+    svValGrad.Transparency = NumberSequence.new(1, 0)
+    svValGrad.Parent = svBlack
+
+    local svCursor = Instance.new("Frame")
+    svCursor.Size = UDim2.new(0, 14, 0, 14)
+    svCursor.AnchorPoint = Vector2.new(0.5, 0.5)
+    svCursor.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+    svCursor.BorderSizePixel = 0
+    svCursor.ZIndex = 3
+    svCursor.Parent = sv
+    Utils.AddCorner(svCursor, UDim.new(1, 0))
+    local svCursorStroke = Instance.new("UIStroke")
+    svCursorStroke.Thickness = 2
+    svCursorStroke.Color = Color3.fromRGB(20, 20, 25)
+    svCursorStroke.Parent = svCursor
+
+    -- Hue bar
+    local hueBar = Instance.new("TextButton")
+    hueBar.Size = UDim2.new(1, 0, 0, 18)
+    hueBar.Position = UDim2.new(0, 0, 0, 162)
+    hueBar.Text = ""
+    hueBar.AutoButtonColor = false
+    hueBar.Parent = exp.Body
+    Utils.AddCorner(hueBar, UDim.new(1, 0))
+    local hueGrad = Instance.new("UIGradient")
+    hueGrad.Color = ColorSequence.new({
+        ColorSequenceKeypoint.new(0.000, Color3.fromRGB(255, 0, 0)),
+        ColorSequenceKeypoint.new(0.167, Color3.fromRGB(255, 255, 0)),
+        ColorSequenceKeypoint.new(0.333, Color3.fromRGB(0, 255, 0)),
+        ColorSequenceKeypoint.new(0.500, Color3.fromRGB(0, 255, 255)),
+        ColorSequenceKeypoint.new(0.667, Color3.fromRGB(0, 0, 255)),
+        ColorSequenceKeypoint.new(0.833, Color3.fromRGB(255, 0, 255)),
+        ColorSequenceKeypoint.new(1.000, Color3.fromRGB(255, 0, 0)),
+    })
+    hueGrad.Parent = hueBar
+    local hueCursor = Instance.new("Frame")
+    hueCursor.Size = UDim2.new(0, 6, 1, 6)
+    hueCursor.AnchorPoint = Vector2.new(0.5, 0.5)
+    hueCursor.Position = UDim2.new(0, 0, 0.5, 0)
+    hueCursor.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+    hueCursor.BorderSizePixel = 0
+    hueCursor.ZIndex = 3
+    hueCursor.Parent = hueBar
+    Utils.AddCorner(hueCursor, UDim.new(0, 3))
+    local hueCursorStroke = Instance.new("UIStroke")
+    hueCursorStroke.Thickness = 1.5
+    hueCursorStroke.Color = Color3.fromRGB(20, 20, 25)
+    hueCursorStroke.Parent = hueCursor
+
+    -- Black/white (value) bar
+    local bwBar = Instance.new("TextButton")
+    bwBar.Size = UDim2.new(1, 0, 0, 18)
+    bwBar.Position = UDim2.new(0, 0, 0, 188)
+    bwBar.Text = ""
+    bwBar.AutoButtonColor = false
+    bwBar.Parent = exp.Body
+    Utils.AddCorner(bwBar, UDim.new(1, 0))
+    local bwGrad = Instance.new("UIGradient")
+    bwGrad.Color = ColorSequence.new(Color3.fromRGB(0, 0, 0), Color3.fromRGB(255, 255, 255))
+    bwGrad.Parent = bwBar
+    local bwCursor = Instance.new("Frame")
+    bwCursor.Size = UDim2.new(0, 6, 1, 6)
+    bwCursor.AnchorPoint = Vector2.new(0.5, 0.5)
+    bwCursor.Position = UDim2.new(0, 0, 0.5, 0)
+    bwCursor.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+    bwCursor.BorderSizePixel = 0
+    bwCursor.ZIndex = 3
+    bwCursor.Parent = bwBar
+    Utils.AddCorner(bwCursor, UDim.new(0, 3))
+    local bwCursorStroke = Instance.new("UIStroke")
+    bwCursorStroke.Thickness = 1.5
+    bwCursorStroke.Color = Color3.fromRGB(20, 20, 25)
+    bwCursorStroke.Parent = bwCursor
+
+    -- Hex input
+    local hexRow = Instance.new("Frame")
+    hexRow.Size = UDim2.new(1, 0, 0, 32)
+    hexRow.Position = UDim2.new(0, 0, 0, 214)
+    hexRow.BackgroundTransparency = 1
+    hexRow.Parent = exp.Body
+    local hexRowLabel = Instance.new("TextLabel")
+    hexRowLabel.Size = UDim2.new(0, 40, 1, 0)
+    hexRowLabel.BackgroundTransparency = 1
+    hexRowLabel.Text = "HEX:"
+    hexRowLabel.TextColor3 = Color3.fromRGB(200, 200, 210)
+    hexRowLabel.Font = Enum.Font.GothamBold
+    hexRowLabel.TextSize = 14
+    hexRowLabel.TextXAlignment = Enum.TextXAlignment.Left
+    hexRowLabel.Parent = hexRow
+    local hexBox = Instance.new("TextBox")
+    hexBox.AnchorPoint = Vector2.new(1, 0.5)
+    hexBox.Position = UDim2.new(1, 0, 0.5, 0)
+    hexBox.Size = UDim2.new(0, 110, 0, 28)
+    hexBox.BackgroundColor3 = Color3.fromRGB(20, 20, 25)
+    hexBox.Text = Utils.ToHex(current())
+    hexBox.TextColor3 = Color3.fromRGB(255, 255, 255)
+    hexBox.Font = Enum.Font.Gotham
+    hexBox.TextSize = 14
+    hexBox.ClearTextOnFocus = false
+    hexBox.Parent = hexRow
+    Utils.AddCorner(hexBox, UDim.new(0, 6))
+    Utils.AddPadding(hexBox, UDim.new(0, 8))
+
+    -- RGB inputs (vertical, non-overlapping)
+    local rgbRow = Instance.new("Frame")
+    rgbRow.Size = UDim2.new(1, 0, 0, 108)
+    rgbRow.Position = UDim2.new(0, 0, 0, 254)
+    rgbRow.BackgroundTransparency = 1
+    rgbRow.Parent = exp.Body
+    local rgbLayout = Instance.new("UIListLayout")
+    rgbLayout.Padding = UDim.new(0, 6)
+    rgbLayout.Parent = rgbRow
+
+    local refresh -- forward declaration
+
+    local function sanitizeRGBText(txt)
+        local filtered = txt:gsub("%D", "")
+        if #filtered > 3 then filtered = filtered:sub(1, 3) end
+        local num = tonumber(filtered) or 0
+        if num > 255 then filtered = "255" end
+        if filtered == "" then filtered = "0" end
+        return filtered
+    end
+
+    -- RGB fields used to call refresh() on EVERY keystroke via
+    -- GetPropertyChangedSignal("Text"), which re-set ~10 properties (hex
+    -- label, all three color bars, both cursors, swatch, sibling boxes)
+    -- per character typed. Typing "255" fired 3 full refreshes. Debounced
+    -- with task.defer so rapid keystrokes within the same frame collapse
+    -- into a single refresh, while still feeling instant to the user.
+    local rgbRefreshPending = false
+    local function requestRGBRefresh(onCommit)
+        if rgbRefreshPending then return end
+        rgbRefreshPending = true
+        task.defer(function()
+            rgbRefreshPending = false
+            onCommit()
+        end)
+    end
+
+    local function makeRGBField(labelText, order, onCommit)
+        local holder = Instance.new("Frame")
+        holder.Size = UDim2.new(1, 0, 0, 32)
+        holder.LayoutOrder = order
+        holder.BackgroundTransparency = 1
+        holder.Parent = rgbRow
+        local lbl = Instance.new("TextLabel")
+        lbl.Size = UDim2.new(0, 30, 1, 0)
+        lbl.BackgroundTransparency = 1
+        lbl.Text = labelText
+        lbl.TextColor3 = Color3.fromRGB(200, 200, 210)
+        lbl.Font = Enum.Font.GothamBold
+        lbl.TextSize = 14
+        lbl.TextXAlignment = Enum.TextXAlignment.Left
+        lbl.Parent = holder
+        local box = Instance.new("TextBox")
+        box.Position = UDim2.new(0, 34, 0, 0)
+        box.Size = UDim2.new(1, -34, 1, 0)
+        box.BackgroundColor3 = Color3.fromRGB(20, 20, 25)
+        box.Text = "0"
+        box.TextColor3 = Color3.fromRGB(255, 255, 255)
+        box.Font = Enum.Font.Gotham
+        box.TextSize = 14
+        box.ClearTextOnFocus = false
+        box.Parent = holder
+        Utils.AddCorner(box, UDim.new(0, 6))
+        Utils.AddPadding(box, UDim.new(0, 6))
+
+        local isUpdating = false
+        connMgr:Track(box:GetPropertyChangedSignal("Text"):Connect(function()
+            if isUpdating then return end
+            local clean = sanitizeRGBText(box.Text)
+            if clean ~= box.Text then
+                isUpdating = true
+                box.Text = clean
+                box.CursorPosition = #clean + 1
+                isUpdating = false
+            end
+            requestRGBRefresh(onCommit)
+        end))
+        connMgr:Track(box.FocusLost:Connect(function()
+            local clean = sanitizeRGBText(box.Text)
+            if clean ~= box.Text then box.Text = clean end
+            onCommit()
+        end))
+        return box
+    end
+
+    local rBox, gBox, bBox
+    local function updateColorFromRGB()
+        local r = math.clamp(tonumber(rBox.Text) or 0, 0, 255)
+        local g = math.clamp(tonumber(gBox.Text) or 0, 0, 255)
+        local b = math.clamp(tonumber(bBox.Text) or 0, 0, 255)
+        hue, sat, val = Color3.fromRGB(r, g, b):ToHSV()
+        refresh()
+    end
+    rBox = makeRGBField("R:", 1, updateColorFromRGB)
+    gBox = makeRGBField("G:", 2, updateColorFromRGB)
+    bBox = makeRGBField("B:", 3, updateColorFromRGB)
+
+    -- Presets
+    local presetColors = opts.Presets or {
+        Color3.fromRGB(255, 255, 255), Color3.fromRGB(0, 0, 0),
+        Color3.fromRGB(255, 60, 60), Color3.fromRGB(255, 150, 40),
+        Color3.fromRGB(255, 230, 50), Color3.fromRGB(60, 220, 90),
+        Color3.fromRGB(50, 210, 220), Color3.fromRGB(60, 120, 255),
+        Color3.fromRGB(170, 80, 255), Color3.fromRGB(255, 90, 180),
+    }
+    local presetRow = Instance.new("Frame")
+    presetRow.Size = UDim2.new(1, 0, 0, 26)
+    presetRow.Position = UDim2.new(0, 0, 0, 370)
+    presetRow.BackgroundTransparency = 1
+    presetRow.Parent = exp.Body
+    local presetLayout = Instance.new("UIListLayout")
+    presetLayout.FillDirection = Enum.FillDirection.Horizontal
+    presetLayout.Padding = UDim.new(0, 6)
+    presetLayout.Parent = presetRow
+
+    refresh = function()
+        local pureHue = Color3.fromHSV(hue, 1, 1)
+        sv.BackgroundColor3 = pureHue
+        local picked = current()
+        swatch.BackgroundColor3 = picked
+        hexLabel.Text = Utils.ToHex(picked)
+        if not hexBox:IsFocused() then hexBox.Text = Utils.ToHex(picked) end
+        if not rBox:IsFocused() then rBox.Text = tostring(math.floor(picked.R * 255 + 0.5)) end
+        if not gBox:IsFocused() then gBox.Text = tostring(math.floor(picked.G * 255 + 0.5)) end
+        if not bBox:IsFocused() then bBox.Text = tostring(math.floor(picked.B * 255 + 0.5)) end
+        svCursor.Position = UDim2.new(sat, 0, 1 - val, 0)
+        hueCursor.Position = UDim2.new(hue, 0, 0.5, 0)
+        bwCursor.Position = UDim2.new(val, 0, 0.5, 0)
+        bwGrad.Color = ColorSequence.new(Color3.fromRGB(0, 0, 0), Color3.fromHSV(hue, sat, 1))
+        if opts.Callback then opts.Callback(picked) end
+    end
+
+    for _, presetColor in ipairs(presetColors) do
+        local pbtn = Instance.new("TextButton")
+        pbtn.Size = UDim2.new(0, 26, 0, 26)
+        pbtn.BackgroundColor3 = presetColor
+        pbtn.Text = ""
+        pbtn.Parent = presetRow
+        Utils.AddCorner(pbtn, UDim.new(0, 6))
+        Animator.AddThickenStroke(pbtn, connMgr)
+        connMgr:Track(pbtn.MouseButton1Click:Connect(function()
+            hue, sat, val = presetColor:ToHSV()
+            refresh()
+        end))
+    end
+
+    -- Drag handling for SV box / hue bar / bw bar
+    local activeDrag = nil
+    local function updateSV(pos)
+        local absPos, absSize = sv.AbsolutePosition, sv.AbsoluteSize
+        sat = math.clamp((pos.X - absPos.X) / absSize.X, 0, 1)
+        val = 1 - math.clamp((pos.Y - absPos.Y) / absSize.Y, 0, 1)
+        refresh()
+    end
+    local function updateHue(pos)
+        local absPos, absSize = hueBar.AbsolutePosition, hueBar.AbsoluteSize
+        hue = math.clamp((pos.X - absPos.X) / absSize.X, 0, 1)
+        refresh()
+    end
+    local function updateBW(pos)
+        local absPos, absSize = bwBar.AbsolutePosition, bwBar.AbsoluteSize
+        val = math.clamp((pos.X - absPos.X) / absSize.X, 0, 1)
+        refresh()
+    end
+
+    connMgr:Track(sv.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            activeDrag = "sv"; updateSV(input.Position)
+        end
+    end))
+    connMgr:Track(hueBar.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            activeDrag = "hue"; updateHue(input.Position)
+        end
+    end))
+    connMgr:Track(bwBar.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            activeDrag = "bw"; updateBW(input.Position)
+        end
+    end))
+    connMgr:Track(UserInputService.InputEnded:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            activeDrag = nil
+        end
+    end))
+    connMgr:Track(UserInputService.InputChanged:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then
+            if activeDrag == "sv" then updateSV(input.Position)
+            elseif activeDrag == "hue" then updateHue(input.Position)
+            elseif activeDrag == "bw" then updateBW(input.Position) end
+        end
+    end))
+
+    connMgr:Track(hexBox.FocusLost:Connect(function(enterPressed)
+        if enterPressed then
+            local color, ok = Utils.HexToColor3(hexBox.Text)
+            if ok then
+                hue, sat, val = color:ToHSV()
+                refresh()
+                return
+            end
+        end
+        hexBox.Text = Utils.ToHex(current())
+    end))
+
+    refresh()
+
+    local self = { Instance = exp.Container }
+    function self:Get() return current() end
+    function self:ApplyTheme(color, accent, isInitial)
+        local panelBg = Utils.Brighten(color, 1.2)
+        local headerTextColor = Utils.GetTextColorFor(panelBg, accent)
+        local hexTextColor = (Utils.GetLuminance(panelBg) > 0.55) and Color3.fromRGB(90, 90, 100) or Color3.fromRGB(190, 190, 200)
+        if isInitial then
+            exp.Header.BackgroundColor3 = panelBg
+            exp.TitleLabel.TextColor3 = headerTextColor
+            hexLabel.TextColor3 = hexTextColor
+        else
+            TweenService:Create(exp.Header, THEME_TWEEN_INFO, { BackgroundColor3 = panelBg }):Play()
+            TweenService:Create(exp.TitleLabel, THEME_TWEEN_INFO, { TextColor3 = headerTextColor }):Play()
+            TweenService:Create(hexLabel, THEME_TWEEN_INFO, { TextColor3 = hexTextColor }):Play()
+        end
+    end
+    theme:Subscribe(function(c, a, initial) self:ApplyTheme(c, a, initial) end)
+    return self
+end
+
+-- ---------- ThemeGrid (grid of preset color/accent swatches) ----------
+function Components.ThemeGrid(parent, theme, connMgr, opts)
+    local presets = opts.Presets or {}
+
+    local container = Instance.new("Frame")
+    container.Size = UDim2.new(1, 0, 0, 0)
+    container.AutomaticSize = Enum.AutomaticSize.Y
+    container.LayoutOrder = opts.LayoutOrder or 0
+    container.BackgroundTransparency = 1
+    container.Parent = parent
+    local grid = Instance.new("UIGridLayout")
+    grid.CellSize = UDim2.new(0, 44, 0, 44)
+    grid.CellPadding = UDim2.new(0, 14, 0, 14)
+    grid.HorizontalAlignment = Enum.HorizontalAlignment.Center
+    grid.SortOrder = Enum.SortOrder.LayoutOrder
+    grid.Parent = container
+
+    local swatches = {}
+    local selectedIndex = opts.DefaultIndex or 1
+
+    local function selectIndex(index)
+        selectedIndex = index
+        for i, s in ipairs(swatches) do
+            local isSel = (i == index)
+            TweenService:Create(s.stroke, TweenInfo.new(0.25, EASE, EASE_OUT), { Transparency = isSel and 0 or 1 }):Play()
+            TweenService:Create(s.check, TweenInfo.new(0.25, EASE, EASE_OUT), { TextTransparency = isSel and 0 or 1 }):Play()
+        end
+    end
+
+    for index, preset in ipairs(presets) do
+        local color, accent = preset[1], preset[2]
+        local previewColor = Utils.Brighten(color, 1.7)
+        local btn = Instance.new("TextButton")
+        btn.Size = UDim2.new(0, 44, 0, 44)
+        btn.BackgroundColor3 = previewColor
+        btn.Text = ""
+        btn.Parent = container
+        Utils.AddCorner(btn, UDim.new(1, 0))
+
+        local stroke = Instance.new("UIStroke")
+        stroke.Thickness = 2.5
+        stroke.Color = Color3.fromRGB(255, 255, 255)
+        stroke.Transparency = (index == selectedIndex) and 0 or 1
+        stroke.Parent = btn
+
+        local check = Instance.new("TextLabel")
+        check.Size = UDim2.new(1, 0, 1, 0)
+        check.BackgroundTransparency = 1
+        check.Text = "✓"
+        check.TextColor3 = Color3.fromRGB(255, 255, 255)
+        check.Font = Enum.Font.GothamBold
+        check.TextSize = 20
+        check.TextTransparency = (index == selectedIndex) and 0 or 1
+        check.ZIndex = 2
+        check.Parent = btn
+
+        table.insert(swatches, { check = check, stroke = stroke })
+
+        Animator.AddThickenStroke(btn, connMgr)
+        connMgr:Track(btn.MouseEnter:Connect(function()
+            TweenService:Create(btn, TweenInfo.new(0.25, EASE, EASE_OUT), { BackgroundColor3 = Utils.Brighten(previewColor, 1.15) }):Play()
+        end))
+        connMgr:Track(btn.MouseLeave:Connect(function()
+            TweenService:Create(btn, TweenInfo.new(0.25, EASE, EASE_OUT), { BackgroundColor3 = previewColor }):Play()
+        end))
+        connMgr:Track(btn.MouseButton1Click:Connect(function()
+            theme:Apply(color, accent)
+            selectIndex(index)
+            if opts.Callback then opts.Callback(color, accent) end
+        end))
+    end
+
+    local self = { Instance = container }
+    function self:ApplyTheme() end -- swatches show fixed preset colors, not the live theme
+    return self
+end
+
+-- ---------- GradientPicker (toggle + preset gradient grid) ----------
+function Components.GradientPicker(parent, theme, connMgr, opts)
+    local gradients = opts.TargetGradients or {} -- list of UIGradient objects to drive
+    local presets = opts.Presets or {}
+
+    local toggleFrame = Instance.new("Frame")
+    toggleFrame.Size = UDim2.new(1, 0, 0, 40)
+    toggleFrame.LayoutOrder = opts.LayoutOrder or 0
+    toggleFrame.Parent = parent
+    Utils.AddCorner(toggleFrame, UDim.new(0, 8))
+
+    local toggleLabel = Instance.new("TextLabel")
+    toggleLabel.Size = UDim2.new(1, -85, 1, 0)
+    toggleLabel.Position = UDim2.new(0, 10, 0, 0)
+    toggleLabel.BackgroundTransparency = 1
+    toggleLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
+    toggleLabel.TextXAlignment = Enum.TextXAlignment.Left
+    toggleLabel.Font = Enum.Font.GothamBold
+    toggleLabel.TextSize = 16
+    toggleLabel.Parent = toggleFrame
+
+    local track = Instance.new("TextButton")
+    track.AnchorPoint = Vector2.new(1, 0.5)
+    track.Position = UDim2.new(1, -15, 0.5, 0)
+    track.Size = UDim2.new(0, 52, 0, 28)
+    track.Text = ""
+    track.AutoButtonColor = false
+    track.Parent = toggleFrame
+    Utils.AddCorner(track, UDim.new(1, 0))
+    local knob = Instance.new("Frame")
+    knob.AnchorPoint = Vector2.new(0, 0.5)
+    knob.Position = UDim2.new(0, 3, 0.5, 0)
+    knob.Size = UDim2.new(0, 22, 0, 22)
+    knob.BackgroundColor3 = Color3.fromRGB(220, 220, 225)
+    knob.BorderSizePixel = 0
+    knob.Parent = track
+    Utils.AddCorner(knob, UDim.new(1, 0))
+
+    local gridContainer = Instance.new("Frame")
+    gridContainer.Size = UDim2.new(1, 0, 0, 0)
+    gridContainer.AutomaticSize = Enum.AutomaticSize.Y
+    gridContainer.LayoutOrder = (opts.LayoutOrder or 0) + 1
+    gridContainer.BackgroundTransparency = 1
+    gridContainer.Parent = parent
+    local grid = Instance.new("UIGridLayout")
+    grid.CellSize = UDim2.new(0, 44, 0, 44)
+    grid.CellPadding = UDim2.new(0, 14, 0, 14)
+    grid.HorizontalAlignment = Enum.HorizontalAlignment.Center
+    grid.SortOrder = Enum.SortOrder.LayoutOrder
+    grid.Parent = gridContainer
+
+    local GRADIENT_BRIGHTEN = 1.35
+    local enabled = false
+    local selectedIndex = nil
+    local swatches = {}
+
+    local function pushGradientColors(instant)
+        local c1, c2
+        if selectedIndex then
+            c1, c2 = presets[selectedIndex][1], presets[selectedIndex][2]
+        else
+            c1, c2 = theme.Color, theme.Accent
+        end
+        local b1, b2 = Utils.Brighten(c1, GRADIENT_BRIGHTEN), Utils.Brighten(c2, GRADIENT_BRIGHTEN)
+        for _, entry in ipairs(gradients) do
+            local grad, tint = entry.Gradient, entry.Tint or 1
+            local sc = ColorSequence.new(Utils.Darken(b1, tint), Utils.Darken(b2, tint))
+            Animator.TweenGradientColor(grad, sc, 0.35, connMgr, instant)
+        end
+    end
+
+    local function setEnabled(v)
+        enabled = v
+        toggleLabel.Text = (opts.Text or "Chế độ Gradient") .. ": " .. (enabled and "Bật" or "Tắt")
+        local darkBg = Utils.Darken(theme.Color, 0.8)
+        local trackColor = enabled and Utils.Brighten(theme.Accent, 1.15) or darkBg
+        local knobX = enabled and (52 - 22 - 3) or 3
+        TweenService:Create(track, TweenInfo.new(0.3, EASE, EASE_OUT), { BackgroundColor3 = trackColor }):Play()
+        TweenService:Create(knob, TweenInfo.new(0.3, EASE, EASE_OUT), { Position = UDim2.new(0, knobX, 0.5, 0) }):Play()
+        for _, entry in ipairs(gradients) do entry.Gradient.Enabled = enabled end
+        if enabled then pushGradientColors(true) end
+    end
+
+    connMgr:Track(track.MouseButton1Click:Connect(function() setEnabled(not enabled) end))
+
+    local function selectPreset(index)
+        selectedIndex = index
+        for i, s in ipairs(swatches) do
+            local isSel = (i == index)
+            TweenService:Create(s.stroke, TweenInfo.new(0.25, EASE, EASE_OUT), { Transparency = isSel and 0 or 1 }):Play()
+            TweenService:Create(s.check, TweenInfo.new(0.25, EASE, EASE_OUT), { TextTransparency = isSel and 0 or 1 }):Play()
+        end
+        if enabled then pushGradientColors(false) end
+    end
+
+    for index, preset in ipairs(presets) do
+        local btn = Instance.new("TextButton")
+        btn.Size = UDim2.new(0, 44, 0, 44)
+        btn.BackgroundColor3 = preset[1]
+        btn.Text = ""
+        btn.Parent = gridContainer
+        Utils.AddCorner(btn, UDim.new(0, 10))
+
+        local swatchGrad = Instance.new("UIGradient")
+        swatchGrad.Color = ColorSequence.new(preset[1], preset[2])
+        swatchGrad.Rotation = 45
+        swatchGrad.Parent = btn
+
+        local stroke = Instance.new("UIStroke")
+        stroke.Thickness = 2.5
+        stroke.Color = Color3.fromRGB(255, 255, 255)
+        stroke.Transparency = 1
+        stroke.Parent = btn
+
+        local check = Instance.new("TextLabel")
+        check.Size = UDim2.new(1, 0, 1, 0)
+        check.BackgroundTransparency = 1
+        check.Text = "✓"
+        check.TextColor3 = Color3.fromRGB(255, 255, 255)
+        check.Font = Enum.Font.GothamBold
+        check.TextSize = 20
+        check.TextTransparency = 1
+        check.ZIndex = 2
+        check.Parent = btn
+
+        table.insert(swatches, { check = check, stroke = stroke })
+        Animator.AddThickenStroke(btn, connMgr)
+        connMgr:Track(btn.MouseButton1Click:Connect(function()
+            selectPreset(index)
+            if not enabled then setEnabled(true) end
+        end))
+    end
+
+    setEnabled(false)
+
+    local self = { Instance = toggleFrame, GridInstance = gridContainer }
+    function self:ApplyTheme(color, accent, isInitial)
+        local panelBg = Utils.Brighten(color, 1.2)
+        local textColor = Utils.GetTextColorFor(panelBg, accent)
+        -- Retint the track in both states now — previously this only fired
+        -- when `enabled` was false, so picking a new theme while gradient
+        -- mode was ON left the toggle showing the *old* accent color.
+        local trackColor = enabled and Utils.Brighten(accent, 1.15) or Utils.Darken(color, 0.8)
+        if isInitial then
+            toggleFrame.BackgroundColor3 = panelBg
+            toggleLabel.TextColor3 = textColor
+            track.BackgroundColor3 = trackColor
+        else
+            TweenService:Create(toggleFrame, THEME_TWEEN_INFO, { BackgroundColor3 = panelBg }):Play()
+            TweenService:Create(toggleLabel, THEME_TWEEN_INFO, { TextColor3 = textColor }):Play()
+            TweenService:Create(track, THEME_TWEEN_INFO, { BackgroundColor3 = trackColor }):Play()
+        end
+        if enabled and not selectedIndex then
+            pushGradientColors(isInitial)
+        end
+    end
+    theme:Subscribe(function(c, a, initial) self:ApplyTheme(c, a, initial) end)
+    return self
+end
+
+-- ---------- Notification (toast card) ----------
+-- Not theme-subscribed like other controls: notifications are transient and
+-- keep whatever color they were created with, except for the semantic type
+-- stripe/icon color which stays fixed regardless of theme.
 local NOTIF_TYPES = {
     success = { Color3.fromRGB(60, 200, 120), "✓" },
     error   = { Color3.fromRGB(220, 70, 70),  "×" },
