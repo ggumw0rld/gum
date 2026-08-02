@@ -2539,23 +2539,12 @@ function Window:_setupMinimize(mainFrame, minimizeBtn)
     local CONTENT_FADE_OUT_TIME = 0.22
     local CONTENT_FADE_IN_TIME = 0.28
 
-    -- Switches mainFrame to a top-center anchor for the duration of the
-    -- minimize/restore Size tween. With this anchor, only Size needs to be
-    -- tweened (the top edge is naturally fixed), removing the need for a
-    -- second, independently-interpolated Position tween — which is what
-    -- caused the visible jitter in the old center-anchored version. Position
-    -- is adjusted here so the on-screen frame doesn't jump the instant the
-    -- anchor itself changes.
     local function anchorTopCenter()
         local size, pos = mainFrame.Size, mainFrame.Position
         local topY = pos.Y.Offset - size.Y.Offset / 2
         mainFrame.AnchorPoint = Vector2.new(0.5, 0)
         mainFrame.Position = UDim2.new(pos.X.Scale, pos.X.Offset, pos.Y.Scale, topY)
     end
-    -- Converts back to true-center anchoring once the minimize/restore
-    -- animation is fully done, so dragging (_setupDrag) and resizing
-    -- (_setupResize) — both of which assume a center anchor — keep working
-    -- exactly as they did before minimize was ever triggered.
     local function anchorCenter()
         local size, pos = mainFrame.Size, mainFrame.Position
         local centerY = pos.Y.Offset + size.Y.Offset / 2
@@ -2571,62 +2560,54 @@ function Window:_setupMinimize(mainFrame, minimizeBtn)
         local contentGroup = self._contentGroup
 
         if self._minimized then
-    minimizeBtn.Text = "▢"
-    self._resizeHandle.Visible = false
+            minimizeBtn.Text = "▢"
+            self._resizeHandle.Visible = false
 
-    local focused = UserInputService:GetFocusedTextBox()
-    if focused then focused:ReleaseFocus() end
+            local focused = UserInputService:GetFocusedTextBox()
+            if focused then focused:ReleaseFocus() end
 
-    Animator.FadeCanvasGroup(contentGroup, 1, CONTENT_FADE_OUT_TIME, connMgr, function()
-        self._tabContainer.Visible = false
-        for _, p in ipairs(self._pages) do p.Visible = false end
+            Animator.FadeCanvasGroup(contentGroup, 1, CONTENT_FADE_OUT_TIME, connMgr, function()
+                self._tabContainer.Visible = false
+                for _, p in ipairs(self._pages) do p.Visible = false end
 
-        -- Bo tròn lại 2 góc dưới của titleBar để khớp mainFrame khi nó
-        -- co lại chỉ còn đúng chiều cao titleBar
-        self._titleBarCorner.BottomLeftRadius = UDim.new(0, 12)
-        self._titleBarCorner.BottomRightRadius = UDim.new(0, 12)
+                self._titleBarCorner.BottomLeftRadius = UDim.new(0, 12)
+                self._titleBarCorner.BottomRightRadius = UDim.new(0, 12)
 
-        anchorTopCenter()
-        local currentW = mainFrame.Size.X.Offset
-        local shrink = Animator.Tween(mainFrame, {
-            Size = UDim2.new(0, currentW, 0, MINIMIZED_HEIGHT)
-        }, SIZE_TWEEN_TIME)
-        shrink.Completed:Connect(function() self._animating = false end)
-        shrink:Play()
-    end)
-else
-    minimizeBtn.Text = "—"
-    ...
-    local grow = Animator.Tween(mainFrame, { Size = targetSize }, SIZE_TWEEN_TIME)
-    grow.Completed:Connect(function()
-        anchorCenter()
-        if self._minimized then self._animating = false; return end
+                anchorTopCenter()
+                local currentW = mainFrame.Size.X.Offset
+                local shrink = Animator.Tween(mainFrame, {
+                    Size = UDim2.new(0, currentW, 0, MINIMIZED_HEIGHT)
+                }, SIZE_TWEEN_TIME)
+                shrink.Completed:Connect(function() self._animating = false end)
+                shrink:Play()
+            end)
+        else
+            minimizeBtn.Text = "—"
 
-        -- Trả lại góc vuông cho titleBar khi đã full-size trở lại
-        self._titleBarCorner.BottomLeftRadius = UDim.new(0, 0)
-        self._titleBarCorner.BottomRightRadius = UDim.new(0, 0)
+            self._tabContainer.Visible = true
+            for i, p in ipairs(self._pages) do
+                p.Visible = (i == self._activeTabIndex)
+                p.Position = UDim2.new(0, 10, 0, 95)
+            end
+            self._resizeHandle.Visible = true
+            contentGroup.GroupTransparency = 1
 
-        Animator.FadeCanvasGroup(contentGroup, 0, CONTENT_FADE_IN_TIME, connMgr, function()
-            self._animating = false
-        end)
-    end)
-    grow:Play()
-end
+            local targetSize = self._currentTargetSize
+            local grow = Animator.Tween(mainFrame, { Size = targetSize }, SIZE_TWEEN_TIME)
+            grow.Completed:Connect(function()
+                anchorCenter()
+                if self._minimized then self._animating = false; return end
 
--- Tab text colors are theme-driven: active tab uses a contrast-safe color
--- computed against the accent (like Button/Toggle do), inactive tabs use
--- contrast-safe color against the dark inactive background, instead of the
--- old hardcoded white/gray pair that never adapted to the live theme.
-function Window:_restyleTabButtons(color, accent)
-    local inactiveBg = Utils.Darken(color, 0.82)
-    for i, btn in ipairs(self._tabButtons) do
-        local isActive = (i == self._activeTabIndex)
-        local bg = isActive and accent or inactiveBg
-        Animator.Tween(btn, {
-            BackgroundColor3 = bg,
-            TextColor3 = Utils.GetTextColorFor(bg, accent),
-        }, 0.25):Play()
-    end
+                self._titleBarCorner.BottomLeftRadius = UDim.new(0, 0)
+                self._titleBarCorner.BottomRightRadius = UDim.new(0, 0)
+
+                Animator.FadeCanvasGroup(contentGroup, 0, CONTENT_FADE_IN_TIME, connMgr, function()
+                    self._animating = false
+                end)
+            end)
+            grow:Play()
+        end
+    end))
 end
 
 function Window:CreateTab(name)
