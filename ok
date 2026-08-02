@@ -31,31 +31,39 @@
     ============================================================
 
     PATCH NOTES (this copy):
-    Fixed two minimize/zoom animation issues:
-      1. mainFrame was anchored at top-center (0.5, 0) with its vertical
-         position hand-compensated (`0.5, -originalSize.Y.Offset / 2`) to
-         *look* centered at its original size. Any UIScale zoom (loading
-         screen reveal, Window:Destroy() teardown) or Size tween (minimize,
-         resize) scaled/grew relative to that top edge instead of the
-         window's actual center, so zooming visibly grew downward instead
-         of "from the middle". mainFrame is now anchored at true center
-         (0.5, 0.5) with Position simply (0.5, 0, 0.5, 0); _setupResize and
-         _setupMinimize now each compute a Position delta alongside their
-         Size change so the titlebar edge doesn't drift while resizing/
-         minimizing around the new center anchor.
-      2. Minimizing set tabContainer/page Visible = false instantly, so
-         every control inside (buttons, toggles, sliders, textboxes,
-         dropdowns...) just vanished with no transition. Rather than adding
-         per-component fade logic to every Components.* factory, all tab-
-         strip + page content now lives inside one CanvasGroup
-         (`self._contentGroup`, parented under mainFrame, sibling to
-         titleBar). CanvasGroup.GroupTransparency fades its entire subtree
-         with a single tween, so minimize now fades content out (then
-         hides it) before shrinking the frame, and restore grows the frame
-         then fades content back in — no changes needed inside Components.
-         The notification layer intentionally stays outside contentGroup
-         (parented directly to screenGui) so toasts keep showing while
-         minimized, unaffected by this fade.
+    Fixed minimize animation (jitter + missing fade):
+      1. mainFrame was anchored at true center (0.5, 0.5) with a hand-computed
+         Position delta applied alongside every minimize/resize Size change so
+         the titlebar edge wouldn't drift. In practice the Size tween and the
+         Position tween never landed on exactly the same pixel every frame
+         (independent TweenService interpolations), which read as jitter.
+         Fixed by switching mainFrame to a *temporary* top-center anchor
+         (0.5, 0) for the duration of the minimize/restore animation only:
+         with that anchor, only Size needs to be tweened (the top edge is
+         naturally fixed), so there's no second Position tween to drift out
+         of sync with. anchorTopCenter()/anchorCenter() convert between the
+         two anchor modes by adjusting Position so the frame doesn't visibly
+         jump when the anchor itself changes. AnchorPoint is restored to true
+         center after the animation completes so dragging (_setupDrag) and
+         resizing (_setupResize) keep behaving exactly as before.
+      2. Content fade (CanvasGroup.GroupTransparency) was being driven by a
+         normal TweenService tween. On some executors, CanvasGroup's offscreen
+         composite buffer doesn't get re-composited in sync with a
+         TweenService-interpolated GroupTransparency — the property value
+         tweens correctly in memory, but visually the content just pops
+         instead of fading. Fixed with fadeCanvasGroup(): a small manual
+         Heartbeat-driven loop that writes GroupTransparency explicitly every
+         frame, forcing a real redraw each step instead of relying on
+         TweenService's internal (and here, unreliable) interpolation.
+      3. Minimize/restore sequencing is now strictly staged and gated on real
+         completion at every step, using the fixes above:
+         minimize:  fade content out (fadeCanvasGroup) -> hide tab/pages ->
+                    anchor top-center -> shrink Size (tween) -> done
+         restore:   show tab/pages -> grow Size (tween) -> anchor back to
+                    center -> fade content in (fadeCanvasGroup) -> done
+         Each step only starts once the previous one has actually finished
+         (Completed / manual completion callback), instead of guessing
+         durations or running fade and resize in parallel.
 
     Superseded note (kept for history):
     Reverted the task.delay-based completion fallback back to
@@ -326,6 +334,35 @@ function Animator.TweenGradientColor(grad, colorSeq, duration, connMgr, instant)
     end)
     if connMgr then connMgr:Track(conn) end
     activeGradientLerps[grad] = conn
+end
+
+-- Manually drives GroupTransparency frame-by-frame instead of letting
+-- TweenService interpolate it internally. CanvasGroup composites its whole
+-- subtree into an offscreen buffer; on some executors that buffer doesn't
+-- get re-composited in sync with TweenService's internal interpolation, so
+-- the fade tween "completes" logically while nothing visibly changes until
+-- the final frame (reads as a hard pop instead of a fade). Writing
+-- GroupTransparency explicitly every Heartbeat forces a real redraw each
+-- step, so the fade is guaranteed to actually render.
+function Animator.FadeCanvasGroup(group, target, duration, connMgr, onComplete)
+    local start = group.GroupTransparency
+    local startTime = os.clock()
+    local conn
+    conn = RunService.Heartbeat:Connect(function()
+        if not group.Parent then
+            conn:Disconnect()
+            return
+        end
+        local alpha = math.clamp((os.clock() - startTime) / duration, 0, 1)
+        local eased = 1 - (1 - alpha) ^ 3 -- cubic-out, matches the feel of EASE/EASE_OUT elsewhere
+        group.GroupTransparency = start + (target - start) * eased
+        if alpha >= 1 then
+            conn:Disconnect()
+            if onComplete then onComplete() end
+        end
+    end)
+    if connMgr then connMgr:Track(conn) end
+    return conn
 end
 
 --============================================================
@@ -2122,12 +2159,11 @@ function Window:_buildChrome(title, originalSize)
     -- Main frame
     local mainFrame = Instance.new("Frame")
     -- Anchored at true center (not top-center) so UIScale-driven zoom
-    -- (loading-screen reveal, Window:Destroy() teardown) and the minimize/
-    -- resize Size tweens all scale/grow symmetrically around the window's
-    -- actual center instead of "growing downward" from a fixed top edge.
-    -- _setupResize and _setupMinimize each compute a Position delta
-    -- alongside their Size change so the titlebar edge doesn't drift as a
-    -- side effect of resizing/minimizing around this center anchor.
+    -- (loading-screen reveal, Window:Destroy() teardown) scales symmetrically
+    -- around the window's actual center. During minimize/restore, the
+    -- window is temporarily switched to a top-center anchor and back (see
+    -- _setupMinimize) so that phase only needs to tween Size, not Size +
+    -- Position together.
     mainFrame.AnchorPoint = Vector2.new(0.5, 0.5)
     mainFrame.Size = originalSize
     mainFrame.Position = UDim2.new(0.5, 0, 0.5, 0)
@@ -2235,10 +2271,12 @@ function Window:_buildChrome(title, originalSize)
     -- subtree — every button/toggle/slider/textbox/dropdown/colorpicker,
     -- regardless of type — with a single tween, instead of needing custom
     -- fade logic inside every Components.* factory. Used by minimize/
-    -- restore below (see _setupMinimize). The titlebar and resize handle
-    -- stay outside it on purpose so they never fade, and the notification
-    -- layer is parented directly to screenGui (see _buildNotificationLayer)
-    -- so toasts keep showing while minimized.
+    -- restore below (see _setupMinimize; fade is driven manually via
+    -- Animator.FadeCanvasGroup rather than TweenService — see that function's
+    -- comment for why). The titlebar and resize handle stay outside it on
+    -- purpose so they never fade, and the notification layer is parented
+    -- directly to screenGui (see _buildNotificationLayer) so toasts keep
+    -- showing while minimized.
     local contentGroup = Instance.new("CanvasGroup")
     contentGroup.Name = "Content"
     contentGroup.Size = UDim2.new(1, 0, 1, 0)
@@ -2445,11 +2483,11 @@ function Window:_setupResize(mainFrame, originalSize)
     handle.Parent = mainFrame
     self._resizeHandle = handle
 
-    -- mainFrame is anchored at its true center now, so growing/shrinking
-    -- Size alone would shift both edges equally in every direction. We
-    -- want resize to feel like dragging the bottom-right corner (top-left
-    -- edge stays put), so every Size change here is paired with a Position
-    -- delta of exactly half the size change, in both axes.
+    -- mainFrame is anchored at its true center while idle, so growing/
+    -- shrinking Size alone would shift both edges equally in every
+    -- direction. We want resize to feel like dragging the bottom-right
+    -- corner (top-left edge stays put), so every Size change here is paired
+    -- with a Position delta of exactly half the size change, in both axes.
     local dragging, dragStart, startSize, startPos
     connMgr:Track(handle.InputBegan:Connect(function(input)
         if self._minimized or self._animating then return end
@@ -2497,15 +2535,23 @@ function Window:_setupMinimize(mainFrame, minimizeBtn)
     local CONTENT_FADE_OUT_TIME = 0.22
     local CONTENT_FADE_IN_TIME = 0.28
 
-    -- Chuyển sang neo top-center: giữ mép trên cố định, chỉ co/giãn chiều
-    -- cao bên dưới. Bỏ hẳn việc tự tính Position delta bằng tay (nguồn gây
-    -- jitter), vì giờ Position không cần tween theo Size nữa.
+    -- Switches mainFrame to a top-center anchor for the duration of the
+    -- minimize/restore Size tween. With this anchor, only Size needs to be
+    -- tweened (the top edge is naturally fixed), removing the need for a
+    -- second, independently-interpolated Position tween — which is what
+    -- caused the visible jitter in the old center-anchored version. Position
+    -- is adjusted here so the on-screen frame doesn't jump the instant the
+    -- anchor itself changes.
     local function anchorTopCenter()
         local size, pos = mainFrame.Size, mainFrame.Position
         local topY = pos.Y.Offset - size.Y.Offset / 2
         mainFrame.AnchorPoint = Vector2.new(0.5, 0)
         mainFrame.Position = UDim2.new(pos.X.Scale, pos.X.Offset, pos.Y.Scale, topY)
     end
+    -- Converts back to true-center anchoring once the minimize/restore
+    -- animation is fully done, so dragging (_setupDrag) and resizing
+    -- (_setupResize) — both of which assume a center anchor — keep working
+    -- exactly as they did before minimize was ever triggered.
     local function anchorCenter()
         local size, pos = mainFrame.Size, mainFrame.Position
         local centerY = pos.Y.Offset + size.Y.Offset / 2
@@ -2524,17 +2570,23 @@ function Window:_setupMinimize(mainFrame, minimizeBtn)
             minimizeBtn.Text = "▢"
             self._resizeHandle.Visible = false
 
+            -- Blur any active textbox first so a control mid-fade doesn't
+            -- keep the keyboard/cursor focused on something disappearing.
             local focused = UserInputService:GetFocusedTextBox()
             if focused then focused:ReleaseFocus() end
 
-            -- Bước 1: fade content ra hết trước.
-            local fadeOut = Animator.Tween(contentGroup, { GroupTransparency = 1 }, CONTENT_FADE_OUT_TIME, Enum.EasingStyle.Sine, EASE_OUT)
-            fadeOut.Completed:Connect(function()
+            -- Stage 1: fade content out (manually driven — see
+            -- Animator.FadeCanvasGroup — so it actually renders on every
+            -- executor instead of possibly popping). Only once this is
+            -- fully done do we touch Size/AnchorPoint, so the fade is never
+            -- competing with the resize for the same frame budget.
+            Animator.FadeCanvasGroup(contentGroup, 1, CONTENT_FADE_OUT_TIME, connMgr, function()
                 self._tabContainer.Visible = false
                 for _, p in ipairs(self._pages) do p.Visible = false end
 
-                -- Bước 2: neo top-center rồi chỉ tween Size (không tween
-                -- Position nữa) -> hết giật.
+                -- Stage 2: switch to top-center anchoring, then shrink
+                -- Size only (no Position tween needed — see anchorTopCenter
+                -- comment above for why this eliminates the jitter).
                 anchorTopCenter()
                 local currentW = mainFrame.Size.X.Offset
                 local shrink = Animator.Tween(mainFrame, {
@@ -2543,7 +2595,6 @@ function Window:_setupMinimize(mainFrame, minimizeBtn)
                 shrink.Completed:Connect(function() self._animating = false end)
                 shrink:Play()
             end)
-            fadeOut:Play()
         else
             minimizeBtn.Text = "—"
 
@@ -2555,18 +2606,23 @@ function Window:_setupMinimize(mainFrame, minimizeBtn)
             self._resizeHandle.Visible = true
             contentGroup.GroupTransparency = 1
 
-            -- mainFrame đang neo top-center (từ lần minimize trước) -> chỉ
-            -- cần tween Size trở lại kích thước gốc.
+            -- Stage 1: mainFrame is already top-center-anchored from the
+            -- last minimize, so grow Size only, straight back to its full
+            -- pre-minimize size.
             local targetSize = self._currentTargetSize
             local grow = Animator.Tween(mainFrame, { Size = targetSize }, SIZE_TWEEN_TIME)
             grow.Completed:Connect(function()
-                -- Xong rồi mới trả AnchorPoint về center, để kéo/resize sau
-                -- đó hoạt động như bình thường.
+                -- Stage 2: restore true-center anchoring now that the frame
+                -- is back to full size, so drag/resize behave normally again.
                 anchorCenter()
-                if self._minimized then self._animating = false; return end
-                local fadeIn = Animator.Tween(contentGroup, { GroupTransparency = 0 }, CONTENT_FADE_IN_TIME, Enum.EasingStyle.Sine, EASE_OUT)
-                fadeIn.Completed:Connect(function() self._animating = false end)
-                fadeIn:Play()
+                if self._minimized then self._animating = false; return end -- re-minimized before this fired
+
+                -- Stage 3: fade content back in (manually driven, same as
+                -- the fade-out above) only after the frame has fully grown,
+                -- so it never looks like it's "popping in" mid-expand.
+                Animator.FadeCanvasGroup(contentGroup, 0, CONTENT_FADE_IN_TIME, connMgr, function()
+                    self._animating = false
+                end)
             end)
             grow:Play()
         end
@@ -2646,10 +2702,11 @@ function Window:CreateTab(name)
     page.AutomaticCanvasSize = Enum.AutomaticSize.Y
     -- Parented to the CanvasGroup (not mainFrame directly) so this page's
     -- controls — buttons, toggles, sliders, textboxes, dropdowns, etc. —
-    -- fade as one unit whenever contentGroup.GroupTransparency is tweened
-    -- (see _setupMinimize). Positions below are unchanged: contentGroup is
-    -- the same size as mainFrame, so relative coordinates line up exactly
-    -- as they did when parented straight to mainFrame.
+    -- fade as one unit whenever contentGroup.GroupTransparency is driven
+    -- (see _setupMinimize / Animator.FadeCanvasGroup). Positions below are
+    -- unchanged: contentGroup is the same size as mainFrame, so relative
+    -- coordinates line up exactly as they did when parented straight to
+    -- mainFrame.
     page.Parent = self._contentGroup
     page.Visible = (index == 1)
     local layout = Instance.new("UIListLayout")
