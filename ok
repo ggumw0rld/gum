@@ -1952,7 +1952,7 @@ function Window:_buildChrome(title, originalSize)
     local mainGradient = Instance.new("UIGradient"); mainGradient.Rotation = 45; mainGradient.Enabled = false; mainGradient.Parent = mainFrame
     local titleGradient = Instance.new("UIGradient"); titleGradient.Rotation = 45; titleGradient.Enabled = false; titleGradient.Parent = titleBar
 
-    local contentGroup = Instance.new("CanvasGroup")
+    local contentGroup = Instance.new("Frame")
     contentGroup.Name = "Content"
     contentGroup.Size = UDim2.new(1, 0, 1, 0)
     contentGroup.BackgroundTransparency = 1
@@ -2219,21 +2219,19 @@ function Window:_setupMinimize(mainFrame, minimizeBtn)
             local focused = UserInputService:GetFocusedTextBox()
             if focused then focused:ReleaseFocus() end
 
-            Animator.FadeCanvasGroup(contentGroup, 1, CONTENT_FADE_OUT_TIME, connMgr, function()
-                self._tabContainer.Visible = false
-                for _, p in ipairs(self._pages) do p.Visible = false end
+            self._tabContainer.Visible = false
+            for _, p in ipairs(self._pages) do p.Visible = false end
 
-                self._titleBarCorner.BottomLeftRadius = UDim.new(0, 12)
-                self._titleBarCorner.BottomRightRadius = UDim.new(0, 12)
+            self._titleBarCorner.BottomLeftRadius = UDim.new(0, 12)
+            self._titleBarCorner.BottomRightRadius = UDim.new(0, 12)
 
-                anchorTopCenter()
-                local currentW = mainFrame.Size.X.Offset
-                local shrink = Animator.Tween(mainFrame, {
-                    Size = UDim2.new(0, currentW, 0, MINIMIZED_HEIGHT)
-                }, SIZE_TWEEN_TIME)
-                shrink.Completed:Connect(function() self._animating = false end)
-                shrink:Play()
-            end)
+            anchorTopCenter()
+            local currentW = mainFrame.Size.X.Offset
+            local shrink = Animator.Tween(mainFrame, {
+                Size = UDim2.new(0, currentW, 0, MINIMIZED_HEIGHT)
+            }, SIZE_TWEEN_TIME)
+            shrink.Completed:Connect(function() self._animating = false end)
+            shrink:Play()
         else
             minimizeBtn.Text = "—"
 
@@ -2243,7 +2241,6 @@ function Window:_setupMinimize(mainFrame, minimizeBtn)
                 p.Position = UDim2.new(0, 10, 0, 95)
             end
             self._resizeHandle.Visible = true
-            contentGroup.GroupTransparency = 1
 
             local targetSize = self._currentTargetSize
             local grow = Animator.Tween(mainFrame, { Size = targetSize }, SIZE_TWEEN_TIME)
@@ -2254,9 +2251,7 @@ function Window:_setupMinimize(mainFrame, minimizeBtn)
                 self._titleBarCorner.BottomLeftRadius = UDim.new(0, 0)
                 self._titleBarCorner.BottomRightRadius = UDim.new(0, 0)
 
-                Animator.FadeCanvasGroup(contentGroup, 0, CONTENT_FADE_IN_TIME, connMgr, function()
-                    self._animating = false
-                end)
+                self._animating = false
             end)
             grow:Play()
         end
