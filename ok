@@ -1,100 +1,3 @@
---[[
-    ============================================================
-    Selenix UI Library — Modular Rewrite
-    ============================================================
-    Same visual/behavioural feature set as the original monolithic
-    script, reorganized into independent modules:
-
-        Utils      -> color math, corner/padding/stroke helpers, hex <-> Color3
-        Animator   -> hover/press stroke effect, generic tween + gradient-lerp helper
-        Theme      -> holds the current {Color, Accent}, notifies subscribers on change
-        Window     -> chrome: loading screen, titlebar, drag, resize, minimize
-        Components -> factory functions for each control (Button, Label, Toggle, Slider,
-                       Textbox, Dropdown, MultiDropdown, ColorPicker, ThemeGrid, GradientPicker,
-                       Notification)
-        Tab        -> a page + its tab button; exposes Tab:AddXxx(opts) which delegates to Components
-
-    Every component returned by Components.* implements the same tiny interface:
-        obj.Instance      -- root GuiObject
-        obj:ApplyTheme(color, accent)  -- called automatically by Theme:Apply()
-        obj:Destroy()                  -- optional cleanup
-
-    This keeps the file a single drop-in script (works fine from an executor,
-    no ReplicatedStorage / require() needed) while still being a real
-    component library internally: every control is built once, in one place,
-    and reused instead of copy-pasted three times (the old Dropdown /
-    MultiDropdown / ColorPicker collapsible-header logic is now one
-    `Components.ExpandableHeader` helper shared by all three).
-
-    The window has no in-UI close button / close-confirm dialog — it is
-    closed programmatically instead, via `Selenix:Destroy()`.
-    ============================================================
-
-    PATCH NOTES (this copy):
-    Fixed minimize animation (jitter + missing fade):
-      1. mainFrame was anchored at true center (0.5, 0.5) with a hand-computed
-         Position delta applied alongside every minimize/resize Size change so
-         the titlebar edge wouldn't drift. In practice the Size tween and the
-         Position tween never landed on exactly the same pixel every frame
-         (independent TweenService interpolations), which read as jitter.
-         Fixed by switching mainFrame to a *temporary* top-center anchor
-         (0.5, 0) for the duration of the minimize/restore animation only:
-         with that anchor, only Size needs to be tweened (the top edge is
-         naturally fixed), so there's no second Position tween to drift out
-         of sync with. anchorTopCenter()/anchorCenter() convert between the
-         two anchor modes by adjusting Position so the frame doesn't visibly
-         jump when the anchor itself changes. AnchorPoint is restored to true
-         center after the animation completes so dragging (_setupDrag) and
-         resizing (_setupResize) keep behaving exactly as before.
-      2. Content fade (CanvasGroup.GroupTransparency) was being driven by a
-         normal TweenService tween. On some executors, CanvasGroup's offscreen
-         composite buffer doesn't get re-composited in sync with a
-         TweenService-interpolated GroupTransparency — the property value
-         tweens correctly in memory, but visually the content just pops
-         instead of fading. Fixed with fadeCanvasGroup(): a small manual
-         Heartbeat-driven loop that writes GroupTransparency explicitly every
-         frame, forcing a real redraw each step instead of relying on
-         TweenService's internal (and here, unreliable) interpolation.
-      3. Minimize/restore sequencing is now strictly staged and gated on real
-         completion at every step, using the fixes above:
-         minimize:  fade content out (fadeCanvasGroup) -> hide tab/pages ->
-                    anchor top-center -> shrink Size (tween) -> done
-         restore:   show tab/pages -> grow Size (tween) -> anchor back to
-                    center -> fade content in (fadeCanvasGroup) -> done
-         Each step only starts once the previous one has actually finished
-         (Completed / manual completion callback), instead of guessing
-         durations or running fade and resize in parallel.
-
-    Superseded note (kept for history):
-    Reverted the task.delay-based completion fallback back to
-    tween.Completed:Connect(...) in the four spots that had it
-    (ExpandableHeader open/close, loading-screen fade-out, tab switchTo,
-    notification Dismiss). task.delay(duration, fn) assumes a tween finishes
-    in exactly `duration` seconds; under frame drops / lag spikes it can fire
-    visibly before or after the tween actually settles, which reads as
-    janky/stuttery timing (the follow-up step — unlocking `animating` /
-    `switching`, revealing the window, destroying the notification, etc. —
-    landing slightly out of sync with what's on screen). tween.Completed
-    fires exactly when the tween itself reports done, so the follow-up step
-    always lines up with the animation. Trade-off: on executors that don't
-    reliably fire Tween.Completed, these four interactions can get stuck
-    disabled after their first use (see the superseded note below) — if that
-    resurfaces, task.delay is the fallback to reach for again.
-
-    Superseded note (kept for history — no longer applies to the 4 spots
-    above, since they're back on tween.Completed):
-    Fixed a critical bug where Utils.Brighten / Utils.GetLuminance /
-    Utils.GetTextColorFor / Components.Label's Muted branch used lowercase
-    Color3 fields (.r/.g/.b), which do not exist on Color3 (Roblox only
-    exposes uppercase .R/.G/.B). Because Theme:Subscribe() invokes every
-    subscriber synchronously the moment it's registered (isInitial=true
-    pass), this error fired the instant Window.new() ran and Theme:Subscribe
-    was first called (e.g. inside Components.Label / Components.Button /
-    Window:_buildChrome), aborting the whole script before the ScreenGui
-    ever finished building — i.e. the UI silently failed to appear.
-    ============================================================
-]]
-
 local TweenService = game:GetService("TweenService")
 local RunService = game:GetService("RunService")
 local Players = game:GetService("Players")
@@ -105,17 +8,9 @@ local EASE = Enum.EasingStyle.Quint
 local EASE_OUT = Enum.EasingDirection.Out
 local EASE_IN = Enum.EasingDirection.In
 
--- Shared duration for the "theme changed" recolor tween used by every
--- component's ApplyTheme(). Previously most components just snapped their
--- colors straight to the new theme instead of tweening, so picking a new
--- theme in ThemeGrid looked jarring/inconsistent (only the tab buttons
--- actually animated). Everything below now tweens using this constant.
 local THEME_TWEEN_DURATION = 0.3
 local THEME_TWEEN_INFO = TweenInfo.new(THEME_TWEEN_DURATION, EASE, EASE_OUT)
 
---============================================================
--- MODULE: Utils
---============================================================
 local Utils = {}
 
 function Utils.Brighten(color, factor)
@@ -125,13 +20,12 @@ function Utils.Brighten(color, factor)
         math.min(color.B * factor, 1)
     )
 end
-Utils.Darken = Utils.Brighten -- factor < 1 darkens, factor > 1 brightens; same math either way
+Utils.Darken = Utils.Brighten
 
 function Utils.GetLuminance(c)
     return 0.299 * c.R + 0.587 * c.G + 0.114 * c.B
 end
 
--- Contrast-safe text color for a given background, lightly tinted with `tint` (usually the accent)
 function Utils.GetTextColorFor(bg, tint)
     if Utils.GetLuminance(bg) > 0.55 then
         return Color3.new(
@@ -172,7 +66,6 @@ function Utils.ToHex(color)
         math.floor(color.B * 255 + 0.5))
 end
 
--- Returns color, success
 function Utils.HexToColor3(text)
     local hex = text:gsub("#", ""):gsub("%s", "")
     if #hex ~= 6 or hex:match("[^0-9a-fA-F]") then
@@ -184,12 +77,6 @@ function Utils.HexToColor3(text)
     return Color3.fromRGB(r, g, b), true
 end
 
---============================================================
--- MODULE: ConnectionManager
--- Central place to track every RBXScriptConnection created by the
--- UI so Window:Destroy() can cleanly tear everything down (fixes
--- the "leak on rerun" class of bugs from the original script).
---============================================================
 local ConnectionManager = {}
 ConnectionManager.__index = ConnectionManager
 
@@ -209,15 +96,11 @@ function ConnectionManager:DisconnectAll()
     table.clear(self._connections)
 end
 
---============================================================
--- MODULE: Animator
---============================================================
 local Animator = {}
 
 local HOVER_THICKNESS = 1.5
 local PRESSED_THICKNESS = 1.5
 
--- Adds the thin "outline grows on hover/press" stroke used by every clickable control.
 function Animator.AddThickenStroke(btn, connMgr)
     local stroke = Instance.new("UIStroke")
     stroke.Name = "ThickenStroke"
@@ -245,23 +128,6 @@ function Animator.AddThickenStroke(btn, connMgr)
     return stroke
 end
 
--- Background-color hover effect.
--- baseColor can be:
---   * nil                -> "live" mode: auto-brighten whatever BackgroundColor3
---                           currently is when the mouse enters, and restore that
---                           captured value on leave. Only safe for buttons whose
---                           color is never changed by anything else afterwards.
---   * a function          -> "reactive" mode: on both enter and leave, the base
---                           color is *recomputed* by calling baseColor() fresh,
---                           instead of relying on a value captured at MouseEnter
---                           time. Use this whenever the button's real base color
---                           is also being retweened elsewhere (e.g. by
---                           Theme:Apply()) — otherwise a theme change that lands
---                           while the mouse is still hovering gets silently
---                           overwritten by the *stale* pre-change color the next
---                           time MouseLeave fires.
---   * a Color3             -> "static" mode: fixed base/hover colors, used for
---                           chrome buttons whose colors never depend on theme.
 function Animator.AddHoverEffect(btn, connMgr, baseColor, hoverColor, skipStroke)
     if not skipStroke then Animator.AddThickenStroke(btn, connMgr) end
     local isDynamic = (type(baseColor) == "function")
@@ -295,9 +161,7 @@ function Animator.Tween(obj, props, duration, style, dir)
     return TweenService:Create(obj, TweenInfo.new(duration or 0.3, style or EASE, dir or EASE_OUT), props)
 end
 
--- TweenService cannot tween ColorSequence, so gradient recoloring is done with a
--- manual per-frame lerp between two flat colors (start/end keypoints).
-local activeGradientLerps = setmetatable({}, { __mode = "k" }) -- weak keys: entries self-clean if `grad` is GC'd/destroyed mid-lerp
+local activeGradientLerps = setmetatable({}, { __mode = "k" })
 function Animator.TweenGradientColor(grad, colorSeq, duration, connMgr, instant)
     if activeGradientLerps[grad] then
         activeGradientLerps[grad]:Disconnect()
@@ -316,10 +180,6 @@ function Animator.TweenGradientColor(grad, colorSeq, duration, connMgr, instant)
 
     local conn
     conn = RunService.Heartbeat:Connect(function()
-        -- grad may have been Destroy()'d while this Heartbeat connection was
-        -- still pending disconnect (e.g. Window:Destroy() mid-lerp); guard
-        -- against writing to / reading a dead Instance instead of relying
-        -- solely on ConnectionManager's teardown timing.
         if not grad.Parent then
             conn:Disconnect()
             activeGradientLerps[grad] = nil
@@ -336,14 +196,6 @@ function Animator.TweenGradientColor(grad, colorSeq, duration, connMgr, instant)
     activeGradientLerps[grad] = conn
 end
 
--- Manually drives GroupTransparency frame-by-frame instead of letting
--- TweenService interpolate it internally. CanvasGroup composites its whole
--- subtree into an offscreen buffer; on some executors that buffer doesn't
--- get re-composited in sync with TweenService's internal interpolation, so
--- the fade tween "completes" logically while nothing visibly changes until
--- the final frame (reads as a hard pop instead of a fade). Writing
--- GroupTransparency explicitly every Heartbeat forces a real redraw each
--- step, so the fade is guaranteed to actually render.
 function Animator.FadeCanvasGroup(group, target, duration, connMgr, onComplete)
     local start = group.GroupTransparency
     local startTime = os.clock()
@@ -354,7 +206,7 @@ function Animator.FadeCanvasGroup(group, target, duration, connMgr, onComplete)
             return
         end
         local alpha = math.clamp((os.clock() - startTime) / duration, 0, 1)
-        local eased = 1 - (1 - alpha) ^ 3 -- cubic-out, matches the feel of EASE/EASE_OUT elsewhere
+        local eased = 1 - (1 - alpha) ^ 3
         group.GroupTransparency = start + (target - start) * eased
         if alpha >= 1 then
             conn:Disconnect()
@@ -365,13 +217,6 @@ function Animator.FadeCanvasGroup(group, target, duration, connMgr, onComplete)
     return conn
 end
 
---============================================================
--- MODULE: Theme
--- Single source of truth for {Color, Accent}. Components register
--- themselves once and get restyled automatically on every change,
--- instead of the old approach of manually listing every object in
--- one giant ApplyTheme() function.
---============================================================
 local Theme = {}
 Theme.__index = Theme
 
@@ -383,12 +228,6 @@ function Theme.new(color, accent)
     }, Theme)
 end
 
--- fn(color, accent, isInitial) is called immediately once with isInitial=true,
--- then again with isInitial=false on every subsequent Apply(). Passing this
--- flag lets every subscriber snap on the first paint and only tween on real
--- theme changes, instead of each component having to hand-roll its own
--- "initialized" flag (which most of them previously didn't, causing a
--- visible flash-then-tween on creation — see Components.* ApplyTheme below).
 function Theme:Subscribe(fn)
     table.insert(self._subscribers, fn)
     fn(self.Color, self.Accent, true)
@@ -409,13 +248,8 @@ function Theme:PanelColors()
         Utils.GetTextColorFor(darkBg, self.Accent)
 end
 
---============================================================
--- MODULE: Components
--- Every factory returns { Instance, ApplyTheme(color,accent), Destroy() }
---============================================================
 local Components = {}
 
--- ---------- Label ----------
 function Components.Label(parent, theme, connMgr, opts)
     local holder = Instance.new("Frame")
     holder.Size = opts.Size or UDim2.new(1, 0, 0, 34)
@@ -436,11 +270,6 @@ function Components.Label(parent, theme, connMgr, opts)
     if opts.Padded ~= false then Utils.AddPadding(label, UDim.new(0, 15)) end
 
     local self = { Instance = holder }
-    -- Labels sit directly on mainFrame's background (no panel of their own),
-    -- so their contrast-safe color is computed against the live theme.Color
-    -- itself rather than the brightened "panel" background other controls
-    -- use. opts.Muted dims that same contrast-safe color instead of using a
-    -- fixed gray, so muted labels stay readable on both dark and light themes.
     function self:ApplyTheme(color, accent, isInitial)
         local textColor = Utils.GetTextColorFor(color, accent)
         if opts.Muted then
@@ -458,7 +287,6 @@ function Components.Label(parent, theme, connMgr, opts)
     return self
 end
 
--- ---------- Button ----------
 function Components.Button(parent, theme, connMgr, opts)
     local holder = Instance.new("Frame")
     holder.Size = opts.Size or UDim2.new(1, 0, 0, 40)
@@ -476,9 +304,6 @@ function Components.Button(parent, theme, connMgr, opts)
     btn.Parent = holder
     Utils.AddPadding(btn, UDim.new(0, 15))
     Utils.AddCorner(btn, UDim.new(0, 8))
-    -- Reactive mode: base color is recomputed fresh from the live theme on
-    -- every enter/leave, so a theme change landing mid-hover can't get
-    -- clobbered by a stale pre-change color when the mouse leaves.
     Animator.AddHoverEffect(btn, connMgr, function() return Utils.Brighten(theme.Color, 1.2) end)
 
     if opts.Callback then
@@ -503,7 +328,6 @@ function Components.Button(parent, theme, connMgr, opts)
     return self
 end
 
--- ---------- Toggle ----------
 function Components.Toggle(parent, theme, connMgr, opts)
     local frame = Instance.new("Frame")
     frame.Size = opts.Size or UDim2.new(1, 0, 0, 40)
@@ -585,19 +409,11 @@ function Components.Toggle(parent, theme, connMgr, opts)
     return self
 end
 
--- ---------- Slider ----------
--- opts.Decimals (integer, default 0) lets the slider represent fractional
--- values (e.g. 0.0-1.0 uniforms) instead of always rounding to whole
--- numbers — previously `value = math.round(...)` made it impossible to
--- drive a 0-1 float parameter from this control at all.
 function Components.Slider(parent, theme, connMgr, opts)
     local min, max = opts.Min or 0, opts.Max or 100
-    -- Guard against a misconfigured Min == Max (or Min > Max): every alpha
-    -- calculation below divides by (max - min), which previously produced
-    -- NaN positions/sizes (and a NaN drag value) instead of just clamping.
     local range = (max > min) and (max - min) or 1
     local decimals = math.max(math.floor(opts.Decimals or 0), 0)
-    local step = 10 ^ (-decimals) -- smallest representable increment at this precision
+    local step = 10 ^ (-decimals)
 
     local function roundTo(n)
         local mult = 10 ^ decimals
@@ -709,7 +525,6 @@ function Components.Slider(parent, theme, connMgr, opts)
     return self
 end
 
--- ---------- Textbox ----------
 function Components.Textbox(parent, theme, connMgr, opts)
     local frame = Instance.new("Frame")
     frame.Size = opts.Size or UDim2.new(1, 0, 0, 40)
@@ -784,10 +599,6 @@ function Components.Textbox(parent, theme, connMgr, opts)
     return self
 end
 
--- ---------- ExpandableHeader ----------
--- Shared "header row that expands into a body panel" used by Dropdown,
--- MultiDropdown and ColorPicker. Collapses three near-identical blocks
--- from the original script into one reusable piece.
 function Components.ExpandableHeader(parent, theme, connMgr, opts)
     local closedHeight = opts.ClosedHeight or 46
     local bodyHeight = opts.BodyHeight or 200
@@ -837,10 +648,6 @@ function Components.ExpandableHeader(parent, theme, connMgr, opts)
     body.BackgroundTransparency = 1
     body.Parent = container
 
-    -- Reactive mode: recompute the header's base color fresh from the live
-    -- theme on every enter/leave (see Animator.AddHoverEffect) instead of
-    -- capturing it once — otherwise a theme change while the header is
-    -- hovered gets overwritten by the stale color on MouseLeave.
     Animator.AddHoverEffect(header, connMgr, function() return Utils.Brighten(theme.Color, 1.2) end)
 
     local open, animating = false, false
@@ -852,10 +659,6 @@ function Components.ExpandableHeader(parent, theme, connMgr, opts)
         local tw = TweenService:Create(container, TweenInfo.new(0.33, EASE, EASE_OUT), {
             Size = UDim2.new(1, 0, 0, open and openHeight or closedHeight)
         })
-        -- Gated on the tween's own Completed event so `animating` clears in
-        -- sync with the actual on-screen animation instead of a fixed
-        -- task.delay guess (which can unlock slightly early/late under lag
-        -- and reads as stuttery timing).
         tw.Completed:Connect(function() animating = false end)
         tw:Play()
         if opts.OnToggle then opts.OnToggle(open) end
@@ -872,7 +675,6 @@ function Components.ExpandableHeader(parent, theme, connMgr, opts)
     }
 end
 
--- ---------- Dropdown (single select) ----------
 function Components.Dropdown(parent, theme, connMgr, opts)
     local options = opts.Options or {}
     local optionHeight = 32
@@ -974,7 +776,6 @@ function Components.Dropdown(parent, theme, connMgr, opts)
     return self
 end
 
--- ---------- MultiDropdown ----------
 function Components.MultiDropdown(parent, theme, connMgr, opts)
     local options = opts.Options or {}
     local optionHeight = 32
@@ -1108,7 +909,6 @@ function Components.MultiDropdown(parent, theme, connMgr, opts)
     return self
 end
 
--- ---------- ColorPicker ----------
 function Components.ColorPicker(parent, theme, connMgr, opts)
     local hue, sat, val = 0, 0, 1
     if opts.Default then hue, sat, val = opts.Default:ToHSV() end
@@ -1147,7 +947,6 @@ function Components.ColorPicker(parent, theme, connMgr, opts)
     swatchStroke.Transparency = 0.6
     swatchStroke.Parent = swatch
 
-    -- SV box
     local sv = Instance.new("TextButton")
     sv.Size = UDim2.new(1, 0, 0, 150)
     sv.BackgroundColor3 = Color3.fromHSV(hue, 1, 1)
@@ -1195,7 +994,6 @@ function Components.ColorPicker(parent, theme, connMgr, opts)
     svCursorStroke.Color = Color3.fromRGB(20, 20, 25)
     svCursorStroke.Parent = svCursor
 
-    -- Hue bar
     local hueBar = Instance.new("TextButton")
     hueBar.Size = UDim2.new(1, 0, 0, 18)
     hueBar.Position = UDim2.new(0, 0, 0, 162)
@@ -1228,7 +1026,6 @@ function Components.ColorPicker(parent, theme, connMgr, opts)
     hueCursorStroke.Color = Color3.fromRGB(20, 20, 25)
     hueCursorStroke.Parent = hueCursor
 
-    -- Black/white (value) bar
     local bwBar = Instance.new("TextButton")
     bwBar.Size = UDim2.new(1, 0, 0, 18)
     bwBar.Position = UDim2.new(0, 0, 0, 188)
@@ -1253,7 +1050,6 @@ function Components.ColorPicker(parent, theme, connMgr, opts)
     bwCursorStroke.Color = Color3.fromRGB(20, 20, 25)
     bwCursorStroke.Parent = bwCursor
 
-    -- Hex input
     local hexRow = Instance.new("Frame")
     hexRow.Size = UDim2.new(1, 0, 0, 32)
     hexRow.Position = UDim2.new(0, 0, 0, 214)
@@ -1282,7 +1078,6 @@ function Components.ColorPicker(parent, theme, connMgr, opts)
     Utils.AddCorner(hexBox, UDim.new(0, 6))
     Utils.AddPadding(hexBox, UDim.new(0, 8))
 
-    -- RGB inputs (vertical, non-overlapping)
     local rgbRow = Instance.new("Frame")
     rgbRow.Size = UDim2.new(1, 0, 0, 108)
     rgbRow.Position = UDim2.new(0, 0, 0, 254)
@@ -1292,7 +1087,7 @@ function Components.ColorPicker(parent, theme, connMgr, opts)
     rgbLayout.Padding = UDim.new(0, 6)
     rgbLayout.Parent = rgbRow
 
-    local refresh -- forward declaration
+    local refresh
 
     local function sanitizeRGBText(txt)
         local filtered = txt:gsub("%D", "")
@@ -1303,12 +1098,6 @@ function Components.ColorPicker(parent, theme, connMgr, opts)
         return filtered
     end
 
-    -- RGB fields used to call refresh() on EVERY keystroke via
-    -- GetPropertyChangedSignal("Text"), which re-set ~10 properties (hex
-    -- label, all three color bars, both cursors, swatch, sibling boxes)
-    -- per character typed. Typing "255" fired 3 full refreshes. Debounced
-    -- with task.defer so rapid keystrokes within the same frame collapse
-    -- into a single refresh, while still feeling instant to the user.
     local rgbRefreshPending = false
     local function requestRGBRefresh(onCommit)
         if rgbRefreshPending then return end
@@ -1379,7 +1168,6 @@ function Components.ColorPicker(parent, theme, connMgr, opts)
     gBox = makeRGBField("G:", 2, updateColorFromRGB)
     bBox = makeRGBField("B:", 3, updateColorFromRGB)
 
-    -- Presets
     local presetColors = opts.Presets or {
         Color3.fromRGB(255, 255, 255), Color3.fromRGB(0, 0, 0),
         Color3.fromRGB(255, 60, 60), Color3.fromRGB(255, 150, 40),
@@ -1428,7 +1216,6 @@ function Components.ColorPicker(parent, theme, connMgr, opts)
         end))
     end
 
-    -- Drag handling for SV box / hue bar / bw bar
     local activeDrag = nil
     local function updateSV(pos)
         local absPos, absSize = sv.AbsolutePosition, sv.AbsoluteSize
@@ -1509,7 +1296,6 @@ function Components.ColorPicker(parent, theme, connMgr, opts)
     return self
 end
 
--- ---------- ThemeGrid (grid of preset color/accent swatches) ----------
 function Components.ThemeGrid(parent, theme, connMgr, opts)
     local presets = opts.Presets or {}
 
@@ -1582,13 +1368,12 @@ function Components.ThemeGrid(parent, theme, connMgr, opts)
     end
 
     local self = { Instance = container }
-    function self:ApplyTheme() end -- swatches show fixed preset colors, not the live theme
+    function self:ApplyTheme() end
     return self
 end
 
--- ---------- GradientPicker (toggle + preset gradient grid) ----------
 function Components.GradientPicker(parent, theme, connMgr, opts)
-    local gradients = opts.TargetGradients or {} -- list of UIGradient objects to drive
+    local gradients = opts.TargetGradients or {}
     local presets = opts.Presets or {}
 
     local toggleFrame = Instance.new("Frame")
@@ -1725,9 +1510,6 @@ function Components.GradientPicker(parent, theme, connMgr, opts)
     function self:ApplyTheme(color, accent, isInitial)
         local panelBg = Utils.Brighten(color, 1.2)
         local textColor = Utils.GetTextColorFor(panelBg, accent)
-        -- Retint the track in both states now — previously this only fired
-        -- when `enabled` was false, so picking a new theme while gradient
-        -- mode was ON left the toggle showing the *old* accent color.
         local trackColor = enabled and Utils.Brighten(accent, 1.15) or Utils.Darken(color, 0.8)
         if isInitial then
             toggleFrame.BackgroundColor3 = panelBg
@@ -1746,19 +1528,6 @@ function Components.GradientPicker(parent, theme, connMgr, opts)
     return self
 end
 
--- ---------- Notification (toast card) ----------
--- Not theme-subscribed like other controls: notifications are transient and
--- keep whatever color they were created with, except for the semantic type
--- stripe/icon color which stays fixed regardless of theme.
---
--- opts.Duration: seconds before auto-dismiss. Omit/nil defaults to 4s.
--- Pass 0 or false to make the notification "sticky" — no progress bar, and
--- it never auto-dismisses; it only closes via the × button or a manual
--- :Dismiss() call.
---
--- Icon + title share a horizontal row whose own UIListLayout vertically
--- centers both against each other, so the title text lines up with the
--- icon regardless of the title's actual rendered height.
 local NOTIF_TYPES = {
     success = { Color3.fromRGB(60, 200, 120), "✓" },
     error   = { Color3.fromRGB(220, 70, 70),  "×" },
@@ -1775,15 +1544,6 @@ function Components.Notification(parent, theme, connMgr, opts)
     if duration == false then duration = 0 end
     local isSticky = not (duration and duration > 0)
 
-    -- Notifications are laid out by a UIListLayout on `parent` (the toast
-    -- container). UIListLayout re-applies its own computed Position to every
-    -- direct child whenever it recalculates the stack (new toast added,
-    -- another toast resized/removed, etc), which fights any tween that's
-    -- also driving that child's Position. Fix: give each toast its own
-    -- invisible "slot" that IS the direct list-managed child (reserves the
-    -- correct stacking space via AutomaticSize, never has its Position
-    -- tweened), and make the visible `card` a child of that slot instead of
-    -- of `parent` directly.
     local slot = Instance.new("Frame")
     slot.Name = "NotificationSlot"
     slot.Size = UDim2.new(1, 0, 0, 0)
@@ -1797,9 +1557,6 @@ function Components.Notification(parent, theme, connMgr, opts)
     card.AutomaticSize = Enum.AutomaticSize.Y
     card.BackgroundColor3 = Utils.Brighten(theme.Color, 1.25)
     card.BorderSizePixel = 0
-    -- Left un-clipped until Dismiss() explicitly turns it on, so the nested
-    -- AutomaticSize convergence (see note above) never gets caught mid-
-    -- computation and visibly cropped.
     card.ClipsDescendants = false
     card.Parent = slot
     Utils.AddCorner(card, UDim.new(0, 10))
@@ -1870,8 +1627,6 @@ function Components.Notification(parent, theme, connMgr, opts)
     titleLabel.TextSize = 15
     titleLabel.Parent = headerRow
 
-    -- Body text is padded left by icon-width + row padding (26 + 12 = 38)
-    -- so it lines up under the title instead of under the icon.
     local bodyLabel = Instance.new("TextLabel")
     bodyLabel.Size = UDim2.new(1, 0, 0, 0)
     bodyLabel.AutomaticSize = Enum.AutomaticSize.Y
@@ -1905,9 +1660,6 @@ function Components.Notification(parent, theme, connMgr, opts)
     bottomSpacer.BackgroundTransparency = 1
     bottomSpacer.Parent = contentHolder
 
-    -- Progress bar only exists for non-sticky notifications. Its fill is
-    -- driven directly (no Tween) by the Heartbeat countdown below, so it's
-    -- always exactly in sync with the actual time remaining.
     local progressTrack, progressFill
     if not isSticky then
         progressTrack = Instance.new("Frame")
@@ -1931,9 +1683,6 @@ function Components.Notification(parent, theme, connMgr, opts)
         TweenService:Create(closeBtn, TweenInfo.new(0.2, EASE, EASE_OUT), { TextColor3 = Color3.fromRGB(180, 180, 190) }):Play()
     end))
 
-    -- Whole-card scale for a springy pop on entrance/exit (Size itself is
-    -- driven by AutomaticSize, so scale is layered on top via UIScale instead
-    -- of tweening Size directly).
     local cardScale = Instance.new("UIScale")
     cardScale.Scale = 0.9
     cardScale.Parent = card
@@ -1949,7 +1698,7 @@ function Components.Notification(parent, theme, connMgr, opts)
     local countdownConn = nil
     local self = { Instance = slot }
 
-    card.Active = true -- lets a plain Frame receive MouseEnter/MouseLeave for hover-to-pause
+    card.Active = true
 
     local function stopCountdown()
         if countdownConn then
@@ -1958,10 +1707,6 @@ function Components.Notification(parent, theme, connMgr, opts)
         end
     end
 
-    -- Single Heartbeat connection drives both the visible progress bar and
-    -- the actual auto-dismiss off the same `remainingTime` clock, so the bar
-    -- reaching empty and the dismiss firing can never drift apart or get
-    -- stuck mid-way the way the old Tween-based version could.
     local function startCountdown()
         if isSticky or dismissed then return end
         stopCountdown()
@@ -1986,16 +1731,8 @@ function Components.Notification(parent, theme, connMgr, opts)
         dismissed = true
         stopCountdown()
 
-        -- Now that the entrance/hover phase is fully done, clip again for
-        -- the exit — this hides the slide-out overshoot and the height
-        -- collapse in step 2 from spilling outside the card's rounded corners.
         card.ClipsDescendants = true
 
-        -- Step 1: slide the whole card out to the right, clear past its own
-        -- width, so the exit reads as a deliberate "swipe away". `card`
-        -- lives inside `slot` (not directly inside the list-managed
-        -- container), so this Position tween is free to run without a
-        -- UIListLayout recompute snapping it back mid-flight.
         local slideDistance = card.AbsoluteSize.X + 60
         Animator.Tween(cardScale, { Scale = 0.94 }, 0.28, EASE, EASE_IN):Play()
         Animator.Tween(stroke, { Transparency = 1 }, 0.22, EASE, EASE_IN):Play()
@@ -2006,17 +1743,10 @@ function Components.Notification(parent, theme, connMgr, opts)
         Animator.Tween(iconHolder, { BackgroundTransparency = 1 }, 0.18, EASE, EASE_IN):Play()
         Animator.Tween(closeBtn, { TextTransparency = 1 }, 0.18, EASE, EASE_IN):Play()
 
-        -- Gated on each tween's own Completed event so the slide-out ->
-        -- collapse -> destroy sequence always lines up with the actual
-        -- on-screen animation instead of guessing via task.delay.
         local slideOut = Animator.Tween(card, { Position = UDim2.new(0, slideDistance, 0, 0), BackgroundTransparency = 1 }, 0.3, EASE, EASE_IN)
         slideOut:Play()
 
         slideOut.Completed:Connect(function()
-            -- Step 2: collapse height smoothly so notifications below slide
-            -- up into place instead of jumping the instant this one is gone.
-            -- Shrinking `card`'s height shrinks `slot`'s AutomaticSize right
-            -- along with it, which is what actually drives the list reflow.
             card.AutomaticSize = Enum.AutomaticSize.None
             card.Size = UDim2.new(1, 0, 0, card.AbsoluteSize.Y)
             local collapse = Animator.Tween(card, { Size = UDim2.new(1, 0, 0, 0) }, 0.22, EASE, EASE_IN)
@@ -2030,9 +1760,6 @@ function Components.Notification(parent, theme, connMgr, opts)
 
     connMgr:Track(closeBtn.MouseButton1Click:Connect(function() self:Dismiss() end))
 
-    -- Hovering a notification pauses its countdown (classic toast-UX
-    -- courtesy so it doesn't vanish while you're reading it) and gives a
-    -- subtle highlight so the card reads as interactive.
     connMgr:Track(card.MouseEnter:Connect(function()
         if dismissed then return end
         stopCountdown()
@@ -2052,11 +1779,6 @@ function Components.Notification(parent, theme, connMgr, opts)
         end
     end))
 
-    -- Entrance: slide in from the side + fade + a small springy scale
-    -- overshoot (Back easing), with the icon popping in a beat later. We
-    -- wait two Heartbeat frames first so `card`'s AutomaticSize has fully
-    -- converged — this is what fixes both the jerky entrance and the text
-    -- appearing to "land" in the wrong spot.
     card.Position = UDim2.new(0, 36, 0, 0)
     card.BackgroundTransparency = 1
     stroke.Transparency = 1
@@ -2074,32 +1796,16 @@ function Components.Notification(parent, theme, connMgr, opts)
         startCountdown()
     end)
 
-    function self:ApplyTheme() end -- notifications keep their creation-time look; they're short-lived
+    function self:ApplyTheme() end
     return self
 end
 
---============================================================
--- MODULE: Tab (forward-declared; methods attached after Window below)
---============================================================
 local TabMeta = {}
 TabMeta.__index = TabMeta
 
---============================================================
--- MODULE: Window
--- Owns the ScreenGui, loading screen, chrome (titlebar/drag/resize/
--- minimize) and the tab strip. Delegates page content to Tab objects,
--- which delegate individual controls to Components. There is no in-UI
--- close button — the window is closed programmatically instead, via
--- Library:Destroy() (or Window:Destroy() directly).
---============================================================
 local Window = {}
 Window.__index = Window
 
--- Maps a window Title -> its ConnectionManager, for the currently-live
--- window using that title. Lets destroyExisting() fully tear down a
--- previous run's connections (drag/resize/hover/heartbeat tweens) instead
--- of only deleting its ScreenGui and leaking every connection it made,
--- which is what re-running this script used to do every single time.
 local activeWindows = {}
 
 local function destroyExisting(playerGui, name)
@@ -2116,10 +1822,6 @@ function Window.new(config)
     config = config or {}
     local title = config.Title or "Selenix"
     local size = config.Size or UDim2.new(0, 460, 0, 390)
-    -- Optional titlebar icon. Pass an asset id string (e.g. "rbxassetid://123"
-    -- or just the numeric id, both accepted below). Leave nil/"" to omit the
-    -- icon entirely — the title text then shifts left to fill the freed space
-    -- instead of leaving an empty gap where the icon would have been.
     local icon = config.Icon
     if type(icon) == "number" then icon = "rbxassetid://" .. tostring(icon) end
     if icon == "" then icon = nil end
@@ -2156,14 +1858,7 @@ end
 function Window:_buildChrome(title, originalSize)
     local screenGui, connMgr, theme = self._screenGui, self._connMgr, self._theme
 
-    -- Main frame
     local mainFrame = Instance.new("Frame")
-    -- Anchored at true center (not top-center) so UIScale-driven zoom
-    -- (loading-screen reveal, Window:Destroy() teardown) scales symmetrically
-    -- around the window's actual center. During minimize/restore, the
-    -- window is temporarily switched to a top-center anchor and back (see
-    -- _setupMinimize) so that phase only needs to tween Size, not Size +
-    -- Position together.
     mainFrame.AnchorPoint = Vector2.new(0.5, 0.5)
     mainFrame.Size = originalSize
     mainFrame.Position = UDim2.new(0.5, 0, 0.5, 0)
@@ -2191,10 +1886,8 @@ function Window:_buildChrome(title, originalSize)
     mainScale.Scale = 0.8
     mainScale.Parent = mainFrame
 
-    -- Loading screen
     self:_buildLoadingScreen(title, mainFrame, mainScale, shadow)
 
-    -- Titlebar
     local titleBar = Instance.new("Frame")
     titleBar.Size = UDim2.new(1, 0, 0, 40)
     titleBar.BorderSizePixel = 0
@@ -2207,11 +1900,6 @@ function Window:_buildChrome(title, originalSize)
     self._titleBarCorner = titleBarCorner
     self._titleBar = titleBar
 
-    -- Icon is only created when one was provided in CreateWindow's config;
-    -- without it there's nothing reserving that left-hand space, so the
-    -- title label starts further left (15px, matching the titlebar's other
-    -- edge paddings) and claims the width the icon would have used instead
-    -- of leaving a blank gap.
     local hasIcon = self._icon ~= nil
     local titleIcon
     if hasIcon then
@@ -2246,41 +1934,24 @@ function Window:_buildChrome(title, originalSize)
         b.AnchorPoint = Vector2.new(0.5, 0.5)
         b.Position = UDim2.new(1, xOffset + 15, 0, 5 + 15)
         b.BackgroundColor3 = bgColor
-        b.BackgroundTransparency = 1 -- fully invisible background; only the glyph shows
+        b.BackgroundTransparency = 1
         b.Text = text
         b.TextColor3 = Color3.fromRGB(255, 255, 255)
         b.TextSize = 18
         b.Font = Enum.Font.GothamBold
         b.Parent = titleBar
         Utils.AddCorner(b, UDim.new(0, 6))
-        Animator.AddHoverEffect(b, connMgr, bgColor, hoverColor, true) -- skipStroke: no hover-outline frame on chrome buttons
+        Animator.AddHoverEffect(b, connMgr, bgColor, hoverColor, true)
         return b
     end
 
     local minimizeBtn = chromeButton(-40, "—", Color3.fromRGB(60, 60, 70), Color3.fromRGB(80, 80, 95))
-    -- (close button removed — the window is closed programmatically via
-    -- Selenix:Destroy(); the resize/expand titlebar button was removed
-    -- earlier too — resizing is still available via the drag handle in the
-    -- window's bottom-right corner)
 
     self:_setupDrag(titleBar, mainFrame)
 
-    -- Theme-driven gradients (used by GradientPicker component)
     local mainGradient = Instance.new("UIGradient"); mainGradient.Rotation = 45; mainGradient.Enabled = false; mainGradient.Parent = mainFrame
     local titleGradient = Instance.new("UIGradient"); titleGradient.Rotation = 45; titleGradient.Enabled = false; titleGradient.Parent = titleBar
 
-    -- Content group: everything below the titlebar (tab strip + all tab
-    -- pages/controls) lives inside this CanvasGroup instead of directly
-    -- inside mainFrame. CanvasGroup.GroupTransparency fades the *entire*
-    -- subtree — every button/toggle/slider/textbox/dropdown/colorpicker,
-    -- regardless of type — with a single tween, instead of needing custom
-    -- fade logic inside every Components.* factory. Used by minimize/
-    -- restore below (see _setupMinimize; fade is driven manually via
-    -- Animator.FadeCanvasGroup rather than TweenService — see that function's
-    -- comment for why). The titlebar and resize handle stay outside it on
-    -- purpose so they never fade, and the notification layer is parented
-    -- directly to screenGui (see _buildNotificationLayer) so toasts keep
-    -- showing while minimized.
     local contentGroup = Instance.new("CanvasGroup")
     contentGroup.Name = "Content"
     contentGroup.Size = UDim2.new(1, 0, 1, 0)
@@ -2288,7 +1959,6 @@ function Window:_buildChrome(title, originalSize)
     contentGroup.Parent = mainFrame
     self._contentGroup = contentGroup
 
-    -- Tab strip
     local tabContainer = Instance.new("ScrollingFrame")
     tabContainer.Size = UDim2.new(1, 0, 0, 45)
     tabContainer.Position = UDim2.new(0, 0, 0, 40)
@@ -2298,7 +1968,7 @@ function Window:_buildChrome(title, originalSize)
     tabContainer.CanvasSize = UDim2.new(0, 0, 0, 0)
     tabContainer.AutomaticCanvasSize = Enum.AutomaticSize.X
     tabContainer.ElasticBehavior = Enum.ElasticBehavior.WhenScrollable
-    tabContainer.BackgroundTransparency = 1 -- hidden; blends straight into mainFrame
+    tabContainer.BackgroundTransparency = 1
     tabContainer.Parent = contentGroup
     local tabContainerGradient = Instance.new("UIGradient"); tabContainerGradient.Rotation = 45; tabContainerGradient.Enabled = false; tabContainerGradient.Parent = tabContainer
     local tabLayout = Instance.new("UIListLayout")
@@ -2310,9 +1980,6 @@ function Window:_buildChrome(title, originalSize)
     Utils.AddPadding(tabContainer, UDim.new(0, 10), UDim.new(0, 10))
     self._tabContainer = tabContainer
 
-    -- Still used as the horizontal offset new pages slide in from during a
-    -- tab switch (see CreateTab's switchTo) — kept even though the cover
-    -- overlay that used to size itself off of it is gone.
     local SLIDE_OFFSET = 26
     self._slideOffset = SLIDE_OFFSET
 
@@ -2325,10 +1992,6 @@ function Window:_buildChrome(title, originalSize)
     self:_setupResize(mainFrame, originalSize)
     self:_setupMinimize(mainFrame, minimizeBtn)
 
-    -- Theme subscription for chrome pieces. isInitial=true on the first
-    -- (synchronous) call snaps every color instantly; every call after that
-    -- is a real theme change from ThemeGrid, so it animates like every other
-    -- component instead of the old hand-rolled `chromeThemeInitialized` flag.
     theme:Subscribe(function(color, accent, isInitial)
         local darkTitle = Utils.Darken(color, 0.7)
         local darkTab = Utils.Darken(color, 0.85)
@@ -2417,11 +2080,6 @@ function Window:_buildLoadingScreen(title, mainFrame, mainScale, mainShadow)
     Animator.Tween(loading, { BackgroundTransparency = 0 }, 0.35):Play()
     Animator.Tween(barFill, { Size = UDim2.new(1, 0, 1, 0) }, 1.35):Play()
 
-    -- Gated on the fade-out tween's own Completed event (instead of a fixed
-    -- task.delay guess) so mainFrame is revealed exactly when the loading
-    -- screen has actually finished fading out, avoiding a visible timing
-    -- mismatch under lag/frame drops. The initial 1.6s wait itself stays as
-    -- task.delay since it isn't tied to any tween's duration.
     task.delay(1.6, function()
         Animator.Tween(loadingScale, { Scale = 0.85 }, 0.3, EASE, EASE_IN):Play()
         local fadeOut = Animator.Tween(loading, { BackgroundTransparency = 1 }, 0.3, EASE, EASE_IN)
@@ -2487,11 +2145,6 @@ function Window:_setupResize(mainFrame, originalSize)
     handle.Parent = mainFrame
     self._resizeHandle = handle
 
-    -- mainFrame is anchored at its true center while idle, so growing/
-    -- shrinking Size alone would shift both edges equally in every
-    -- direction. We want resize to feel like dragging the bottom-right
-    -- corner (top-left edge stays put), so every Size change here is paired
-    -- with a Position delta of exactly half the size change, in both axes.
     local dragging, dragStart, startSize, startPos
     connMgr:Track(handle.InputBegan:Connect(function(input)
         if self._minimized or self._animating then return end
@@ -2621,8 +2274,6 @@ function Window:CreateTab(name)
     btn.Text = name
     btn.Font = Enum.Font.GothamBold
     btn.TextSize = 15
-    -- Without this, Roblox's own built-in button-hover recolor runs on top
-    -- of BackgroundColor3 alongside our tween below, fighting it every frame.
     btn.AutoButtonColor = false
     btn.Parent = self._tabContainer
     Utils.AddCorner(btn, UDim.new(0, 6))
@@ -2630,9 +2281,6 @@ function Window:CreateTab(name)
     local function tabBaseColor()
         return (index == self._activeTabIndex) and theme.Accent or Utils.Darken(theme.Color, 0.82)
     end
-    -- Text color is now computed for contrast against the live theme instead
-    -- of a hardcoded white/gray pair, so it stays readable (and tweens
-    -- correctly) on any theme, including light ones.
     local function tabTextColor()
         return Utils.GetTextColorFor(tabBaseColor(), theme.Accent)
     end
@@ -2640,7 +2288,7 @@ function Window:CreateTab(name)
         return Utils.GetTextColorFor(Utils.Brighten(tabBaseColor(), 1.2), theme.Accent)
     end
 
-    btn.TextColor3 = tabTextColor() -- initial paint, matches the theme active at creation time
+    btn.TextColor3 = tabTextColor()
 
     connMgr:Track(btn.MouseEnter:Connect(function()
         local hoverBg = Utils.Brighten(tabBaseColor(), 1.2)
@@ -2665,13 +2313,6 @@ function Window:CreateTab(name)
     page.ScrollBarThickness = 0
     page.CanvasSize = UDim2.new(0, 0, 0, 0)
     page.AutomaticCanvasSize = Enum.AutomaticSize.Y
-    -- Parented to the CanvasGroup (not mainFrame directly) so this page's
-    -- controls — buttons, toggles, sliders, textboxes, dropdowns, etc. —
-    -- fade as one unit whenever contentGroup.GroupTransparency is driven
-    -- (see _setupMinimize / Animator.FadeCanvasGroup). Positions below are
-    -- unchanged: contentGroup is the same size as mainFrame, so relative
-    -- coordinates line up exactly as they did when parented straight to
-    -- mainFrame.
     page.Parent = self._contentGroup
     page.Visible = (index == 1)
     local layout = Instance.new("UIListLayout")
@@ -2698,9 +2339,6 @@ function Window:CreateTab(name)
         newPage.Position = UDim2.new(0, 10 + direction * self._slideOffset, 0, 95)
         newPage.Visible = true
 
-        -- Gated on the slide tween's own Completed event so `switching`
-        -- clears exactly when the page has actually finished sliding into
-        -- place, instead of a fixed task.delay guess.
         local slide = Animator.Tween(newPage, { Position = PAGE_BASE_POS }, 0.35)
         slide.Completed:Connect(function() switching = false end)
         slide:Play()
@@ -2736,12 +2374,6 @@ end
 function Window:GetTheme() return self._theme end
 function Window:GetGradients() return self._gradients end
 
---============================================================
--- Notification layer
--- Independent of mainFrame (parented directly to the ScreenGui) so
--- toasts keep showing even while the window is minimized, and stay
--- visible above the rest of the chrome via ZIndex.
---============================================================
 function Window:_buildNotificationLayer()
     local screenGui = self._screenGui
 
@@ -2753,9 +2385,6 @@ function Window:_buildNotificationLayer()
     container.ZIndex = 100
     container.Parent = screenGui
 
-    -- Width caps at 300px but shrinks on narrow/mobile screens, always
-    -- keeping a 20px margin on both sides so the rounded card never clips
-    -- off the left edge of the viewport.
     local MAX_WIDTH = 300
     local MIN_MARGIN = 20
     local function updateContainerSize()
@@ -2775,15 +2404,10 @@ function Window:_buildNotificationLayer()
     self._notifContainer = container
     self._notifOrder = 0
 
-    -- Caps the number of simultaneous toasts so a spammy Notify() loop can't
-    -- flood the whole viewport; oldest visible toast is dismissed to make
-    -- room for a new one instead of growing the stack unbounded.
     self._activeNotifs = {}
     self._maxNotifs = 5
 end
 
--- opts: { Title, Text, Type = "success"|"error"|"warning"|"info",
---         Duration (seconds; default 4, pass 0 or false for sticky/no auto-dismiss) }
 function Window:Notify(opts)
     opts = opts or {}
     self._notifOrder = self._notifOrder + 1
@@ -2806,10 +2430,6 @@ function Window:Notify(opts)
     return notif
 end
 
---============================================================
--- Tab methods
--- Thin wrappers that assign a LayoutOrder and forward to Components.*
---============================================================
 local function nextOrder(tab)
     tab._order = tab._order + 1
     return tab._order
@@ -2863,18 +2483,12 @@ end
 function TabMeta:CreateGradientPicker(opts)
     opts = opts or {}
     opts.LayoutOrder = nextOrder(self)
-    nextOrder(self) -- GradientPicker also creates the grid one order below
+    nextOrder(self)
     return Components.GradientPicker(self._page, self._theme, self._connMgr, opts)
 end
 
---============================================================
--- Public Library API
---============================================================
 local Library = {}
 
--- Tracks the most recently created window so Library:Destroy() (i.e.
--- `Selenix:Destroy()`) has something to close without the caller needing
--- to hold onto the Window object themselves.
 Library._activeWindow = nil
 
 function Library:CreateWindow(config)
@@ -2883,9 +2497,6 @@ function Library:CreateWindow(config)
     return window
 end
 
--- Closes the UI programmatically — e.g. `Selenix:Destroy()` — running the
--- same fade/scale-down teardown as Window:Destroy(). No-op if there is no
--- active window (already destroyed, or never created).
 function Library:Destroy()
     if Library._activeWindow then
         Library._activeWindow:Destroy()
