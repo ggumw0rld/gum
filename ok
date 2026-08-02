@@ -2497,14 +2497,28 @@ function Window:_setupMinimize(mainFrame, minimizeBtn)
     local CONTENT_FADE_OUT_TIME = 0.22
     local CONTENT_FADE_IN_TIME = 0.28
 
+    -- Chuyển sang neo top-center: giữ mép trên cố định, chỉ co/giãn chiều
+    -- cao bên dưới. Bỏ hẳn việc tự tính Position delta bằng tay (nguồn gây
+    -- jitter), vì giờ Position không cần tween theo Size nữa.
+    local function anchorTopCenter()
+        local size, pos = mainFrame.Size, mainFrame.Position
+        local topY = pos.Y.Offset - size.Y.Offset / 2
+        mainFrame.AnchorPoint = Vector2.new(0.5, 0)
+        mainFrame.Position = UDim2.new(pos.X.Scale, pos.X.Offset, pos.Y.Scale, topY)
+    end
+    local function anchorCenter()
+        local size, pos = mainFrame.Size, mainFrame.Position
+        local centerY = pos.Y.Offset + size.Y.Offset / 2
+        mainFrame.AnchorPoint = Vector2.new(0.5, 0.5)
+        mainFrame.Position = UDim2.new(pos.X.Scale, pos.X.Offset, pos.Y.Scale, centerY)
+    end
+
     connMgr:Track(minimizeBtn.MouseButton1Click:Connect(function()
         if self._animating then return end
         self._animating = true
         self._minimized = not self._minimized
 
         local contentGroup = self._contentGroup
-        local startSize = mainFrame.Size
-        local startPos = mainFrame.Position
 
         if self._minimized then
             minimizeBtn.Text = "▢"
@@ -2513,21 +2527,18 @@ function Window:_setupMinimize(mainFrame, minimizeBtn)
             local focused = UserInputService:GetFocusedTextBox()
             if focused then focused:ReleaseFocus() end
 
-            -- Bước 1: fade content ra hết TRƯỚC, frame chưa động vào.
+            -- Bước 1: fade content ra hết trước.
             local fadeOut = Animator.Tween(contentGroup, { GroupTransparency = 1 }, CONTENT_FADE_OUT_TIME, Enum.EasingStyle.Sine, EASE_OUT)
             fadeOut.Completed:Connect(function()
                 self._tabContainer.Visible = false
                 for _, p in ipairs(self._pages) do p.Visible = false end
 
-                -- Bước 2: content đã ẩn hoàn toàn -> giờ mới co frame lại.
-                local dH = MINIMIZED_HEIGHT - startSize.Y.Offset
-                local targetPos = UDim2.new(
-                    startPos.X.Scale, startPos.X.Offset,
-                    startPos.Y.Scale, startPos.Y.Offset + dH / 2
-                )
+                -- Bước 2: neo top-center rồi chỉ tween Size (không tween
+                -- Position nữa) -> hết giật.
+                anchorTopCenter()
+                local currentW = mainFrame.Size.X.Offset
                 local shrink = Animator.Tween(mainFrame, {
-                    Size = UDim2.new(startSize.X.Scale, startSize.X.Offset, 0, MINIMIZED_HEIGHT),
-                    Position = targetPos,
+                    Size = UDim2.new(0, currentW, 0, MINIMIZED_HEIGHT)
                 }, SIZE_TWEEN_TIME)
                 shrink.Completed:Connect(function() self._animating = false end)
                 shrink:Play()
@@ -2544,17 +2555,15 @@ function Window:_setupMinimize(mainFrame, minimizeBtn)
             self._resizeHandle.Visible = true
             contentGroup.GroupTransparency = 1
 
-            -- Bước 1: giãn frame về full size trước.
+            -- mainFrame đang neo top-center (từ lần minimize trước) -> chỉ
+            -- cần tween Size trở lại kích thước gốc.
             local targetSize = self._currentTargetSize
-            local dH = targetSize.Y.Offset - startSize.Y.Offset
-            local targetPos = UDim2.new(
-                startPos.X.Scale, startPos.X.Offset,
-                startPos.Y.Scale, startPos.Y.Offset + dH / 2
-            )
-            local grow = Animator.Tween(mainFrame, { Size = targetSize, Position = targetPos }, SIZE_TWEEN_TIME)
+            local grow = Animator.Tween(mainFrame, { Size = targetSize }, SIZE_TWEEN_TIME)
             grow.Completed:Connect(function()
-                if self._minimized then self._animating = false; return end -- bị minimize lại giữa chừng
-                -- Bước 2: frame đã full size -> giờ fade content vào.
+                -- Xong rồi mới trả AnchorPoint về center, để kéo/resize sau
+                -- đó hoạt động như bình thường.
+                anchorCenter()
+                if self._minimized then self._animating = false; return end
                 local fadeIn = Animator.Tween(contentGroup, { GroupTransparency = 0 }, CONTENT_FADE_IN_TIME, Enum.EasingStyle.Sine, EASE_OUT)
                 fadeIn.Completed:Connect(function() self._animating = false end)
                 fadeIn:Play()
