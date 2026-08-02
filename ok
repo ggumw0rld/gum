@@ -2200,7 +2200,11 @@ function Window:_buildChrome(title, originalSize)
     titleBar.BorderSizePixel = 0
     titleBar.Active = true
     titleBar.Parent = mainFrame
-    Utils.AddCorner(titleBar, UDim.new(0, 12))
+    titleBar.Parent = mainFrame
+    local titleBarCorner = Utils.AddCorner(titleBar, UDim.new(0, 12))
+    titleBarCorner.BottomLeftRadius = UDim.new(0, 0)
+    titleBarCorner.BottomRightRadius = UDim.new(0, 0)
+    self._titleBarCorner = titleBarCorner
     self._titleBar = titleBar
 
     -- Icon is only created when one was provided in CreateWindow's config;
@@ -2567,66 +2571,46 @@ function Window:_setupMinimize(mainFrame, minimizeBtn)
         local contentGroup = self._contentGroup
 
         if self._minimized then
-            minimizeBtn.Text = "▢"
-            self._resizeHandle.Visible = false
+    minimizeBtn.Text = "▢"
+    self._resizeHandle.Visible = false
 
-            -- Blur any active textbox first so a control mid-fade doesn't
-            -- keep the keyboard/cursor focused on something disappearing.
-            local focused = UserInputService:GetFocusedTextBox()
-            if focused then focused:ReleaseFocus() end
+    local focused = UserInputService:GetFocusedTextBox()
+    if focused then focused:ReleaseFocus() end
 
-            -- Stage 1: fade content out (manually driven — see
-            -- Animator.FadeCanvasGroup — so it actually renders on every
-            -- executor instead of possibly popping). Only once this is
-            -- fully done do we touch Size/AnchorPoint, so the fade is never
-            -- competing with the resize for the same frame budget.
-            Animator.FadeCanvasGroup(contentGroup, 1, CONTENT_FADE_OUT_TIME, connMgr, function()
-                self._tabContainer.Visible = false
-                for _, p in ipairs(self._pages) do p.Visible = false end
+    Animator.FadeCanvasGroup(contentGroup, 1, CONTENT_FADE_OUT_TIME, connMgr, function()
+        self._tabContainer.Visible = false
+        for _, p in ipairs(self._pages) do p.Visible = false end
 
-                -- Stage 2: switch to top-center anchoring, then shrink
-                -- Size only (no Position tween needed — see anchorTopCenter
-                -- comment above for why this eliminates the jitter).
-                anchorTopCenter()
-                local currentW = mainFrame.Size.X.Offset
-                local shrink = Animator.Tween(mainFrame, {
-                    Size = UDim2.new(0, currentW, 0, MINIMIZED_HEIGHT)
-                }, SIZE_TWEEN_TIME)
-                shrink.Completed:Connect(function() self._animating = false end)
-                shrink:Play()
-            end)
-        else
-            minimizeBtn.Text = "—"
+        -- Bo tròn lại 2 góc dưới của titleBar để khớp mainFrame khi nó
+        -- co lại chỉ còn đúng chiều cao titleBar
+        self._titleBarCorner.BottomLeftRadius = UDim.new(0, 12)
+        self._titleBarCorner.BottomRightRadius = UDim.new(0, 12)
 
-            self._tabContainer.Visible = true
-            for i, p in ipairs(self._pages) do
-                p.Visible = (i == self._activeTabIndex)
-                p.Position = UDim2.new(0, 10, 0, 95)
-            end
-            self._resizeHandle.Visible = true
-            contentGroup.GroupTransparency = 1
+        anchorTopCenter()
+        local currentW = mainFrame.Size.X.Offset
+        local shrink = Animator.Tween(mainFrame, {
+            Size = UDim2.new(0, currentW, 0, MINIMIZED_HEIGHT)
+        }, SIZE_TWEEN_TIME)
+        shrink.Completed:Connect(function() self._animating = false end)
+        shrink:Play()
+    end)
+else
+    minimizeBtn.Text = "—"
+    ...
+    local grow = Animator.Tween(mainFrame, { Size = targetSize }, SIZE_TWEEN_TIME)
+    grow.Completed:Connect(function()
+        anchorCenter()
+        if self._minimized then self._animating = false; return end
 
-            -- Stage 1: mainFrame is already top-center-anchored from the
-            -- last minimize, so grow Size only, straight back to its full
-            -- pre-minimize size.
-            local targetSize = self._currentTargetSize
-            local grow = Animator.Tween(mainFrame, { Size = targetSize }, SIZE_TWEEN_TIME)
-            grow.Completed:Connect(function()
-                -- Stage 2: restore true-center anchoring now that the frame
-                -- is back to full size, so drag/resize behave normally again.
-                anchorCenter()
-                if self._minimized then self._animating = false; return end -- re-minimized before this fired
+        -- Trả lại góc vuông cho titleBar khi đã full-size trở lại
+        self._titleBarCorner.BottomLeftRadius = UDim.new(0, 0)
+        self._titleBarCorner.BottomRightRadius = UDim.new(0, 0)
 
-                -- Stage 3: fade content back in (manually driven, same as
-                -- the fade-out above) only after the frame has fully grown,
-                -- so it never looks like it's "popping in" mid-expand.
-                Animator.FadeCanvasGroup(contentGroup, 0, CONTENT_FADE_IN_TIME, connMgr, function()
-                    self._animating = false
-                end)
-            end)
-            grow:Play()
-        end
-    end))
+        Animator.FadeCanvasGroup(contentGroup, 0, CONTENT_FADE_IN_TIME, connMgr, function()
+            self._animating = false
+        end)
+    end)
+    grow:Play()
 end
 
 -- Tab text colors are theme-driven: active tab uses a contrast-safe color
