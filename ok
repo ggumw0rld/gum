@@ -31,6 +31,23 @@
     ============================================================
 
     PATCH NOTES (this copy):
+    Reverted the task.delay-based completion fallback back to
+    tween.Completed:Connect(...) in the four spots that had it
+    (ExpandableHeader open/close, loading-screen fade-out, tab switchTo,
+    notification Dismiss). task.delay(duration, fn) assumes a tween finishes
+    in exactly `duration` seconds; under frame drops / lag spikes it can fire
+    visibly before or after the tween actually settles, which reads as
+    janky/stuttery timing (the follow-up step — unlocking `animating` /
+    `switching`, revealing the window, destroying the notification, etc. —
+    landing slightly out of sync with what's on screen). tween.Completed
+    fires exactly when the tween itself reports done, so the follow-up step
+    always lines up with the animation. Trade-off: on executors that don't
+    reliably fire Tween.Completed, these four interactions can get stuck
+    disabled after their first use (see the superseded note below) — if that
+    resurfaces, task.delay is the fallback to reach for again.
+
+    Superseded note (kept for history — no longer applies to the 4 spots
+    above, since they're back on tween.Completed):
     Fixed a critical bug where Utils.Brighten / Utils.GetLuminance /
     Utils.GetTextColorFor / Components.Label's Muted branch used lowercase
     Color3 fields (.r/.g/.b), which do not exist on Color3 (Roblox only
@@ -768,14 +785,15 @@ function Components.ExpandableHeader(parent, theme, connMgr, opts)
         animating = true
         open = v
         TweenService:Create(arrow, TweenInfo.new(0.3, EASE, EASE_OUT), { Rotation = open and 180 or 0 }):Play()
-        TweenService:Create(container, TweenInfo.new(0.33, EASE, EASE_OUT), {
+        local tw = TweenService:Create(container, TweenInfo.new(0.33, EASE, EASE_OUT), {
             Size = UDim2.new(1, 0, 0, open and openHeight or closedHeight)
-        }):Play()
-        -- Was gated on Tween.Completed, which some executors never fire —
-        -- that permanently stuck `animating = true`, silently disabling this
-        -- header (and every ExpandableHeader-based control: Dropdown,
-        -- MultiDropdown, ColorPicker) after its very first open/close.
-        task.delay(0.33, function() animating = false end)
+        })
+        -- Gated on the tween's own Completed event so `animating` clears in
+        -- sync with the actual on-screen animation instead of a fixed
+        -- task.delay guess (which can unlock slightly early/late under lag
+        -- and reads as stuttery timing).
+        tw.Completed:Connect(function() animating = false end)
+        tw:Play()
         if opts.OnToggle then opts.OnToggle(open) end
     end
     connMgr:Track(header.MouseButton1Click:Connect(function() setOpen(not open) end))
@@ -1674,23 +1692,9 @@ end
 -- it never auto-dismisses; it only closes via the × button or a manual
 -- :Dismiss() call.
 --
--- FIXES vs the previous version:
---  1) Entrance animation + the auto-dismiss countdown now both wait two
---     Heartbeat frames before starting. `card` nests two levels of
---     AutomaticSize (labels -> contentHolder -> card), so its true height
---     isn't known on the very first frame; starting the slide/scale/fade
---     tween before that settles is what made the card visibly pop in at
---     the wrong size and made the text look like it "landed" too low.
---  2) The hover-to-pause countdown no longer works by Cancel()-ing a Tween
---     and reading back its live interpolated Size to guess "how much time
---     is left". That could desync (e.g. if MouseEnter/MouseLeave fire more
---     than once in quick succession) and leave the auto-dismiss timer
---     effectively stuck forever. It's now a single Heartbeat-driven
---     countdown with an explicit `remainingTime` value — pausing/resuming
---     is just disconnecting/reconnecting that one connection.
---  3) Sticky notifications (Duration = 0/false) never create a progress
---     bar at all, instead of relying on Lua's "0 is truthy" behavior to
---     accidentally skip it.
+-- Icon + title share a horizontal row whose own UIListLayout vertically
+-- centers both against each other, so the title text lines up with the
+-- icon regardless of the title's actual rendered height.
 local NOTIF_TYPES = {
     success = { Color3.fromRGB(60, 200, 120), "✓" },
     error   = { Color3.fromRGB(220, 70, 70),  "×" },
@@ -1748,13 +1752,6 @@ function Components.Notification(parent, theme, connMgr, opts)
     accentBar.Parent = card
     Utils.AddCorner(accentBar, UDim.new(0, 2))
 
-    -- Icon + title now share a horizontal row whose own UIListLayout
-    -- vertically centers both against each other. Previously the icon
-    -- (vertically centered inside its 26px circle) and the title (top-
-    -- aligned text starting at the same Y offset) didn't share a real
-    -- visual center, so the title text visibly sat lower than the icon.
-    -- Centering them as a row guarantees alignment regardless of the
-    -- title's actual rendered height.
     local contentHolder = Instance.new("Frame")
     contentHolder.Position = UDim2.new(0, 14, 0, 14)
     contentHolder.Size = UDim2.new(1, -52, 0, 0)
@@ -1944,28 +1941,26 @@ function Components.Notification(parent, theme, connMgr, opts)
         Animator.Tween(icon, { TextTransparency = 1 }, 0.18, EASE, EASE_IN):Play()
         Animator.Tween(iconHolder, { BackgroundTransparency = 1 }, 0.18, EASE, EASE_IN):Play()
         Animator.Tween(closeBtn, { TextTransparency = 1 }, 0.18, EASE, EASE_IN):Play()
-        local SLIDE_OUT_DURATION = 0.3
-        Animator.Tween(card, { Position = UDim2.new(0, slideDistance, 0, 0), BackgroundTransparency = 1 }, SLIDE_OUT_DURATION, EASE, EASE_IN):Play()
 
-        -- NOTE: teardown used to be chained off slideOut.Completed / then
-        -- collapse.Completed. On executors that don't reliably fire
-        -- Tween.Completed, that left dismissed notifications stuck on
-        -- screen forever (visually mid-fade, never actually destroyed).
-        -- task.delay matching each tween's own duration doesn't depend on
-        -- that event at all.
-        task.delay(SLIDE_OUT_DURATION, function()
+        -- Gated on each tween's own Completed event so the slide-out ->
+        -- collapse -> destroy sequence always lines up with the actual
+        -- on-screen animation instead of guessing via task.delay.
+        local slideOut = Animator.Tween(card, { Position = UDim2.new(0, slideDistance, 0, 0), BackgroundTransparency = 1 }, 0.3, EASE, EASE_IN)
+        slideOut:Play()
+
+        slideOut.Completed:Connect(function()
             -- Step 2: collapse height smoothly so notifications below slide
             -- up into place instead of jumping the instant this one is gone.
             -- Shrinking `card`'s height shrinks `slot`'s AutomaticSize right
             -- along with it, which is what actually drives the list reflow.
             card.AutomaticSize = Enum.AutomaticSize.None
             card.Size = UDim2.new(1, 0, 0, card.AbsoluteSize.Y)
-            local COLLAPSE_DURATION = 0.22
-            Animator.Tween(card, { Size = UDim2.new(1, 0, 0, 0) }, COLLAPSE_DURATION, EASE, EASE_IN):Play()
-            task.delay(COLLAPSE_DURATION, function()
+            local collapse = Animator.Tween(card, { Size = UDim2.new(1, 0, 0, 0) }, 0.22, EASE, EASE_IN)
+            collapse.Completed:Connect(function()
                 if opts.OnDismiss then opts.OnDismiss() end
                 slot:Destroy()
             end)
+            collapse:Play()
         end)
     end
 
@@ -2329,24 +2324,22 @@ function Window:_buildLoadingScreen(title, mainFrame, mainScale, mainShadow)
     Animator.Tween(loading, { BackgroundTransparency = 0 }, 0.35):Play()
     Animator.Tween(barFill, { Size = UDim2.new(1, 0, 1, 0) }, 1.35):Play()
 
-    -- NOTE: revealing mainFrame used to be gated on fadeOut.Completed firing.
-    -- Some executors/environments don't reliably fire Tween.Completed, which
-    -- silently left mainFrame.Visible stuck at false forever (loading screen
-    -- fades out, then... nothing — the whole window never appears, even
-    -- though the rest of the script runs fine). Driven off task.delay
-    -- instead, matching the tween's own duration, so it fires regardless of
-    -- whether Completed does.
-    local FADE_OUT_DURATION = 0.3
+    -- Gated on the fade-out tween's own Completed event (instead of a fixed
+    -- task.delay guess) so mainFrame is revealed exactly when the loading
+    -- screen has actually finished fading out, avoiding a visible timing
+    -- mismatch under lag/frame drops. The initial 1.6s wait itself stays as
+    -- task.delay since it isn't tied to any tween's duration.
     task.delay(1.6, function()
-        Animator.Tween(loadingScale, { Scale = 0.85 }, FADE_OUT_DURATION, EASE, EASE_IN):Play()
-        Animator.Tween(loading, { BackgroundTransparency = 1 }, FADE_OUT_DURATION, EASE, EASE_IN):Play()
-        task.delay(FADE_OUT_DURATION, function()
+        Animator.Tween(loadingScale, { Scale = 0.85 }, 0.3, EASE, EASE_IN):Play()
+        local fadeOut = Animator.Tween(loading, { BackgroundTransparency = 1 }, 0.3, EASE, EASE_IN)
+        fadeOut.Completed:Connect(function()
             loading:Destroy()
             mainFrame.Visible = true
             Animator.Tween(mainScale, { Scale = 1 }, 0.35):Play()
             Animator.Tween(mainFrame, { BackgroundTransparency = 0 }, 0.45):Play()
             Animator.Tween(mainShadow, { Transparency = 0.45 }, 0.5):Play()
         end)
+        fadeOut:Play()
     end)
 end
 
@@ -2558,11 +2551,12 @@ function Window:CreateTab(name)
         newPage.Position = UDim2.new(0, 10 + direction * self._slideOffset, 0, 95)
         newPage.Visible = true
 
-        -- Was gated on Tween.Completed, which some executors never fire —
-        -- that permanently stuck `switching = true`, silently disabling all
-        -- further tab switches after the very first one.
-        Animator.Tween(newPage, { Position = PAGE_BASE_POS }, 0.35):Play()
-        task.delay(0.35, function() switching = false end)
+        -- Gated on the slide tween's own Completed event so `switching`
+        -- clears exactly when the page has actually finished sliding into
+        -- place, instead of a fixed task.delay guess.
+        local slide = Animator.Tween(newPage, { Position = PAGE_BASE_POS }, 0.35)
+        slide.Completed:Connect(function() switching = false end)
+        slide:Play()
     end
     connMgr:Track(btn.MouseButton1Click:Connect(switchTo))
 
