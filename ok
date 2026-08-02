@@ -2522,7 +2522,9 @@ function Window:_setupDrag(titleBar, mainFrame)
     local activeInput, dragStart, startPos
 
     connMgr:Track(titleBar.InputBegan:Connect(function(input)
-        if self._resizing or self._minimized or self._animating then return end
+        -- Re-entry guard: ignore a repeat InputBegan firing mid-hold, and
+        -- refuse to start a titlebar drag while a resize is in progress.
+        if self._titleDragging or self._resizing or self._minimized or self._animating then return end
         if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
             self._titleDragging = true
             activeInput = input
@@ -2597,7 +2599,14 @@ function Window:_setupResize(mainFrame, originalSize)
 
     local activeInput, dragStart, startSize
     connMgr:Track(handle.InputBegan:Connect(function(input)
-        if self._titleDragging or self._minimized or self._animating then return end
+        -- Re-entry guard: on the Delta executor, Touch InputBegan can fire
+        -- again mid-hold for the same finger — without this check, each
+        -- repeat firing re-ran anchorTopLeftForResize() on top of an
+        -- already-top-left-anchored frame, subtracting another half-size
+        -- from Position every time and causing repeated visible jumps
+        -- during the drag. Also refuses to start while a titlebar drag is
+        -- already in progress.
+        if self._resizing or self._titleDragging or self._minimized or self._animating then return end
         if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
             self._resizing = true
             activeInput = input
