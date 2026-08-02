@@ -31,6 +31,33 @@
     ============================================================
 
     PATCH NOTES (this copy):
+    Fixed two minimize/zoom animation issues:
+      1. mainFrame was anchored at top-center (0.5, 0) with its vertical
+         position hand-compensated (`0.5, -originalSize.Y.Offset / 2`) to
+         *look* centered at its original size. Any UIScale zoom (loading
+         screen reveal, Window:Destroy() teardown) or Size tween (minimize,
+         resize) scaled/grew relative to that top edge instead of the
+         window's actual center, so zooming visibly grew downward instead
+         of "from the middle". mainFrame is now anchored at true center
+         (0.5, 0.5) with Position simply (0.5, 0, 0.5, 0); _setupResize and
+         _setupMinimize now each compute a Position delta alongside their
+         Size change so the titlebar edge doesn't drift while resizing/
+         minimizing around the new center anchor.
+      2. Minimizing set tabContainer/page Visible = false instantly, so
+         every control inside (buttons, toggles, sliders, textboxes,
+         dropdowns...) just vanished with no transition. Rather than adding
+         per-component fade logic to every Components.* factory, all tab-
+         strip + page content now lives inside one CanvasGroup
+         (`self._contentGroup`, parented under mainFrame, sibling to
+         titleBar). CanvasGroup.GroupTransparency fades its entire subtree
+         with a single tween, so minimize now fades content out (then
+         hides it) before shrinking the frame, and restore grows the frame
+         then fades content back in — no changes needed inside Components.
+         The notification layer intentionally stays outside contentGroup
+         (parented directly to screenGui) so toasts keep showing while
+         minimized, unaffected by this fade.
+
+    Superseded note (kept for history):
     Reverted the task.delay-based completion fallback back to
     tween.Completed:Connect(...) in the four spots that had it
     (ExpandableHeader open/close, loading-screen fade-out, tab switchTo,
@@ -2094,9 +2121,16 @@ function Window:_buildChrome(title, originalSize)
 
     -- Main frame
     local mainFrame = Instance.new("Frame")
-    mainFrame.AnchorPoint = Vector2.new(0.5, 0)
+    -- Anchored at true center (not top-center) so UIScale-driven zoom
+    -- (loading-screen reveal, Window:Destroy() teardown) and the minimize/
+    -- resize Size tweens all scale/grow symmetrically around the window's
+    -- actual center instead of "growing downward" from a fixed top edge.
+    -- _setupResize and _setupMinimize each compute a Position delta
+    -- alongside their Size change so the titlebar edge doesn't drift as a
+    -- side effect of resizing/minimizing around this center anchor.
+    mainFrame.AnchorPoint = Vector2.new(0.5, 0.5)
     mainFrame.Size = originalSize
-    mainFrame.Position = UDim2.new(0.5, 0, 0.5, -originalSize.Y.Offset / 2)
+    mainFrame.Position = UDim2.new(0.5, 0, 0.5, 0)
     mainFrame.BorderSizePixel = 0
     mainFrame.ClipsDescendants = true
     mainFrame.Active = true
@@ -2195,6 +2229,23 @@ function Window:_buildChrome(title, originalSize)
     local mainGradient = Instance.new("UIGradient"); mainGradient.Rotation = 45; mainGradient.Enabled = false; mainGradient.Parent = mainFrame
     local titleGradient = Instance.new("UIGradient"); titleGradient.Rotation = 45; titleGradient.Enabled = false; titleGradient.Parent = titleBar
 
+    -- Content group: everything below the titlebar (tab strip + all tab
+    -- pages/controls) lives inside this CanvasGroup instead of directly
+    -- inside mainFrame. CanvasGroup.GroupTransparency fades the *entire*
+    -- subtree — every button/toggle/slider/textbox/dropdown/colorpicker,
+    -- regardless of type — with a single tween, instead of needing custom
+    -- fade logic inside every Components.* factory. Used by minimize/
+    -- restore below (see _setupMinimize). The titlebar and resize handle
+    -- stay outside it on purpose so they never fade, and the notification
+    -- layer is parented directly to screenGui (see _buildNotificationLayer)
+    -- so toasts keep showing while minimized.
+    local contentGroup = Instance.new("CanvasGroup")
+    contentGroup.Name = "Content"
+    contentGroup.Size = UDim2.new(1, 0, 1, 0)
+    contentGroup.BackgroundTransparency = 1
+    contentGroup.Parent = mainFrame
+    self._contentGroup = contentGroup
+
     -- Tab strip
     local tabContainer = Instance.new("ScrollingFrame")
     tabContainer.Size = UDim2.new(1, 0, 0, 45)
@@ -2206,7 +2257,7 @@ function Window:_buildChrome(title, originalSize)
     tabContainer.AutomaticCanvasSize = Enum.AutomaticSize.X
     tabContainer.ElasticBehavior = Enum.ElasticBehavior.WhenScrollable
     tabContainer.BackgroundTransparency = 1 -- hidden; blends straight into mainFrame
-    tabContainer.Parent = mainFrame
+    tabContainer.Parent = contentGroup
     local tabContainerGradient = Instance.new("UIGradient"); tabContainerGradient.Rotation = 45; tabContainerGradient.Enabled = false; tabContainerGradient.Parent = tabContainer
     local tabLayout = Instance.new("UIListLayout")
     tabLayout.FillDirection = Enum.FillDirection.Horizontal
@@ -2394,13 +2445,19 @@ function Window:_setupResize(mainFrame, originalSize)
     handle.Parent = mainFrame
     self._resizeHandle = handle
 
-    local dragging, dragStart, startSize
+    -- mainFrame is anchored at its true center now, so growing/shrinking
+    -- Size alone would shift both edges equally in every direction. We
+    -- want resize to feel like dragging the bottom-right corner (top-left
+    -- edge stays put), so every Size change here is paired with a Position
+    -- delta of exactly half the size change, in both axes.
+    local dragging, dragStart, startSize, startPos
     connMgr:Track(handle.InputBegan:Connect(function(input)
         if self._minimized or self._animating then return end
         if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
             dragging = true
             dragStart = input.Position
             startSize = mainFrame.Size
+            startPos = mainFrame.Position
         end
     end))
     connMgr:Track(UserInputService.InputEnded:Connect(function(input)
@@ -2414,7 +2471,12 @@ function Window:_setupResize(mainFrame, originalSize)
             local delta = input.Position - dragStart
             local w = math.clamp(startSize.X.Offset + delta.X, MIN_W, MAX_W)
             local h = math.clamp(startSize.Y.Offset + delta.Y, MIN_H, MAX_H)
+            local dW, dH = w - startSize.X.Offset, h - startSize.Y.Offset
             mainFrame.Size = UDim2.new(0, w, 0, h)
+            mainFrame.Position = UDim2.new(
+                startPos.X.Scale, startPos.X.Offset + dW / 2,
+                startPos.Y.Scale, startPos.Y.Offset + dH / 2
+            )
         end
     end))
     connMgr:Track(handle.MouseEnter:Connect(function()
@@ -2430,27 +2492,84 @@ function Window:_setupMinimize(mainFrame, minimizeBtn)
     self._minimized = false
     self._animating = false
 
+    local MINIMIZED_HEIGHT = 40
+    local SIZE_TWEEN_TIME = 0.45
+    local CONTENT_FADE_OUT_TIME = 0.15
+    local CONTENT_FADE_IN_TIME = 0.25
+
     connMgr:Track(minimizeBtn.MouseButton1Click:Connect(function()
         if self._animating then return end
         self._animating = true
         self._minimized = not self._minimized
+
+        local contentGroup = self._contentGroup
+        local startSize = mainFrame.Size
+        local startPos = mainFrame.Position
+
         if self._minimized then
             minimizeBtn.Text = "▢"
             self._resizeHandle.Visible = false
-            self._tabContainer.Visible = false
-            for _, p in ipairs(self._pages) do p.Visible = false end
-            Animator.Tween(mainFrame, { Size = UDim2.new(mainFrame.Size.X.Scale, mainFrame.Size.X.Offset, 0, 40) }, 0.45):Play()
+
+            -- Blur any active textbox first so a control mid-fade doesn't
+            -- keep the keyboard/cursor focused on something disappearing.
+            local focused = UserInputService:GetFocusedTextBox()
+            if focused then focused:ReleaseFocus() end
+
+            -- Fade the whole content subtree out first; only flip the tab
+            -- strip/pages to Visible = false once they're actually
+            -- invisible, instead of doing it instantly at click time.
+            local fadeOut = Animator.Tween(contentGroup, { GroupTransparency = 1 }, CONTENT_FADE_OUT_TIME)
+            fadeOut.Completed:Connect(function()
+                self._tabContainer.Visible = false
+                for _, p in ipairs(self._pages) do p.Visible = false end
+            end)
+            fadeOut:Play()
+
+            -- Shrink to a titlebar-height strip. mainFrame is center-
+            -- anchored, so compensate Position by half the height delta —
+            -- this keeps the titlebar's own on-screen position fixed
+            -- instead of drifting upward as the frame shrinks around its
+            -- center.
+            local dH = MINIMIZED_HEIGHT - startSize.Y.Offset
+            local targetPos = UDim2.new(
+                startPos.X.Scale, startPos.X.Offset,
+                startPos.Y.Scale, startPos.Y.Offset + dH / 2
+            )
+            Animator.Tween(mainFrame, {
+                Size = UDim2.new(startSize.X.Scale, startSize.X.Offset, 0, MINIMIZED_HEIGHT),
+                Position = targetPos,
+            }, SIZE_TWEEN_TIME):Play()
         else
             minimizeBtn.Text = "—"
-            Animator.Tween(mainFrame, { Size = self._currentTargetSize }, 0.45):Play()
+
+            local targetSize = self._currentTargetSize
+            local dH = targetSize.Y.Offset - startSize.Y.Offset
+            local targetPos = UDim2.new(
+                startPos.X.Scale, startPos.X.Offset,
+                startPos.Y.Scale, startPos.Y.Offset + dH / 2
+            )
+            Animator.Tween(mainFrame, { Size = targetSize, Position = targetPos }, SIZE_TWEEN_TIME):Play()
+
             self._tabContainer.Visible = true
             for i, p in ipairs(self._pages) do
                 p.Visible = (i == self._activeTabIndex)
                 p.Position = UDim2.new(0, 10, 0, 95)
             end
             self._resizeHandle.Visible = true
+
+            -- Content starts invisible and fades back in partway through
+            -- the frame's grow tween, so it doesn't visibly "pop in" while
+            -- the frame is still mid-expand.
+            contentGroup.GroupTransparency = 1
+            task.delay(SIZE_TWEEN_TIME * 0.5, function()
+                if self._minimized then return end -- re-minimized before this fired
+                Animator.Tween(contentGroup, { GroupTransparency = 0 }, CONTENT_FADE_IN_TIME):Play()
+            end)
         end
-        task.delay(0.45, function() self._animating = false end)
+
+        -- Gated on the (longer of the two) size tween's duration so a
+        -- second click can't interrupt mainFrame mid-resize.
+        task.delay(SIZE_TWEEN_TIME, function() self._animating = false end)
     end))
 end
 
@@ -2525,7 +2644,13 @@ function Window:CreateTab(name)
     page.ScrollBarThickness = 0
     page.CanvasSize = UDim2.new(0, 0, 0, 0)
     page.AutomaticCanvasSize = Enum.AutomaticSize.Y
-    page.Parent = mainFrame
+    -- Parented to the CanvasGroup (not mainFrame directly) so this page's
+    -- controls — buttons, toggles, sliders, textboxes, dropdowns, etc. —
+    -- fade as one unit whenever contentGroup.GroupTransparency is tweened
+    -- (see _setupMinimize). Positions below are unchanged: contentGroup is
+    -- the same size as mainFrame, so relative coordinates line up exactly
+    -- as they did when parented straight to mainFrame.
+    page.Parent = self._contentGroup
     page.Visible = (index == 1)
     local layout = Instance.new("UIListLayout")
     layout.SortOrder = Enum.SortOrder.LayoutOrder
