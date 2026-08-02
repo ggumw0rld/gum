@@ -2569,24 +2569,10 @@ function Window:_setupResize(mainFrame, originalSize)
 
     -- mainFrame is anchored at its true center while idle (see _setupDrag /
     -- _setupMinimize, which both assume that). The resize handle sits in
-    -- the bottom-right corner, so conceptually we want the TOP-LEFT corner
-    -- to stay fixed while dragging and only Size to grow/shrink.
-    --
-    -- The old version kept the center anchor for the whole drag and
-    -- manually re-added half of every Size delta to Position every single
-    -- InputChanged frame to fake a fixed top-left corner. Two properties
-    -- being derived and set together, every frame, off a running delta is
-    -- exactly the same class of bug already diagnosed and fixed for
-    -- minimize/restore (see the top-center anchor swap there) — it read as
-    -- jitter/giật during the drag.
-    --
-    -- Fix: temporarily swap mainFrame to a top-left anchor (0,0) for the
-    -- duration of the drag only. With that anchor, the top-left corner is
-    -- naturally fixed, so InputChanged only ever needs to touch Size — no
-    -- second, error-prone Position computation competing with it. Anchor
-    -- is swapped back to true-center the instant the drag ends, so
-    -- dragging (_setupDrag) and minimize/restore keep behaving exactly as
-    -- before.
+    -- the bottom-right corner, so we want the TOP-LEFT corner fixed while
+    -- dragging and only Size to grow/shrink — swap to a top-left anchor for
+    -- the duration of the drag so Position never needs to be touched at all
+    -- (same trick already used for minimize/restore).
     local function anchorTopLeftForResize()
         local size, pos = mainFrame.Size, mainFrame.Position
         mainFrame.AnchorPoint = Vector2.new(0, 0)
@@ -2604,25 +2590,50 @@ function Window:_setupResize(mainFrame, originalSize)
         )
     end
 
-    local dragging, dragStart, startSize
+    -- `contentGroup` (the CanvasGroup holding the tab strip + every page /
+    -- control, used for the minimize fade) resizes every frame along with
+    -- mainFrame during a drag, since its Size is UDim2.new(1,0,1,0) relative
+    -- to mainFrame. A CanvasGroup renders its whole subtree to an offscreen
+    -- buffer, so forcing it to recomposite at a new resolution on every
+    -- single resize frame is expensive — on weaker/mobile GPUs that shows up
+    -- as stutter (a performance jitter, not a positional one, and not fixed
+    -- by the anchor trick above). Fix: hide it for the duration of the
+    -- active drag (skips rendering/compositing entirely — you see the frame
+    -- + titlebar grow/shrink, content pops back the instant you release),
+    -- and show it again the moment the drag ends.
+    local contentGroup = self._contentGroup
+
+    -- InputChanged/InputEnded on UserInputService fire for ANY input source
+    -- system-wide, not just the one that pressed the handle — so filtering
+    -- purely on the `dragging` boolean (as before) means an unrelated touch
+    -- elsewhere on screen while resizing would also feed its Position into
+    -- the delta math and cause a visible jump. Fixed by capturing the exact
+    -- InputObject that began the drag (`activeInput`) and only reacting to
+    -- that same object later, mirroring how _setupDrag already filters
+    -- titlebar dragging.
+    local dragging, activeInput, dragStart, startSize
     connMgr:Track(handle.InputBegan:Connect(function(input)
         if self._minimized or self._animating then return end
         if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
             dragging = true
+            activeInput = input
             dragStart = input.Position
             anchorTopLeftForResize()
             startSize = mainFrame.Size
+            contentGroup.Visible = false
         end
     end))
     connMgr:Track(UserInputService.InputEnded:Connect(function(input)
-        if dragging and (input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch) then
+        if dragging and input == activeInput then
             dragging = false
+            activeInput = nil
             self._currentTargetSize = mainFrame.Size
             anchorCenterAfterResize()
+            contentGroup.Visible = true
         end
     end))
     connMgr:Track(UserInputService.InputChanged:Connect(function(input)
-        if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+        if dragging and input == activeInput then
             local delta = input.Position - dragStart
             local w = math.clamp(startSize.X.Offset + delta.X, MIN_W, MAX_W)
             local h = math.clamp(startSize.Y.Offset + delta.Y, MIN_H, MAX_H)
