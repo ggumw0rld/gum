@@ -1792,19 +1792,6 @@ function Components.GradientPicker(parent, theme, connMgr, opts)
     return self
 end
 
--- ---------- Notification (toast card) ----------
--- Not theme-subscribed like other controls: notifications are transient and
--- keep whatever color they were created with, except for the semantic type
--- stripe/icon color which stays fixed regardless of theme.
---
--- opts.Duration: seconds before auto-dismiss. Omit/nil defaults to 4s.
--- Pass 0 or false to make the notification "sticky" — no progress bar, and
--- it never auto-dismisses; it only closes via the × button or a manual
--- :Dismiss() call.
---
--- Icon + title share a horizontal row whose own UIListLayout vertically
--- centers both against each other, so the title text lines up with the
--- icon regardless of the title's actual rendered height.
 local NOTIF_TYPES = {
     success = { Color3.fromRGB(60, 200, 120), "✓" },
     error   = { Color3.fromRGB(220, 70, 70),  "×" },
@@ -1933,6 +1920,33 @@ function Components.Notification(parent, theme, connMgr, opts)
     bodyLabel.Parent = contentHolder
     Utils.AddPadding(bodyLabel, UDim.new(0, 38))
 
+    -- Optional inline action button (opts.Button = { Text, Callback, KeepOpen }).
+    -- Created here (for layout order) but its click connection is wired up
+    -- below once `self` / Dismiss() exist.
+    local actionBtn
+    if opts.Button then
+        actionBtn = Instance.new("TextButton")
+        actionBtn.Size = UDim2.new(0, 0, 0, 30)
+        actionBtn.AutomaticSize = Enum.AutomaticSize.X
+        actionBtn.LayoutOrder = 3
+        actionBtn.BackgroundColor3 = accentColor
+        actionBtn.Text = opts.Button.Text or "OK"
+        actionBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+        actionBtn.Font = Enum.Font.GothamBold
+        actionBtn.TextSize = 13
+        actionBtn.AutoButtonColor = false
+        actionBtn.Parent = contentHolder
+        Utils.AddCorner(actionBtn, UDim.new(0, 6))
+        Utils.AddPadding(actionBtn, UDim.new(0, 14))
+        Animator.AddThickenStroke(actionBtn, connMgr)
+        connMgr:Track(actionBtn.MouseEnter:Connect(function()
+            TweenService:Create(actionBtn, TweenInfo.new(0.2, EASE, EASE_OUT), { BackgroundColor3 = Utils.Brighten(accentColor, 1.2) }):Play()
+        end))
+        connMgr:Track(actionBtn.MouseLeave:Connect(function()
+            TweenService:Create(actionBtn, TweenInfo.new(0.2, EASE, EASE_OUT), { BackgroundColor3 = accentColor }):Play()
+        end))
+    end
+
     local closeBtn = Instance.new("TextButton")
     closeBtn.AnchorPoint = Vector2.new(1, 0)
     closeBtn.Position = UDim2.new(1, -10, 0, 10)
@@ -1945,30 +1959,31 @@ function Components.Notification(parent, theme, connMgr, opts)
     closeBtn.ZIndex = 2
     closeBtn.Parent = card
 
-    local bottomSpacer = Instance.new("Frame")
-    bottomSpacer.Size = UDim2.new(1, 0, 0, 16)
-    bottomSpacer.LayoutOrder = 3
-    bottomSpacer.BackgroundTransparency = 1
-    bottomSpacer.Parent = contentHolder
-
-    -- Progress bar only exists for non-sticky notifications. Its fill is
+    -- Numeric countdown label replacing the old progress bar. Sits just to
+    -- the left of the × button. Only created for non-sticky notifications;
     -- driven directly (no Tween) by the Heartbeat countdown below, so it's
     -- always exactly in sync with the actual time remaining.
-    local progressTrack, progressFill
+    local timerLabel
     if not isSticky then
-        progressTrack = Instance.new("Frame")
-        progressTrack.Size = UDim2.new(1, 0, 0, 3)
-        progressTrack.AnchorPoint = Vector2.new(0, 1)
-        progressTrack.Position = UDim2.new(0, 0, 1, 0)
-        progressTrack.BackgroundColor3 = Utils.Darken(theme.Color, 0.8)
-        progressTrack.BorderSizePixel = 0
-        progressTrack.Parent = card
-        progressFill = Instance.new("Frame")
-        progressFill.Size = UDim2.new(1, 0, 1, 0)
-        progressFill.BackgroundColor3 = accentColor
-        progressFill.BorderSizePixel = 0
-        progressFill.Parent = progressTrack
+        timerLabel = Instance.new("TextLabel")
+        timerLabel.AnchorPoint = Vector2.new(1, 0)
+        timerLabel.Position = UDim2.new(1, -38, 0, 10)
+        timerLabel.Size = UDim2.new(0, 24, 0, 22)
+        timerLabel.BackgroundTransparency = 1
+        timerLabel.Text = tostring(math.ceil(duration))
+        timerLabel.TextColor3 = Color3.fromRGB(160, 160, 170)
+        timerLabel.TextXAlignment = Enum.TextXAlignment.Right
+        timerLabel.Font = Enum.Font.GothamBold
+        timerLabel.TextSize = 12
+        timerLabel.ZIndex = 2
+        timerLabel.Parent = card
     end
+
+    local bottomSpacer = Instance.new("Frame")
+    bottomSpacer.Size = UDim2.new(1, 0, 0, 16)
+    bottomSpacer.LayoutOrder = 4
+    bottomSpacer.BackgroundTransparency = 1
+    bottomSpacer.Parent = contentHolder
 
     connMgr:Track(closeBtn.MouseEnter:Connect(function()
         TweenService:Create(closeBtn, TweenInfo.new(0.2, EASE, EASE_OUT), { TextColor3 = Color3.fromRGB(255, 255, 255) }):Play()
@@ -2004,10 +2019,10 @@ function Components.Notification(parent, theme, connMgr, opts)
         end
     end
 
-    -- Single Heartbeat connection drives both the visible progress bar and
-    -- the actual auto-dismiss off the same `remainingTime` clock, so the bar
-    -- reaching empty and the dismiss firing can never drift apart or get
-    -- stuck mid-way the way the old Tween-based version could.
+    -- Single Heartbeat connection drives both the visible timer label and
+    -- the actual auto-dismiss off the same `remainingTime` clock, so the
+    -- displayed number reaching 0 and the dismiss firing can never drift
+    -- apart or get stuck mid-way.
     local function startCountdown()
         if isSticky or dismissed then return end
         stopCountdown()
@@ -2016,8 +2031,8 @@ function Components.Notification(parent, theme, connMgr, opts)
         countdownConn = RunService.Heartbeat:Connect(function()
             local elapsed = os.clock() - startClock
             remainingTime = math.max(startRemaining - elapsed, 0)
-            if progressFill then
-                progressFill.Size = UDim2.new(math.max(remainingTime / duration, 0), 0, 1, 0)
+            if timerLabel then
+                timerLabel.Text = tostring(math.ceil(remainingTime))
             end
             if remainingTime <= 0 then
                 stopCountdown()
@@ -2037,12 +2052,13 @@ function Components.Notification(parent, theme, connMgr, opts)
         -- collapse in step 2 from spilling outside the card's rounded corners.
         card.ClipsDescendants = true
 
-        -- Step 1: slide the whole card out to the right, clear past its own
-        -- width, so the exit reads as a deliberate "swipe away". `card`
-        -- lives inside `slot` (not directly inside the list-managed
-        -- container), so this Position tween is free to run without a
-        -- UIListLayout recompute snapping it back mid-flight.
-        local slideDistance = card.AbsoluteSize.X + 60
+        -- Step 1: slide the whole card UP and fade it out, so the exit
+        -- reads as the toast lifting off the stack (matches the vertical
+        -- top-to-bottom layout the toast container uses, instead of the
+        -- old horizontal swipe-right). `card` lives inside `slot` (not
+        -- directly inside the list-managed container), so this Position
+        -- tween is free to run without a UIListLayout recompute snapping
+        -- it back mid-flight.
         Animator.Tween(cardScale, { Scale = 0.94 }, 0.28, EASE, EASE_IN):Play()
         Animator.Tween(stroke, { Transparency = 1 }, 0.22, EASE, EASE_IN):Play()
         Animator.Tween(accentBar, { BackgroundTransparency = 1 }, 0.22, EASE, EASE_IN):Play()
@@ -2051,11 +2067,15 @@ function Components.Notification(parent, theme, connMgr, opts)
         Animator.Tween(icon, { TextTransparency = 1 }, 0.18, EASE, EASE_IN):Play()
         Animator.Tween(iconHolder, { BackgroundTransparency = 1 }, 0.18, EASE, EASE_IN):Play()
         Animator.Tween(closeBtn, { TextTransparency = 1 }, 0.18, EASE, EASE_IN):Play()
+        if timerLabel then Animator.Tween(timerLabel, { TextTransparency = 1 }, 0.18, EASE, EASE_IN):Play() end
+        if actionBtn then
+            Animator.Tween(actionBtn, { BackgroundTransparency = 1 }, 0.18, EASE, EASE_IN):Play()
+        end
 
-        -- Gated on each tween's own Completed event so the slide-out ->
+        -- Gated on each tween's own Completed event so the slide-up ->
         -- collapse -> destroy sequence always lines up with the actual
         -- on-screen animation instead of guessing via task.delay.
-        local slideOut = Animator.Tween(card, { Position = UDim2.new(0, slideDistance, 0, 0), BackgroundTransparency = 1 }, 0.3, EASE, EASE_IN)
+        local slideOut = Animator.Tween(card, { Position = UDim2.new(0, 0, 0, -40), BackgroundTransparency = 1 }, 0.3, EASE, EASE_IN)
         slideOut:Play()
 
         slideOut.Completed:Connect(function()
@@ -2075,6 +2095,12 @@ function Components.Notification(parent, theme, connMgr, opts)
     end
 
     connMgr:Track(closeBtn.MouseButton1Click:Connect(function() self:Dismiss() end))
+    if actionBtn then
+        connMgr:Track(actionBtn.MouseButton1Click:Connect(function()
+            if opts.Button.Callback then opts.Button.Callback() end
+            if opts.Button.KeepOpen ~= true then self:Dismiss() end
+        end))
+    end
 
     -- Hovering a notification pauses its countdown (classic toast-UX
     -- courtesy so it doesn't vanish while you're reading it) and gives a
@@ -2098,12 +2124,12 @@ function Components.Notification(parent, theme, connMgr, opts)
         end
     end))
 
-    -- Entrance: slide in from the side + fade + a small springy scale
-    -- overshoot (Back easing), with the icon popping in a beat later. We
-    -- wait two Heartbeat frames first so `card`'s AutomaticSize has fully
-    -- converged — this is what fixes both the jerky entrance and the text
-    -- appearing to "land" in the wrong spot.
-    card.Position = UDim2.new(0, 36, 0, 0)
+    -- Entrance: slide DOWN from just above its final spot + fade + a small
+    -- springy scale overshoot (Back easing), with the icon popping in a
+    -- beat later. We wait two Heartbeat frames first so `card`'s
+    -- AutomaticSize has fully converged — this is what fixes both the
+    -- jerky entrance and the text appearing to "land" in the wrong spot.
+    card.Position = UDim2.new(0, 0, 0, -30)
     card.BackgroundTransparency = 1
     stroke.Transparency = 1
     task.defer(function()
@@ -2123,6 +2149,7 @@ function Components.Notification(parent, theme, connMgr, opts)
     function self:ApplyTheme() end -- notifications keep their creation-time look; they're short-lived
     return self
 end
+
 
 --============================================================
 -- MODULE: Tab (forward-declared; methods attached after Window below)
