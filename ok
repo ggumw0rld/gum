@@ -768,11 +768,14 @@ function Components.ExpandableHeader(parent, theme, connMgr, opts)
         animating = true
         open = v
         TweenService:Create(arrow, TweenInfo.new(0.3, EASE, EASE_OUT), { Rotation = open and 180 or 0 }):Play()
-        local tw = TweenService:Create(container, TweenInfo.new(0.33, EASE, EASE_OUT), {
+        TweenService:Create(container, TweenInfo.new(0.33, EASE, EASE_OUT), {
             Size = UDim2.new(1, 0, 0, open and openHeight or closedHeight)
-        })
-        tw.Completed:Connect(function() animating = false end)
-        tw:Play()
+        }):Play()
+        -- Was gated on Tween.Completed, which some executors never fire —
+        -- that permanently stuck `animating = true`, silently disabling this
+        -- header (and every ExpandableHeader-based control: Dropdown,
+        -- MultiDropdown, ColorPicker) after its very first open/close.
+        task.delay(0.33, function() animating = false end)
         if opts.OnToggle then opts.OnToggle(open) end
     end
     connMgr:Track(header.MouseButton1Click:Connect(function() setOpen(not open) end))
@@ -1674,7 +1677,7 @@ end
 -- FIXES vs the previous version:
 --  1) Entrance animation + the auto-dismiss countdown now both wait two
 --     Heartbeat frames before starting. `card` nests two levels of
---     AutomaticSize (labels -> textHolder -> card), so its true height
+--     AutomaticSize (labels -> contentHolder -> card), so its true height
 --     isn't known on the very first frame; starting the slide/scale/fade
 --     tween before that settles is what made the card visibly pop in at
 --     the wrong size and made the text look like it "landed" too low.
@@ -1745,13 +1748,42 @@ function Components.Notification(parent, theme, connMgr, opts)
     accentBar.Parent = card
     Utils.AddCorner(accentBar, UDim.new(0, 2))
 
+    -- Icon + title now share a horizontal row whose own UIListLayout
+    -- vertically centers both against each other. Previously the icon
+    -- (vertically centered inside its 26px circle) and the title (top-
+    -- aligned text starting at the same Y offset) didn't share a real
+    -- visual center, so the title text visibly sat lower than the icon.
+    -- Centering them as a row guarantees alignment regardless of the
+    -- title's actual rendered height.
+    local contentHolder = Instance.new("Frame")
+    contentHolder.Position = UDim2.new(0, 14, 0, 14)
+    contentHolder.Size = UDim2.new(1, -52, 0, 0)
+    contentHolder.AutomaticSize = Enum.AutomaticSize.Y
+    contentHolder.BackgroundTransparency = 1
+    contentHolder.Parent = card
+    local contentLayout = Instance.new("UIListLayout")
+    contentLayout.Padding = UDim.new(0, 6)
+    contentLayout.Parent = contentHolder
+
+    local headerRow = Instance.new("Frame")
+    headerRow.Size = UDim2.new(1, 0, 0, 0)
+    headerRow.AutomaticSize = Enum.AutomaticSize.Y
+    headerRow.LayoutOrder = 1
+    headerRow.BackgroundTransparency = 1
+    headerRow.Parent = contentHolder
+    local headerLayout = Instance.new("UIListLayout")
+    headerLayout.FillDirection = Enum.FillDirection.Horizontal
+    headerLayout.VerticalAlignment = Enum.VerticalAlignment.Center
+    headerLayout.Padding = UDim.new(0, 12)
+    headerLayout.Parent = headerRow
+
     local iconHolder = Instance.new("Frame")
     iconHolder.Size = UDim2.new(0, 26, 0, 26)
-    iconHolder.Position = UDim2.new(0, 14, 0, 14)
+    iconHolder.LayoutOrder = 1
     iconHolder.BackgroundColor3 = accentColor
     iconHolder.BackgroundTransparency = 0.8
     iconHolder.BorderSizePixel = 0
-    iconHolder.Parent = card
+    iconHolder.Parent = headerRow
     Utils.AddCorner(iconHolder, UDim.new(1, 0))
 
     local icon = Instance.new("TextLabel")
@@ -1763,23 +1795,10 @@ function Components.Notification(parent, theme, connMgr, opts)
     icon.TextSize = 14
     icon.Parent = iconHolder
 
-    -- Text block now starts at the same Y offset as the icon (14, was 12)
-    -- so the title's first line lines up with the icon instead of sitting
-    -- a couple pixels off from it.
-    local textHolder = Instance.new("Frame")
-    textHolder.Position = UDim2.new(0, 52, 0, 14)
-    textHolder.Size = UDim2.new(1, -90, 0, 0)
-    textHolder.AutomaticSize = Enum.AutomaticSize.Y
-    textHolder.BackgroundTransparency = 1
-    textHolder.Parent = card
-    local textLayout = Instance.new("UIListLayout")
-    textLayout.Padding = UDim.new(0, 2)
-    textLayout.Parent = textHolder
-
     local titleLabel = Instance.new("TextLabel")
-    titleLabel.Size = UDim2.new(1, 0, 0, 0)
+    titleLabel.Size = UDim2.new(1, -38, 0, 0)
     titleLabel.AutomaticSize = Enum.AutomaticSize.Y
-    titleLabel.LayoutOrder = 1
+    titleLabel.LayoutOrder = 2
     titleLabel.BackgroundTransparency = 1
     titleLabel.Text = opts.Title or "Thông báo"
     titleLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
@@ -1788,8 +1807,10 @@ function Components.Notification(parent, theme, connMgr, opts)
     titleLabel.TextWrapped = true
     titleLabel.Font = Enum.Font.GothamBold
     titleLabel.TextSize = 15
-    titleLabel.Parent = textHolder
+    titleLabel.Parent = headerRow
 
+    -- Body text is padded left by icon-width + row padding (26 + 12 = 38)
+    -- so it lines up under the title instead of under the icon.
     local bodyLabel = Instance.new("TextLabel")
     bodyLabel.Size = UDim2.new(1, 0, 0, 0)
     bodyLabel.AutomaticSize = Enum.AutomaticSize.Y
@@ -1802,7 +1823,8 @@ function Components.Notification(parent, theme, connMgr, opts)
     bodyLabel.TextWrapped = true
     bodyLabel.Font = Enum.Font.Gotham
     bodyLabel.TextSize = 13
-    bodyLabel.Parent = textHolder
+    bodyLabel.Parent = contentHolder
+    Utils.AddPadding(bodyLabel, UDim.new(0, 38))
 
     local closeBtn = Instance.new("TextButton")
     closeBtn.AnchorPoint = Vector2.new(1, 0)
@@ -1813,13 +1835,14 @@ function Components.Notification(parent, theme, connMgr, opts)
     closeBtn.TextColor3 = Color3.fromRGB(180, 180, 190)
     closeBtn.Font = Enum.Font.GothamBold
     closeBtn.TextSize = 13
+    closeBtn.ZIndex = 2
     closeBtn.Parent = card
 
     local bottomSpacer = Instance.new("Frame")
     bottomSpacer.Size = UDim2.new(1, 0, 0, 16)
     bottomSpacer.LayoutOrder = 3
     bottomSpacer.BackgroundTransparency = 1
-    bottomSpacer.Parent = textHolder
+    bottomSpacer.Parent = contentHolder
 
     -- Progress bar only exists for non-sticky notifications. Its fill is
     -- driven directly (no Tween) by the Heartbeat countdown below, so it's
@@ -1921,22 +1944,28 @@ function Components.Notification(parent, theme, connMgr, opts)
         Animator.Tween(icon, { TextTransparency = 1 }, 0.18, EASE, EASE_IN):Play()
         Animator.Tween(iconHolder, { BackgroundTransparency = 1 }, 0.18, EASE, EASE_IN):Play()
         Animator.Tween(closeBtn, { TextTransparency = 1 }, 0.18, EASE, EASE_IN):Play()
-        local slideOut = Animator.Tween(card, { Position = UDim2.new(0, slideDistance, 0, 0), BackgroundTransparency = 1 }, 0.3, EASE, EASE_IN)
-        slideOut:Play()
+        local SLIDE_OUT_DURATION = 0.3
+        Animator.Tween(card, { Position = UDim2.new(0, slideDistance, 0, 0), BackgroundTransparency = 1 }, SLIDE_OUT_DURATION, EASE, EASE_IN):Play()
 
-        slideOut.Completed:Connect(function()
+        -- NOTE: teardown used to be chained off slideOut.Completed / then
+        -- collapse.Completed. On executors that don't reliably fire
+        -- Tween.Completed, that left dismissed notifications stuck on
+        -- screen forever (visually mid-fade, never actually destroyed).
+        -- task.delay matching each tween's own duration doesn't depend on
+        -- that event at all.
+        task.delay(SLIDE_OUT_DURATION, function()
             -- Step 2: collapse height smoothly so notifications below slide
             -- up into place instead of jumping the instant this one is gone.
             -- Shrinking `card`'s height shrinks `slot`'s AutomaticSize right
             -- along with it, which is what actually drives the list reflow.
             card.AutomaticSize = Enum.AutomaticSize.None
             card.Size = UDim2.new(1, 0, 0, card.AbsoluteSize.Y)
-            local collapse = Animator.Tween(card, { Size = UDim2.new(1, 0, 0, 0) }, 0.22, EASE, EASE_IN)
-            collapse.Completed:Connect(function()
+            local COLLAPSE_DURATION = 0.22
+            Animator.Tween(card, { Size = UDim2.new(1, 0, 0, 0) }, COLLAPSE_DURATION, EASE, EASE_IN):Play()
+            task.delay(COLLAPSE_DURATION, function()
                 if opts.OnDismiss then opts.OnDismiss() end
                 slot:Destroy()
             end)
-            collapse:Play()
         end)
     end
 
@@ -2300,17 +2329,24 @@ function Window:_buildLoadingScreen(title, mainFrame, mainScale, mainShadow)
     Animator.Tween(loading, { BackgroundTransparency = 0 }, 0.35):Play()
     Animator.Tween(barFill, { Size = UDim2.new(1, 0, 1, 0) }, 1.35):Play()
 
+    -- NOTE: revealing mainFrame used to be gated on fadeOut.Completed firing.
+    -- Some executors/environments don't reliably fire Tween.Completed, which
+    -- silently left mainFrame.Visible stuck at false forever (loading screen
+    -- fades out, then... nothing — the whole window never appears, even
+    -- though the rest of the script runs fine). Driven off task.delay
+    -- instead, matching the tween's own duration, so it fires regardless of
+    -- whether Completed does.
+    local FADE_OUT_DURATION = 0.3
     task.delay(1.6, function()
-        Animator.Tween(loadingScale, { Scale = 0.85 }, 0.3, EASE, EASE_IN):Play()
-        local fadeOut = Animator.Tween(loading, { BackgroundTransparency = 1 }, 0.3, EASE, EASE_IN)
-        fadeOut.Completed:Connect(function()
+        Animator.Tween(loadingScale, { Scale = 0.85 }, FADE_OUT_DURATION, EASE, EASE_IN):Play()
+        Animator.Tween(loading, { BackgroundTransparency = 1 }, FADE_OUT_DURATION, EASE, EASE_IN):Play()
+        task.delay(FADE_OUT_DURATION, function()
             loading:Destroy()
             mainFrame.Visible = true
             Animator.Tween(mainScale, { Scale = 1 }, 0.35):Play()
             Animator.Tween(mainFrame, { BackgroundTransparency = 0 }, 0.45):Play()
             Animator.Tween(mainShadow, { Transparency = 0.45 }, 0.5):Play()
         end)
-        fadeOut:Play()
     end)
 end
 
@@ -2522,9 +2558,11 @@ function Window:CreateTab(name)
         newPage.Position = UDim2.new(0, 10 + direction * self._slideOffset, 0, 95)
         newPage.Visible = true
 
-        local slide = Animator.Tween(newPage, { Position = PAGE_BASE_POS }, 0.35)
-        slide.Completed:Connect(function() switching = false end)
-        slide:Play()
+        -- Was gated on Tween.Completed, which some executors never fire —
+        -- that permanently stuck `switching = true`, silently disabling all
+        -- further tab switches after the very first one.
+        Animator.Tween(newPage, { Position = PAGE_BASE_POS }, 0.35):Play()
+        task.delay(0.35, function() switching = false end)
     end
     connMgr:Track(btn.MouseButton1Click:Connect(switchTo))
 
