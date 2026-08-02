@@ -2567,25 +2567,58 @@ function Window:_setupResize(mainFrame, originalSize)
     handle.Parent = mainFrame
     self._resizeHandle = handle
 
-    -- mainFrame is anchored at its true center while idle, so growing/
-    -- shrinking Size alone would shift both edges equally in every
-    -- direction. We want resize to feel like dragging the bottom-right
-    -- corner (top-left edge stays put), so every Size change here is paired
-    -- with a Position delta of exactly half the size change, in both axes.
-    local dragging, dragStart, startSize, startPos
+    -- mainFrame is anchored at its true center while idle (see _setupDrag /
+    -- _setupMinimize, which both assume that). The resize handle sits in
+    -- the bottom-right corner, so conceptually we want the TOP-LEFT corner
+    -- to stay fixed while dragging and only Size to grow/shrink.
+    --
+    -- The old version kept the center anchor for the whole drag and
+    -- manually re-added half of every Size delta to Position every single
+    -- InputChanged frame to fake a fixed top-left corner. Two properties
+    -- being derived and set together, every frame, off a running delta is
+    -- exactly the same class of bug already diagnosed and fixed for
+    -- minimize/restore (see the top-center anchor swap there) — it read as
+    -- jitter/giật during the drag.
+    --
+    -- Fix: temporarily swap mainFrame to a top-left anchor (0,0) for the
+    -- duration of the drag only. With that anchor, the top-left corner is
+    -- naturally fixed, so InputChanged only ever needs to touch Size — no
+    -- second, error-prone Position computation competing with it. Anchor
+    -- is swapped back to true-center the instant the drag ends, so
+    -- dragging (_setupDrag) and minimize/restore keep behaving exactly as
+    -- before.
+    local function anchorTopLeftForResize()
+        local size, pos = mainFrame.Size, mainFrame.Position
+        mainFrame.AnchorPoint = Vector2.new(0, 0)
+        mainFrame.Position = UDim2.new(
+            pos.X.Scale, pos.X.Offset - size.X.Offset / 2,
+            pos.Y.Scale, pos.Y.Offset - size.Y.Offset / 2
+        )
+    end
+    local function anchorCenterAfterResize()
+        local size, pos = mainFrame.Size, mainFrame.Position
+        mainFrame.AnchorPoint = Vector2.new(0.5, 0.5)
+        mainFrame.Position = UDim2.new(
+            pos.X.Scale, pos.X.Offset + size.X.Offset / 2,
+            pos.Y.Scale, pos.Y.Offset + size.Y.Offset / 2
+        )
+    end
+
+    local dragging, dragStart, startSize
     connMgr:Track(handle.InputBegan:Connect(function(input)
         if self._minimized or self._animating then return end
         if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
             dragging = true
             dragStart = input.Position
+            anchorTopLeftForResize()
             startSize = mainFrame.Size
-            startPos = mainFrame.Position
         end
     end))
     connMgr:Track(UserInputService.InputEnded:Connect(function(input)
         if dragging and (input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch) then
             dragging = false
             self._currentTargetSize = mainFrame.Size
+            anchorCenterAfterResize()
         end
     end))
     connMgr:Track(UserInputService.InputChanged:Connect(function(input)
@@ -2593,12 +2626,9 @@ function Window:_setupResize(mainFrame, originalSize)
             local delta = input.Position - dragStart
             local w = math.clamp(startSize.X.Offset + delta.X, MIN_W, MAX_W)
             local h = math.clamp(startSize.Y.Offset + delta.Y, MIN_H, MAX_H)
-            local dW, dH = w - startSize.X.Offset, h - startSize.Y.Offset
+            -- Position untouched: with the top-left anchor set above, the
+            -- top-left corner is already fixed, so Size alone is enough.
             mainFrame.Size = UDim2.new(0, w, 0, h)
-            mainFrame.Position = UDim2.new(
-                startPos.X.Scale, startPos.X.Offset + dW / 2,
-                startPos.Y.Scale, startPos.Y.Offset + dH / 2
-            )
         end
     end))
     connMgr:Track(handle.MouseEnter:Connect(function()
