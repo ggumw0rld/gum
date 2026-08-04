@@ -981,20 +981,38 @@ function Components.ExpandableHeader(parent, theme, connMgr, opts)
         Arrow = arrow,
         Body = body,
         SetOpen = setOpen,
+        -- Exposes closedHeight/openHeight and a way to change bodyHeight at
+        -- runtime (see Components.Dropdown:Refresh below), so a caller can
+        -- rebuild the body content and have the expand/collapse size still
+        -- match the new content instead of clipping it or leaving dead space.
+        GetClosedHeight = function() return closedHeight end,
+        SetBodyHeight = function(newBodyHeight)
+            bodyHeight = newBodyHeight
+            openHeight = closedHeight + bodyHeight + 6
+            if open then
+                container.Size = UDim2.new(1, 0, 0, openHeight)
+            end
+        end,
     }
 end
 
 -- ---------- Dropdown (single select) ----------
 function Components.Dropdown(parent, theme, connMgr, opts)
-    local options = opts.Options or {}
     local optionHeight = 32
-    local bodyHeight = #options * optionHeight + math.max(#options - 1, 0) * 6
-    local selected = opts.Default or options[1]
+    local optionButtons = {}
+    local options, selected
+
+    local function bodyHeightFor(count)
+        return count * optionHeight + math.max(count - 1, 0) * 6
+    end
+
+    options = opts.Options or {}
+    selected = opts.Default or options[1]
 
     local exp = Components.ExpandableHeader(parent, theme, connMgr, {
         Text = opts.Text or "Chọn mục:",
         LayoutOrder = opts.LayoutOrder,
-        BodyHeight = bodyHeight,
+        BodyHeight = bodyHeightFor(#options),
     })
 
     local valueLabel = Instance.new("TextLabel")
@@ -1019,14 +1037,13 @@ function Components.Dropdown(parent, theme, connMgr, opts)
     layout.Padding = UDim.new(0, 6)
     layout.Parent = list
 
-    local optionButtons = {}
     local function baseColorFor(text)
         return (text == selected) and theme.Accent or Utils.Darken(theme.Color, 0.8)
     end
 
     local function select(text)
         selected = text
-        valueLabel.Text = text
+        valueLabel.Text = text or ""
         for _, row in ipairs(optionButtons) do
             local isSel = (row.text == text)
             TweenService:Create(row.btn, TweenInfo.new(0.25, EASE, EASE_OUT), {
@@ -1036,41 +1053,69 @@ function Components.Dropdown(parent, theme, connMgr, opts)
         if opts.Callback then opts.Callback(text) end
     end
 
-    for i, text in ipairs(options) do
-        local btn = Instance.new("TextButton")
-        btn.Size = UDim2.new(1, 0, 0, optionHeight)
-        btn.LayoutOrder = i
-        btn.BackgroundColor3 = baseColorFor(text)
-        btn.Text = text
-        btn.TextXAlignment = Enum.TextXAlignment.Left
-        btn.TextColor3 = Color3.fromRGB(255, 255, 255)
-        btn.Font = Enum.Font.Gotham
-        btn.TextSize = 14
-        btn.Parent = list
-        Utils.AddCorner(btn, UDim.new(0, 6))
-        Utils.AddPadding(btn, UDim.new(0, 10))
-        Animator.AddThickenStroke(btn, connMgr)
+    -- Rebuilds the option rows in `list` from the `options` array. Used both
+    -- at creation and by :Refresh() below, so a Dropdown's Options can be
+    -- repopulated at runtime (e.g. a "saved configs" list that changes as
+    -- the user saves new ones) instead of being frozen at creation time.
+    local function rebuildOptions()
+        for _, row in ipairs(optionButtons) do row.btn:Destroy() end
+        table.clear(optionButtons)
 
-        connMgr:Track(btn.MouseEnter:Connect(function()
-            TweenService:Create(btn, TweenInfo.new(0.18, EASE, EASE_OUT), { BackgroundColor3 = Utils.Brighten(baseColorFor(text), 1.2) }):Play()
-        end))
-        connMgr:Track(btn.MouseLeave:Connect(function()
-            TweenService:Create(btn, TweenInfo.new(0.18, EASE, EASE_OUT), { BackgroundColor3 = baseColorFor(text) }):Play()
-        end))
-        connMgr:Track(btn.MouseButton1Click:Connect(function() select(text) end))
+        for i, text in ipairs(options) do
+            local btn = Instance.new("TextButton")
+            btn.Size = UDim2.new(1, 0, 0, optionHeight)
+            btn.LayoutOrder = i
+            btn.BackgroundColor3 = baseColorFor(text)
+            btn.Text = text
+            btn.TextXAlignment = Enum.TextXAlignment.Left
+            btn.TextColor3 = Color3.fromRGB(255, 255, 255)
+            btn.Font = Enum.Font.Gotham
+            btn.TextSize = 14
+            btn.Parent = list
+            Utils.AddCorner(btn, UDim.new(0, 6))
+            Utils.AddPadding(btn, UDim.new(0, 10))
+            Animator.AddThickenStroke(btn, connMgr)
 
-        table.insert(optionButtons, { btn = btn, text = text })
+            connMgr:Track(btn.MouseEnter:Connect(function()
+                TweenService:Create(btn, TweenInfo.new(0.18, EASE, EASE_OUT), { BackgroundColor3 = Utils.Brighten(baseColorFor(text), 1.2) }):Play()
+            end))
+            connMgr:Track(btn.MouseLeave:Connect(function()
+                TweenService:Create(btn, TweenInfo.new(0.18, EASE, EASE_OUT), { BackgroundColor3 = baseColorFor(text) }):Play()
+            end))
+            connMgr:Track(btn.MouseButton1Click:Connect(function() select(text) end))
+
+            table.insert(optionButtons, { btn = btn, text = text })
+        end
     end
+    rebuildOptions()
 
     local self = { Instance = exp.Container }
     function self:Get() return selected end
     -- Programmatically select an option (used by Window:LoadConfig).
-    -- Silently ignores values that aren't in opts.Options.
+    -- Silently ignores values that aren't in the current Options list.
     function self:Set(v)
         local found = false
         for _, t in ipairs(options) do if t == v then found = true break end end
         if not found then return end
         select(v)
+    end
+    -- Replaces the Options list at runtime and rebuilds the option rows +
+    -- the expand/collapse body height to match. If keepSelection is false
+    -- (default), selection falls back to the first new option (or nil if
+    -- newOptions is empty); if true, the current selection is kept when it
+    -- still exists in newOptions, otherwise it also falls back.
+    function self:Refresh(newOptions, keepSelection)
+        options = newOptions or {}
+        if keepSelection then
+            local stillValid = false
+            for _, t in ipairs(options) do if t == selected then stillValid = true break end end
+            if not stillValid then selected = options[1] end
+        else
+            selected = options[1]
+        end
+        exp.SetBodyHeight(bodyHeightFor(#options))
+        rebuildOptions()
+        valueLabel.Text = selected or ""
     end
     function self:ApplyTheme(color, accent, isInitial)
         local panelBg = Utils.Brighten(color, 1.2)
@@ -3195,26 +3240,33 @@ function Window:GetTheme() return self._theme end
 function Window:GetGradients() return self._gradients end
 
 --============================================================
--- MODULE: Config (Flags + Save/Load)
+-- MODULE: Config (Flags + Save/Load/List)
 -- Any control created via Tab:CreateXxx({..., Flag = "uniqueName"}) is
 -- registered here (see TabMeta:CreateXxx below). SaveConfig(name) reads
 -- every registered control's current value via :Get() and writes it to
 -- a JSON file; LoadConfig(name) reads that file back and calls :Set() on
--- each matching control. Both are wrapped in pcall and check for the
--- executor globals (writefile/readfile/isfile/makefolder/isfolder) since
--- not every executor exposes them — callers should check the returned
--- boolean rather than assume success.
+-- each matching control; ListConfigs() enumerates the saved config names
+-- so a consumer script can build a "load one of my saved configs" picker
+-- (e.g. TabMeta:CreateConfigList below). All three are wrapped in pcall
+-- and check for the executor globals (writefile/readfile/isfile/
+-- listfiles/makefolder/isfolder) since not every executor exposes them —
+-- callers should check the returned boolean/table rather than assume
+-- success.
 --============================================================
 function Window:_registerFlag(flag, obj)
     if not flag then return end
     self._flags[flag] = obj
 end
 
+local CONFIG_FOLDER = "Selenix/Config"
 local function configFolder()
     if not (isfolder and makefolder) then return nil end
-    local folder = "Selenix/Config"
-    if not isfolder(folder) then makefolder(folder) end
-    return folder
+    if not isfolder(CONFIG_FOLDER) then makefolder(CONFIG_FOLDER) end
+    return CONFIG_FOLDER
+end
+
+local function configPath(name)
+    return CONFIG_FOLDER .. "/" .. (name or "default") .. ".json"
 end
 
 -- Serializes every registered flag's current value to
@@ -3223,9 +3275,10 @@ end
 -- again in LoadConfig.
 function Window:SaveConfig(name)
     if not writefile then return false, "executor has no writefile" end
+    if not (name and name ~= "") then return false, "config name is empty" end
 
-    local folder = configFolder()
-    local path = (folder and (folder .. "/") or "") .. (name or "default") .. ".json"
+    configFolder()
+    local path = configPath(name)
 
     local data = {}
     for flag, obj in pairs(self._flags) do
@@ -3255,8 +3308,7 @@ end
 function Window:LoadConfig(name)
     if not (readfile and isfile) then return false, "executor has no readfile/isfile" end
 
-    local folder = configFolder()
-    local path = (folder and (folder .. "/") or "") .. (name or "default") .. ".json"
+    local path = configPath(name)
     if not isfile(path) then return false, "config file not found" end
 
     local okRead, raw = pcall(readfile, path)
@@ -3274,6 +3326,30 @@ function Window:LoadConfig(name)
         end
     end
     return true
+end
+
+-- Lists every saved config name (without the .json extension) found in
+-- Selenix/Config, sorted alphabetically. This was the missing piece for
+-- a "config list" UI: SaveConfig/LoadConfig work by name, but nothing
+-- could previously discover which names actually exist on disk. Always
+-- returns a table (never nil), even when the executor lacks listfiles or
+-- the folder doesn't exist yet, so callers can iterate the result
+-- directly without their own pcall.
+function Window:ListConfigs()
+    if not listfiles then return {} end
+    local folder = configFolder()
+    if not folder then return {} end
+
+    local okList, files = pcall(listfiles, folder)
+    if not okList then return {} end
+
+    local names = {}
+    for _, path in ipairs(files) do
+        local fname = path:match("([^/\\]+)%.json$")
+        if fname then table.insert(names, fname) end
+    end
+    table.sort(names)
+    return names
 end
 
 --============================================================
@@ -3419,6 +3495,87 @@ function TabMeta:CreateGradientPicker(opts)
     opts.LayoutOrder = nextOrder(self)
     nextOrder(self) -- GradientPicker also creates the grid one order below
     return Components.GradientPicker(self._page, self._theme, self._connMgr, opts)
+end
+
+-- ---------- CreateConfigList ----------
+-- Ready-made "Config List" section: a Dropdown listing every config
+-- already saved on disk (Window:ListConfigs()), a Textbox to name a new
+-- (or existing) config, and Save/Load buttons. This is the piece that was
+-- actually missing before — SaveConfig/LoadConfig only worked if the
+-- consumer script already knew a config's name, and the Dropdown
+-- component had no way to repopulate its options after a new file was
+-- saved (fixed above via Components.Dropdown:Refresh).
+--
+-- opts (all optional):
+--   Text          -- dropdown label, default "Config đã lưu:"
+--   NameText      -- textbox label, default "Tên config:"
+--   SaveText      -- save button text, default "Lưu Config"
+--   LoadText      -- load button text, default "Tải Config"
+--   AutoLoadLast  -- if true, immediately loads the most recent (last in
+--                    the sorted list) saved config, if any, right after
+--                    building this section
+function TabMeta:CreateConfigList(opts)
+    opts = opts or {}
+    local window = self._window
+
+    local nameBox = self:CreateTextbox({
+        Text = opts.NameText or "Tên config:",
+        Placeholder = "vd: main",
+    })
+
+    local dropdown = self:CreateDropdown({
+        Text = opts.Text or "Config đã lưu:",
+        Options = window:ListConfigs(),
+        Callback = function(selectedName)
+            if selectedName then nameBox:Set(selectedName) end
+        end,
+    })
+
+    local function refreshList(keepSelection)
+        dropdown:Refresh(window:ListConfigs(), keepSelection)
+    end
+
+    self:CreateButton({
+        Text = opts.SaveText or "Lưu Config",
+        Callback = function()
+            local name = nameBox:Get()
+            local ok, err = window:SaveConfig(name)
+            refreshList(true)
+            if window.Notify then
+                window:Notify({
+                    Title = ok and "Đã lưu" or "Lỗi",
+                    Text = ok and ("Đã lưu config \"" .. name .. "\"") or (err or "Không thể lưu config"),
+                    Type = ok and "success" or "error",
+                })
+            end
+        end,
+    })
+
+    self:CreateButton({
+        Text = opts.LoadText or "Tải Config",
+        Callback = function()
+            local name = nameBox:Get()
+            local ok, err = window:LoadConfig(name)
+            if window.Notify then
+                window:Notify({
+                    Title = ok and "Đã tải" or "Lỗi",
+                    Text = ok and ("Đã tải config \"" .. name .. "\"") or (err or "Không thể tải config"),
+                    Type = ok and "success" or "error",
+                })
+            end
+        end,
+    })
+
+    if opts.AutoLoadLast then
+        local existing = window:ListConfigs()
+        local last = existing[#existing]
+        if last then
+            nameBox:Set(last)
+            window:LoadConfig(last)
+        end
+    end
+
+    return { Dropdown = dropdown, NameBox = nameBox, Refresh = refreshList }
 end
 
 --============================================================
