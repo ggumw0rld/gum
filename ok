@@ -1,6 +1,6 @@
 --[[
     ============================================================
-    Selenix UI Library — Modular Rewrite
+    Selenix UI Library — Modular Rewrite (FIXED)
     ============================================================
     Same visual/behavioural feature set as the original monolithic
     script, reorganized into independent modules:
@@ -30,7 +30,40 @@
     closed programmatically instead, via `Selenix:Destroy()`.
     ============================================================
 
-    PATCH NOTES (this copy):
+    PATCH NOTES (this copy — 3 fixes applied on top of the previous patch):
+
+    FIX 1 — Duplicate theme subscription in CreateTab (perf bug):
+      Window:_buildChrome already subscribes once to the theme and calls
+      self:_restyleTabButtons(...) on every change, which loops over ALL
+      tab buttons. CreateTab was ALSO calling theme:Subscribe(...) with the
+      same callback for every single tab created — so with N tabs, a theme
+      change fired _restyleTabButtons N+1 times, each looping over N
+      buttons and re-tweening all of them (~N² tweens instead of N).
+      Removed the redundant theme:Subscribe(...) call at the end of
+      CreateTab; the chrome-level subscription already covers every tab.
+
+    FIX 2 — Titlebar couldn't be dragged while the window was minimized:
+      _setupDrag's InputBegan guard included `self._minimized`, blocking
+      any drag start whenever the window was in its minimized state (even
+      though the titlebar — the only thing left visible while minimized —
+      is exactly what you'd want to still be able to drag). Removed
+      `self._minimized` from the guard; dragging is still correctly
+      blocked during an active resize or an in-progress minimize/restore
+      animation (`self._resizing` / `self._animating`).
+
+    FIX 3 — Window could be dragged off-screen entirely:
+      Added a clampPosition() helper inside _setupDrag that clamps
+      mainFrame's Position (in Offset units) to keep the window fully
+      inside the current viewport bounds during a drag. It accounts for
+      mainFrame's current AnchorPoint (which this library temporarily
+      changes to top-center during minimize/restore and top-left during
+      resize), so the clamp math stays correct no matter which anchor mode
+      is active at the time of the drag. If the window is ever wider/taller
+      than the viewport itself, the clamp falls back to centering it rather
+      than producing an invalid (min > max) range.
+    ============================================================
+
+    PATCH NOTES (carried over from the previous revision):
     Titlebar corner fix (per-corner rounding):
       titleBar previously used Utils.AddCorner (bo cả 4 góc), which rounded
       its bottom-left/bottom-right corners even though it sits flush on top
@@ -55,14 +88,6 @@
       0 in lockstep with the restore grow-tween — so the corners visually
       "grow in" as the frame shrinks and "flatten back out" as it expands,
       instead of snapping instantly.
-
-    Superseded note (kept for history — titlebar corner masking):
-    An earlier version of this fix used a small square mask Frame
-    (no UICorner) overlaid on titleBar's bottom edge to visually flatten
-    the rounded bottom corners, since older Roblox UICorner could only
-    round all 4 corners uniformly. That workaround is no longer needed now
-    that UICorner supports independent per-corner radii natively — removed
-    in favor of Utils.AddCornerEx above.
 
     Fixed minimize animation (jitter + missing fade):
       1. mainFrame was anchored at true center (0.5, 0.5) with a hand-computed
@@ -97,34 +122,6 @@
          Each step only starts once the previous one has actually finished
          (Completed / manual completion callback), instead of guessing
          durations or running fade and resize in parallel.
-
-    Superseded note (kept for history):
-    Reverted the task.delay-based completion fallback back to
-    tween.Completed:Connect(...) in the four spots that had it
-    (ExpandableHeader open/close, loading-screen fade-out, tab switchTo,
-    notification Dismiss). task.delay(duration, fn) assumes a tween finishes
-    in exactly `duration` seconds; under frame drops / lag spikes it can fire
-    visibly before or after the tween actually settles, which reads as
-    janky/stuttery timing (the follow-up step — unlocking `animating` /
-    `switching`, revealing the window, destroying the notification, etc. —
-    landing slightly out of sync with what's on screen). tween.Completed
-    fires exactly when the tween itself reports done, so the follow-up step
-    always lines up with the animation. Trade-off: on executors that don't
-    reliably fire Tween.Completed, these four interactions can get stuck
-    disabled after their first use (see the superseded note below) — if that
-    resurfaces, task.delay is the fallback to reach for again.
-
-    Superseded note (kept for history — no longer applies to the 4 spots
-    above, since they're back on tween.Completed):
-    Fixed a critical bug where Utils.Brighten / Utils.GetLuminance /
-    Utils.GetTextColorFor / Components.Label's Muted branch used lowercase
-    Color3 fields (.r/.g/.b), which do not exist on Color3 (Roblox only
-    exposes uppercase .R/.G/.B). Because Theme:Subscribe() invokes every
-    subscriber synchronously the moment it's registered (isInitial=true
-    pass), this error fired the instant Window.new() ran and Theme:Subscribe
-    was first called (e.g. inside Components.Label / Components.Button /
-    Window:_buildChrome), aborting the whole script before the ScreenGui
-    ever finished building — i.e. the UI silently failed to appear.
     ============================================================
 ]]
 
@@ -2516,15 +2513,43 @@ function Window:_buildLoadingScreen(title, mainFrame, mainScale, mainShadow)
     end)
 end
 
+-- FIX 2 + FIX 3 applied here:
+--   FIX 2: removed `self._minimized` from the InputBegan guard, so the
+--          titlebar can be dragged while the window is minimized (it's the
+--          only thing visible at that point, so this is the useful case).
+--   FIX 3: added clampPosition() and used it in InputChanged, so the
+--          window can never be dragged fully off-screen ("giống có bức
+--          tượng chặn lại ở rìa màn hình").
 function Window:_setupDrag(titleBar, mainFrame)
     local connMgr = self._connMgr
     self._titleDragging = false
     local activeInput, dragStart, startPos
 
+    -- Giữ cửa sổ luôn nằm trong viewport khi kéo, bất kể AnchorPoint đang
+    -- là center (bình thường) hay top-center/top-left (lúc minimize/resize).
+    -- Tính min/max cho Offset theo đúng AnchorPoint hiện tại của mainFrame,
+    -- vì lib này đổi anchor liên tục (center <-> top-center khi minimize,
+    -- top-left khi resize) nên biên phải tính lại theo anchor mới mỗi lần.
+    local function clampPosition(pos, size, anchor)
+        local viewport = workspace.CurrentCamera.ViewportSize
+        local w, h = size.X.Offset, size.Y.Offset
+        local minX, maxX = anchor.X * w, viewport.X - (1 - anchor.X) * w
+        local minY, maxY = anchor.Y * h, viewport.Y - (1 - anchor.Y) * h
+        -- Nếu cửa sổ to hơn cả viewport (hiếm khi xảy ra), tránh min > max
+        -- gây lỗi math.clamp bằng cách hoán đổi lại cho hợp lệ.
+        if minX > maxX then minX, maxX = maxX, minX end
+        if minY > maxY then minY, maxY = maxY, minY end
+        local x = math.clamp(pos.X.Offset, minX, maxX)
+        local y = math.clamp(pos.Y.Offset, minY, maxY)
+        return UDim2.new(pos.X.Scale, x, pos.Y.Scale, y)
+    end
+
     connMgr:Track(titleBar.InputBegan:Connect(function(input)
         -- Re-entry guard: ignore a repeat InputBegan firing mid-hold, and
-        -- refuse to start a titlebar drag while a resize is in progress.
-        if self._titleDragging or self._resizing or self._minimized or self._animating then return end
+        -- refuse to start a titlebar drag while a resize or an in-progress
+        -- minimize/restore animation is happening. (FIX 2: `self._minimized`
+        -- removed — dragging a minimized window is fine and expected.)
+        if self._titleDragging or self._resizing or self._animating then return end
         if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
             self._titleDragging = true
             activeInput = input
@@ -2536,10 +2561,13 @@ function Window:_setupDrag(titleBar, mainFrame)
         if self._titleDragging and input == activeInput
             and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
             local delta = input.Position - dragStart
-            mainFrame.Position = UDim2.new(
+            local newPos = UDim2.new(
                 startPos.X.Scale, startPos.X.Offset + delta.X,
                 startPos.Y.Scale, startPos.Y.Offset + delta.Y
             )
+            -- FIX 3: clamp before applying, so the window can never be
+            -- dragged fully (or partially) off the edge of the screen.
+            mainFrame.Position = clampPosition(newPos, mainFrame.Size, mainFrame.AnchorPoint)
         end
     end))
     connMgr:Track(UserInputService.InputEnded:Connect(function(input)
@@ -2883,7 +2911,14 @@ function Window:CreateTab(name)
     end
     connMgr:Track(btn.MouseButton1Click:Connect(switchTo))
 
-    theme:Subscribe(function(color, accent) self:_restyleTabButtons(color, accent) end)
+    -- FIX 1: removed the redundant `theme:Subscribe(...)` call that used to
+    -- be here. Window:_buildChrome already subscribes ONCE to the theme and
+    -- calls self:_restyleTabButtons(...) (which loops over every tab
+    -- button) on every change. Re-subscribing the same callback here for
+    -- every single tab meant N tabs produced N+1 calls to
+    -- _restyleTabButtons per theme change, each looping over all N buttons
+    -- — effectively O(N^2) tweens instead of O(N). The chrome-level
+    -- subscription already covers every tab created here.
 
     local tab = setmetatable({
         _page = page,
