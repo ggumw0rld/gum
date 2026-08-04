@@ -589,13 +589,17 @@ function Components.Toggle(parent, theme, connMgr, opts)
     label.Text = labelText()
 
     local function restyle(instant)
-        local darkBg = Utils.Darken(theme.Color, 0.8)
-        local trackColor = state and Utils.Brighten(theme.Accent, 1.15) or darkBg
-        local knobX = state and (52 - 22 - 3) or 3
-        local info = TweenInfo.new(instant and 0 or 0.3, EASE, EASE_OUT)
-        TweenService:Create(track, info, { BackgroundColor3 = trackColor }):Play()
-        TweenService:Create(knob, info, { Position = UDim2.new(0, knobX, 0.5, 0) }):Play()
-    end
+    local darkBg = Utils.Darken(theme.Color, 0.8)
+    local trackColor = state and Utils.Brighten(theme.Accent, 1.15) or darkBg
+    -- Chọn màu knob tương phản với track: track sáng -> knob tối, track tối -> knob trắng
+    local knobColor = Utils.GetLuminance(trackColor) > 0.55
+        and Color3.fromRGB(45, 45, 50)
+        or Color3.fromRGB(255, 255, 255)
+    local knobX = state and (52 - 22 - 3) or 3
+    local info = TweenInfo.new(instant and 0 or 0.3, EASE, EASE_OUT)
+    TweenService:Create(track, info, { BackgroundColor3 = trackColor }):Play()
+    TweenService:Create(knob, info, { Position = UDim2.new(0, knobX, 0.5, 0), BackgroundColor3 = knobColor }):Play()
+end
 
     connMgr:Track(track.MouseButton1Click:Connect(function()
         state = not state
@@ -613,19 +617,26 @@ function Components.Toggle(parent, theme, connMgr, opts)
         restyle(false)
     end
     function self:ApplyTheme(color, accent, isInitial)
-        local panelBg = Utils.Brighten(color, 1.2)
-        local textColor = Utils.GetTextColorFor(panelBg, accent)
-        if isInitial then
-            frame.BackgroundColor3 = panelBg
-            label.TextColor3 = textColor
-        else
-            TweenService:Create(frame, THEME_TWEEN_INFO, { BackgroundColor3 = panelBg }):Play()
-            TweenService:Create(label, THEME_TWEEN_INFO, { TextColor3 = textColor }):Play()
-        end
-        restyle(isInitial)
+    local panelBg = Utils.Brighten(color, 1.2)
+    local textColor = Utils.GetTextColorFor(panelBg, accent)
+    local trackColor = enabled and Utils.Brighten(accent, 1.15) or Utils.Darken(color, 0.8)
+    local knobColor = Utils.GetLuminance(trackColor) > 0.55
+        and Color3.fromRGB(45, 45, 50)
+        or Color3.fromRGB(255, 255, 255)
+    if isInitial then
+        toggleFrame.BackgroundColor3 = panelBg
+        toggleLabel.TextColor3 = textColor
+        track.BackgroundColor3 = trackColor
+        knob.BackgroundColor3 = knobColor
+    else
+        TweenService:Create(toggleFrame, THEME_TWEEN_INFO, { BackgroundColor3 = panelBg }):Play()
+        TweenService:Create(toggleLabel, THEME_TWEEN_INFO, { TextColor3 = textColor }):Play()
+        TweenService:Create(track, THEME_TWEEN_INFO, { BackgroundColor3 = trackColor }):Play()
+        TweenService:Create(knob, THEME_TWEEN_INFO, { BackgroundColor3 = knobColor }):Play()
     end
-    theme:Subscribe(function(c, a, initial) self:ApplyTheme(c, a, initial) end)
-    return self
+    if enabled and not selectedIndex then
+        pushGradientColors(isInitial)
+    end
 end
 
 -- ---------- Slider ----------
@@ -1407,20 +1418,21 @@ function Components.ColorPicker(parent, theme, connMgr, opts)
             if clean ~= box.Text then box.Text = clean end
             onCommit()
         end))
-        return box
-    end
+    return box, lbl   -- thêm lbl vào return
+end
 
-    local rBox, gBox, bBox
-    local function updateColorFromRGB()
-        local r = math.clamp(tonumber(rBox.Text) or 0, 0, 255)
-        local g = math.clamp(tonumber(gBox.Text) or 0, 0, 255)
-        local b = math.clamp(tonumber(bBox.Text) or 0, 0, 255)
-        hue, sat, val = Color3.fromRGB(r, g, b):ToHSV()
-        refresh()
-    end
-    rBox = makeRGBField("R:", 1, updateColorFromRGB)
-    gBox = makeRGBField("G:", 2, updateColorFromRGB)
-    bBox = makeRGBField("B:", 3, updateColorFromRGB)
+local rBox, gBox, bBox
+local rLbl, gLbl, bLbl
+local function updateColorFromRGB()
+    local r = math.clamp(tonumber(rBox.Text) or 0, 0, 255)
+    local g = math.clamp(tonumber(gBox.Text) or 0, 0, 255)
+    local b = math.clamp(tonumber(bBox.Text) or 0, 0, 255)
+    hue, sat, val = Color3.fromRGB(r, g, b):ToHSV()
+    refresh()
+end
+rBox, rLbl = makeRGBField("R:", 1, updateColorFromRGB)
+gBox, gLbl = makeRGBField("G:", 2, updateColorFromRGB)
+bBox, bLbl = makeRGBField("B:", 3, updateColorFromRGB)
 
     -- Presets
     local presetColors = opts.Presets or {
@@ -1535,21 +1547,37 @@ function Components.ColorPicker(parent, theme, connMgr, opts)
     local self = { Instance = exp.Container }
     function self:Get() return current() end
     function self:ApplyTheme(color, accent, isInitial)
-        local panelBg = Utils.Brighten(color, 1.2)
-        local headerTextColor = Utils.GetTextColorFor(panelBg, accent)
-        local hexTextColor = (Utils.GetLuminance(panelBg) > 0.55) and Color3.fromRGB(90, 90, 100) or Color3.fromRGB(190, 190, 200)
-        if isInitial then
-            exp.Header.BackgroundColor3 = panelBg
-            exp.TitleLabel.TextColor3 = headerTextColor
-            hexLabel.TextColor3 = hexTextColor
-        else
-            TweenService:Create(exp.Header, THEME_TWEEN_INFO, { BackgroundColor3 = panelBg }):Play()
-            TweenService:Create(exp.TitleLabel, THEME_TWEEN_INFO, { TextColor3 = headerTextColor }):Play()
-            TweenService:Create(hexLabel, THEME_TWEEN_INFO, { TextColor3 = hexTextColor }):Play()
+    local panelBg = Utils.Brighten(color, 1.2)
+    local headerTextColor = Utils.GetTextColorFor(panelBg, accent)
+    local hexTextColor = (Utils.GetLuminance(panelBg) > 0.55) and Color3.fromRGB(90, 90, 100) or Color3.fromRGB(190, 190, 200)
+    local darkBg = Utils.Darken(color, 0.8)
+    local inputTextColor = Utils.GetTextColorFor(darkBg, accent)
+
+    if isInitial then
+        exp.Header.BackgroundColor3 = panelBg
+        exp.TitleLabel.TextColor3 = headerTextColor
+        hexLabel.TextColor3 = hexTextColor
+        hexRowLabel.TextColor3 = hexTextColor
+        hexBox.BackgroundColor3 = darkBg
+        hexBox.TextColor3 = inputTextColor
+        for _, lbl in ipairs({ rLbl, gLbl, bLbl }) do lbl.TextColor3 = hexTextColor end
+        for _, box in ipairs({ rBox, gBox, bBox }) do
+            box.BackgroundColor3 = darkBg
+            box.TextColor3 = inputTextColor
+        end
+    else
+        TweenService:Create(exp.Header, THEME_TWEEN_INFO, { BackgroundColor3 = panelBg }):Play()
+        TweenService:Create(exp.TitleLabel, THEME_TWEEN_INFO, { TextColor3 = headerTextColor }):Play()
+        TweenService:Create(hexLabel, THEME_TWEEN_INFO, { TextColor3 = hexTextColor }):Play()
+        TweenService:Create(hexRowLabel, THEME_TWEEN_INFO, { TextColor3 = hexTextColor }):Play()
+        TweenService:Create(hexBox, THEME_TWEEN_INFO, { BackgroundColor3 = darkBg, TextColor3 = inputTextColor }):Play()
+        for _, lbl in ipairs({ rLbl, gLbl, bLbl }) do
+            TweenService:Create(lbl, THEME_TWEEN_INFO, { TextColor3 = hexTextColor }):Play()
+        end
+        for _, box in ipairs({ rBox, gBox, bBox }) do
+            TweenService:Create(box, THEME_TWEEN_INFO, { BackgroundColor3 = darkBg, TextColor3 = inputTextColor }):Play()
         end
     end
-    theme:Subscribe(function(c, a, initial) self:ApplyTheme(c, a, initial) end)
-    return self
 end
 
 -- ---------- ThemeGrid (grid of preset color/accent swatches) ----------
@@ -1701,16 +1729,19 @@ function Components.GradientPicker(parent, theme, connMgr, opts)
     end
 
     local function setEnabled(v)
-        enabled = v
-        toggleLabel.Text = (opts.Text or "Chế độ Gradient") .. ": " .. (enabled and "Bật" or "Tắt")
-        local darkBg = Utils.Darken(theme.Color, 0.8)
-        local trackColor = enabled and Utils.Brighten(theme.Accent, 1.15) or darkBg
-        local knobX = enabled and (52 - 22 - 3) or 3
-        TweenService:Create(track, TweenInfo.new(0.3, EASE, EASE_OUT), { BackgroundColor3 = trackColor }):Play()
-        TweenService:Create(knob, TweenInfo.new(0.3, EASE, EASE_OUT), { Position = UDim2.new(0, knobX, 0.5, 0) }):Play()
-        for _, entry in ipairs(gradients) do entry.Gradient.Enabled = enabled end
-        if enabled then pushGradientColors(true) end
-    end
+    enabled = v
+    toggleLabel.Text = (opts.Text or "Chế độ Gradient") .. ": " .. (enabled and "Bật" or "Tắt")
+    local darkBg = Utils.Darken(theme.Color, 0.8)
+    local trackColor = enabled and Utils.Brighten(theme.Accent, 1.15) or darkBg
+    local knobColor = Utils.GetLuminance(trackColor) > 0.55
+        and Color3.fromRGB(45, 45, 50)
+        or Color3.fromRGB(255, 255, 255)
+    local knobX = enabled and (52 - 22 - 3) or 3
+    TweenService:Create(track, TweenInfo.new(0.3, EASE, EASE_OUT), { BackgroundColor3 = trackColor }):Play()
+    TweenService:Create(knob, TweenInfo.new(0.3, EASE, EASE_OUT), { Position = UDim2.new(0, knobX, 0.5, 0), BackgroundColor3 = knobColor }):Play()
+    for _, entry in ipairs(gradients) do entry.Gradient.Enabled = enabled end
+    if enabled then pushGradientColors(true) end
+end
 
     connMgr:Track(track.MouseButton1Click:Connect(function() setEnabled(not enabled) end))
 
