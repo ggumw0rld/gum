@@ -30,7 +30,28 @@
     closed programmatically instead, via `Selenix:Destroy()`.
     ============================================================
 
-    PATCH NOTES (this copy — 3 fixes applied on top of the previous patch):
+    PATCH NOTES (this copy — real loading screen):
+
+    The loading screen no longer fakes progress on a fixed clock
+    (previously: tween the bar to 100% over 1.35s, then task.delay(1.6)
+    and close regardless of what had actually happened). It's now driven
+    by real conditions:
+      - Auto stage: waits for game:IsLoaded()/game.Loaded if the place
+        hasn't finished loading yet, and preloads the titlebar icon asset
+        via ContentProvider:PreloadAsync if one was given. The bar only
+        advances as each of these actually completes.
+      - Manual stage (opt-in via CreateWindow{ Loading = { Manual = true } }):
+        once the auto stage is done, the bar holds below 100% and the
+        screen stays open until the consumer script calls
+        Window:SetLoadingProgress(alpha, statusText) or
+        Window:FinishLoading(text) itself — e.g. after fetching remote
+        data, waiting on a RemoteFunction, or loading saved settings.
+      Config.Loading also accepts WaitForGameLoaded (default true) and
+      PreloadIcon (default true when an Icon is set) to turn either auto
+      step off individually.
+    ============================================================
+
+    PATCH NOTES (3 fixes applied on top of the previous patch):
 
     FIX 1 — Duplicate theme subscription in CreateTab (perf bug):
       Window:_buildChrome already subscribes once to the theme and calls
@@ -129,6 +150,7 @@ local TweenService = game:GetService("TweenService")
 local RunService = game:GetService("RunService")
 local Players = game:GetService("Players")
 local UserInputService = game:GetService("UserInputService")
+local ContentProvider = game:GetService("ContentProvider")
 local Player = Players.LocalPlayer
 
 local EASE = Enum.EasingStyle.Quint
@@ -589,17 +611,13 @@ function Components.Toggle(parent, theme, connMgr, opts)
     label.Text = labelText()
 
     local function restyle(instant)
-    local darkBg = Utils.Darken(theme.Color, 0.8)
-    local trackColor = state and Utils.Brighten(theme.Accent, 1.15) or darkBg
-    -- Chọn màu knob tương phản với track: track sáng -> knob tối, track tối -> knob trắng
-    local knobColor = Utils.GetLuminance(trackColor) > 0.55
-        and Color3.fromRGB(45, 45, 50)
-        or Color3.fromRGB(255, 255, 255)
-    local knobX = state and (52 - 22 - 3) or 3
-    local info = TweenInfo.new(instant and 0 or 0.3, EASE, EASE_OUT)
-    TweenService:Create(track, info, { BackgroundColor3 = trackColor }):Play()
-    TweenService:Create(knob, info, { Position = UDim2.new(0, knobX, 0.5, 0), BackgroundColor3 = knobColor }):Play()
-end
+        local darkBg = Utils.Darken(theme.Color, 0.8)
+        local trackColor = state and Utils.Brighten(theme.Accent, 1.15) or darkBg
+        local knobX = state and (52 - 22 - 3) or 3
+        local info = TweenInfo.new(instant and 0 or 0.3, EASE, EASE_OUT)
+        TweenService:Create(track, info, { BackgroundColor3 = trackColor }):Play()
+        TweenService:Create(knob, info, { Position = UDim2.new(0, knobX, 0.5, 0) }):Play()
+    end
 
     connMgr:Track(track.MouseButton1Click:Connect(function()
         state = not state
@@ -619,22 +637,14 @@ end
     function self:ApplyTheme(color, accent, isInitial)
         local panelBg = Utils.Brighten(color, 1.2)
         local textColor = Utils.GetTextColorFor(panelBg, accent)
-        local darkBg = Utils.Darken(color, 0.8)
-        local trackColor = state and Utils.Brighten(accent, 1.15) or darkBg
-        local knobColor = Utils.GetLuminance(trackColor) > 0.55
-            and Color3.fromRGB(45, 45, 50)
-            or Color3.fromRGB(255, 255, 255)
         if isInitial then
             frame.BackgroundColor3 = panelBg
             label.TextColor3 = textColor
-            track.BackgroundColor3 = trackColor
-            knob.BackgroundColor3 = knobColor
         else
             TweenService:Create(frame, THEME_TWEEN_INFO, { BackgroundColor3 = panelBg }):Play()
             TweenService:Create(label, THEME_TWEEN_INFO, { TextColor3 = textColor }):Play()
-            TweenService:Create(track, THEME_TWEEN_INFO, { BackgroundColor3 = trackColor }):Play()
-            TweenService:Create(knob, THEME_TWEEN_INFO, { BackgroundColor3 = knobColor }):Play()
         end
+        restyle(isInitial)
     end
     theme:Subscribe(function(c, a, initial) self:ApplyTheme(c, a, initial) end)
     return self
@@ -1419,21 +1429,20 @@ function Components.ColorPicker(parent, theme, connMgr, opts)
             if clean ~= box.Text then box.Text = clean end
             onCommit()
         end))
-    return box, lbl   -- thêm lbl vào return
-end
+        return box
+    end
 
-local rBox, gBox, bBox
-local rLbl, gLbl, bLbl
-local function updateColorFromRGB()
-    local r = math.clamp(tonumber(rBox.Text) or 0, 0, 255)
-    local g = math.clamp(tonumber(gBox.Text) or 0, 0, 255)
-    local b = math.clamp(tonumber(bBox.Text) or 0, 0, 255)
-    hue, sat, val = Color3.fromRGB(r, g, b):ToHSV()
-    refresh()
-end
-rBox, rLbl = makeRGBField("R:", 1, updateColorFromRGB)
-gBox, gLbl = makeRGBField("G:", 2, updateColorFromRGB)
-bBox, bLbl = makeRGBField("B:", 3, updateColorFromRGB)
+    local rBox, gBox, bBox
+    local function updateColorFromRGB()
+        local r = math.clamp(tonumber(rBox.Text) or 0, 0, 255)
+        local g = math.clamp(tonumber(gBox.Text) or 0, 0, 255)
+        local b = math.clamp(tonumber(bBox.Text) or 0, 0, 255)
+        hue, sat, val = Color3.fromRGB(r, g, b):ToHSV()
+        refresh()
+    end
+    rBox = makeRGBField("R:", 1, updateColorFromRGB)
+    gBox = makeRGBField("G:", 2, updateColorFromRGB)
+    bBox = makeRGBField("B:", 3, updateColorFromRGB)
 
     -- Presets
     local presetColors = opts.Presets or {
@@ -1548,38 +1557,19 @@ bBox, bLbl = makeRGBField("B:", 3, updateColorFromRGB)
     local self = { Instance = exp.Container }
     function self:Get() return current() end
     function self:ApplyTheme(color, accent, isInitial)
-    local panelBg = Utils.Brighten(color, 1.2)
-    local headerTextColor = Utils.GetTextColorFor(panelBg, accent)
-    local hexTextColor = (Utils.GetLuminance(panelBg) > 0.55) and Color3.fromRGB(90, 90, 100) or Color3.fromRGB(190, 190, 200)
-    local darkBg = Utils.Darken(color, 0.8)
-    local inputTextColor = Utils.GetTextColorFor(darkBg, accent)
-
-    if isInitial then
-        exp.Header.BackgroundColor3 = panelBg
-        exp.TitleLabel.TextColor3 = headerTextColor
-        hexLabel.TextColor3 = hexTextColor
-        hexRowLabel.TextColor3 = hexTextColor
-        hexBox.BackgroundColor3 = darkBg
-        hexBox.TextColor3 = inputTextColor
-        for _, lbl in ipairs({ rLbl, gLbl, bLbl }) do lbl.TextColor3 = hexTextColor end
-        for _, box in ipairs({ rBox, gBox, bBox }) do
-            box.BackgroundColor3 = darkBg
-            box.TextColor3 = inputTextColor
-        end
-    else
-        TweenService:Create(exp.Header, THEME_TWEEN_INFO, { BackgroundColor3 = panelBg }):Play()
-        TweenService:Create(exp.TitleLabel, THEME_TWEEN_INFO, { TextColor3 = headerTextColor }):Play()
-        TweenService:Create(hexLabel, THEME_TWEEN_INFO, { TextColor3 = hexTextColor }):Play()
-        TweenService:Create(hexRowLabel, THEME_TWEEN_INFO, { TextColor3 = hexTextColor }):Play()
-        TweenService:Create(hexBox, THEME_TWEEN_INFO, { BackgroundColor3 = darkBg, TextColor3 = inputTextColor }):Play()
-        for _, lbl in ipairs({ rLbl, gLbl, bLbl }) do
-            TweenService:Create(lbl, THEME_TWEEN_INFO, { TextColor3 = hexTextColor }):Play()
-        end
-        for _, box in ipairs({ rBox, gBox, bBox }) do
-            TweenService:Create(box, THEME_TWEEN_INFO, { BackgroundColor3 = darkBg, TextColor3 = inputTextColor }):Play()
+        local panelBg = Utils.Brighten(color, 1.2)
+        local headerTextColor = Utils.GetTextColorFor(panelBg, accent)
+        local hexTextColor = (Utils.GetLuminance(panelBg) > 0.55) and Color3.fromRGB(90, 90, 100) or Color3.fromRGB(190, 190, 200)
+        if isInitial then
+            exp.Header.BackgroundColor3 = panelBg
+            exp.TitleLabel.TextColor3 = headerTextColor
+            hexLabel.TextColor3 = hexTextColor
+        else
+            TweenService:Create(exp.Header, THEME_TWEEN_INFO, { BackgroundColor3 = panelBg }):Play()
+            TweenService:Create(exp.TitleLabel, THEME_TWEEN_INFO, { TextColor3 = headerTextColor }):Play()
+            TweenService:Create(hexLabel, THEME_TWEEN_INFO, { TextColor3 = hexTextColor }):Play()
         end
     end
-end
     theme:Subscribe(function(c, a, initial) self:ApplyTheme(c, a, initial) end)
     return self
 end
@@ -1733,19 +1723,16 @@ function Components.GradientPicker(parent, theme, connMgr, opts)
     end
 
     local function setEnabled(v)
-    enabled = v
-    toggleLabel.Text = (opts.Text or "Chế độ Gradient") .. ": " .. (enabled and "Bật" or "Tắt")
-    local darkBg = Utils.Darken(theme.Color, 0.8)
-    local trackColor = enabled and Utils.Brighten(theme.Accent, 1.15) or darkBg
-    local knobColor = Utils.GetLuminance(trackColor) > 0.55
-        and Color3.fromRGB(45, 45, 50)
-        or Color3.fromRGB(255, 255, 255)
-    local knobX = enabled and (52 - 22 - 3) or 3
-    TweenService:Create(track, TweenInfo.new(0.3, EASE, EASE_OUT), { BackgroundColor3 = trackColor }):Play()
-    TweenService:Create(knob, TweenInfo.new(0.3, EASE, EASE_OUT), { Position = UDim2.new(0, knobX, 0.5, 0), BackgroundColor3 = knobColor }):Play()
-    for _, entry in ipairs(gradients) do entry.Gradient.Enabled = enabled end
-    if enabled then pushGradientColors(true) end
-end
+        enabled = v
+        toggleLabel.Text = (opts.Text or "Chế độ Gradient") .. ": " .. (enabled and "Bật" or "Tắt")
+        local darkBg = Utils.Darken(theme.Color, 0.8)
+        local trackColor = enabled and Utils.Brighten(theme.Accent, 1.15) or darkBg
+        local knobX = enabled and (52 - 22 - 3) or 3
+        TweenService:Create(track, TweenInfo.new(0.3, EASE, EASE_OUT), { BackgroundColor3 = trackColor }):Play()
+        TweenService:Create(knob, TweenInfo.new(0.3, EASE, EASE_OUT), { Position = UDim2.new(0, knobX, 0.5, 0) }):Play()
+        for _, entry in ipairs(gradients) do entry.Gradient.Enabled = enabled end
+        if enabled then pushGradientColors(true) end
+    end
 
     connMgr:Track(track.MouseButton1Click:Connect(function() setEnabled(not enabled) end))
 
@@ -2251,6 +2238,9 @@ function Window.new(config)
         _tabButtons = {},
         _pages = {},
         _activeTabIndex = 1,
+        -- config.Loading (optional): { Manual = bool, WaitForGameLoaded = bool,
+        -- PreloadIcon = bool } — see _buildLoadingScreen / SetLoadingProgress.
+        _loadingConfig = config.Loading or {},
     }, Window)
 
     self:_buildChrome(title, size)
@@ -2466,9 +2456,29 @@ function Window:_buildChrome(title, originalSize)
     end)
 end
 
+-- The loading screen's progress bar now reflects REAL work instead of a
+-- fixed cosmetic timer:
+--   1. Auto stage (runs unconditionally unless disabled in config.Loading):
+--        - waits for game:IsLoaded() / game.Loaded if the place isn't fully
+--          loaded yet
+--        - preloads the titlebar icon asset via ContentProvider, if one was
+--          given
+--      Each finished step advances the bar by its real share of progress —
+--      nothing is tweened toward a number that doesn't mean anything.
+--   2. Manual stage (opt-in via config.Loading.Manual = true): once the
+--      auto stage is done, the bar holds (capped below 100%) and the
+--      loading screen stays open until the CONSUMER script calls
+--      Window:SetLoadingProgress(alpha, text) / Window:FinishLoading() to
+--      report its own real setup work (fetching data, waiting on a
+--      RemoteFunction, etc). This is what lets the screen only disappear
+--      once things are actually ready, instead of after a guessed delay.
 function Window:_buildLoadingScreen(title, mainFrame, mainScale, mainShadow)
     local screenGui = self._screenGui
     local theme = self._theme
+    local loadingCfg = self._loadingConfig or {}
+    local manual = loadingCfg.Manual == true
+    local waitForGameLoaded = (loadingCfg.WaitForGameLoaded ~= false) -- default true
+    local preloadIcon = (loadingCfg.PreloadIcon ~= false) and (self._icon ~= nil) -- default true if an Icon was given
 
     local loading = Instance.new("Frame")
     loading.AnchorPoint = Vector2.new(0.5, 0.5)
@@ -2527,14 +2537,21 @@ function Window:_buildLoadingScreen(title, mainFrame, mainScale, mainShadow)
 
     Animator.Tween(loadingScale, { Scale = 1 }, 0.35):Play()
     Animator.Tween(loading, { BackgroundTransparency = 0 }, 0.35):Play()
-    Animator.Tween(barFill, { Size = UDim2.new(1, 0, 1, 0) }, 1.35):Play()
+    -- barFill is no longer tweened to 100% on a fixed clock — its Size is
+    -- now driven exclusively by SetLoadingProgress() below, in lockstep
+    -- with real completed work.
 
-    -- Gated on the fade-out tween's own Completed event (instead of a fixed
-    -- task.delay guess) so mainFrame is revealed exactly when the loading
-    -- screen has actually finished fading out, avoiding a visible timing
-    -- mismatch under lag/frame drops. The initial 1.6s wait itself stays as
-    -- task.delay since it isn't tied to any tween's duration.
-    task.delay(1.6, function()
+    local connMgr = self._connMgr
+    self._loadingDone = false
+    self._loadingAlpha = 0
+
+    -- Runs the fade-out -> reveal mainFrame sequence exactly once. Gated on
+    -- each tween's own Completed event (not a guessed delay) so mainFrame
+    -- is revealed exactly when the loading screen has actually finished
+    -- fading out, even under lag/frame drops.
+    local function finishLoading()
+        if self._loadingDone then return end
+        self._loadingDone = true
         Animator.Tween(loadingScale, { Scale = 0.85 }, 0.3, EASE, EASE_IN):Play()
         local fadeOut = Animator.Tween(loading, { BackgroundTransparency = 1 }, 0.3, EASE, EASE_IN)
         fadeOut.Completed:Connect(function()
@@ -2545,6 +2562,64 @@ function Window:_buildLoadingScreen(title, mainFrame, mainScale, mainShadow)
             Animator.Tween(mainShadow, { Transparency = 0.45 }, 0.5):Play()
         end)
         fadeOut:Play()
+    end
+    self._finishLoading = finishLoading
+
+    -- Public: report real loading progress (0-1) and optionally update the
+    -- status line. Calling with alpha >= 1 closes the loading screen.
+    function self:SetLoadingProgress(alpha, text)
+        if self._loadingDone then return end
+        alpha = math.clamp(alpha or 0, 0, 1)
+        self._loadingAlpha = alpha
+        Animator.Tween(barFill, { Size = UDim2.new(alpha, 0, 1, 0) }, 0.25):Play()
+        if text then loadingSubtitle.Text = text end
+        if alpha >= 1 then finishLoading() end
+    end
+
+    -- Public: convenience for SetLoadingProgress(1, text).
+    function self:FinishLoading(text)
+        self:SetLoadingProgress(1, text)
+    end
+
+    -- Real auto stage: only advances the bar as each condition is actually
+    -- satisfied (game finished loading, icon asset actually preloaded).
+    -- If config.Loading.Manual is true, this stage caps its own progress at
+    -- 90% and leaves the screen open — the consumer script is expected to
+    -- call SetLoadingProgress/FinishLoading itself once its own real setup
+    -- (data fetch, RemoteFunction call, etc) is done. Otherwise the screen
+    -- closes automatically the moment this real work is complete.
+    task.spawn(function()
+        local steps = {}
+        if waitForGameLoaded and not game:IsLoaded() then table.insert(steps, "game") end
+        if preloadIcon then table.insert(steps, "icon") end
+
+        if #steps == 0 then
+            if not manual then self:FinishLoading("Sẵn sàng") end
+            return
+        end
+
+        local capMax = manual and 0.9 or 1.0
+        local completed = 0
+        local function stepDone(text)
+            completed = completed + 1
+            self:SetLoadingProgress((completed / #steps) * capMax, text)
+        end
+
+        if waitForGameLoaded and not game:IsLoaded() then
+            self:SetLoadingProgress(0, "Đang chờ game tải...")
+            game.Loaded:Wait()
+            stepDone("Đã tải game")
+        end
+        if preloadIcon then
+            local ok = pcall(function()
+                ContentProvider:PreloadAsync({ self._icon })
+            end)
+            stepDone(ok and "Đã tải icon" or "Bỏ qua icon")
+        end
+
+        if not manual then
+            self:FinishLoading("Sẵn sàng")
+        end
     end)
 end
 
