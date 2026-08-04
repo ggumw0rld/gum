@@ -2531,18 +2531,25 @@ function Window:_setupDrag(titleBar, mainFrame)
     -- vì lib này đổi anchor liên tục (center <-> top-center khi minimize,
     -- top-left khi resize) nên biên phải tính lại theo anchor mới mỗi lần.
     local function clampPosition(pos, size, anchor)
-        local viewport = workspace.CurrentCamera.ViewportSize
-        local w, h = size.X.Offset, size.Y.Offset
-        local minX, maxX = anchor.X * w, viewport.X - (1 - anchor.X) * w
-        local minY, maxY = anchor.Y * h, viewport.Y - (1 - anchor.Y) * h
-        -- Nếu cửa sổ to hơn cả viewport (hiếm khi xảy ra), tránh min > max
-        -- gây lỗi math.clamp bằng cách hoán đổi lại cho hợp lệ.
-        if minX > maxX then minX, maxX = maxX, minX end
-        if minY > maxY then minY, maxY = maxY, minY end
-        local x = math.clamp(pos.X.Offset, minX, maxX)
-        local y = math.clamp(pos.Y.Offset, minY, maxY)
-        return UDim2.new(pos.X.Scale, x, pos.Y.Scale, y)
-    end
+    local viewport = workspace.CurrentCamera.ViewportSize
+    local w, h = size.X.Offset, size.Y.Offset
+
+    -- Quy Scale về pixel tuyệt đối để cộng vào cùng hệ với Offset,
+    -- vì lúc kéo bình thường mainFrame đang neo center (Scale = 0.5),
+    -- không phải 0 như code cũ giả định.
+    local scaleX = pos.X.Scale * viewport.X
+    local scaleY = pos.Y.Scale * viewport.Y
+
+    local minX, maxX = anchor.X * w - scaleX, viewport.X - (1 - anchor.X) * w - scaleX
+    local minY, maxY = anchor.Y * h - scaleY, viewport.Y - (1 - anchor.Y) * h - scaleY
+
+    if minX > maxX then minX, maxX = maxX, minX end
+    if minY > maxY then minY, maxY = maxY, minY end
+
+    local x = math.clamp(pos.X.Offset, minX, maxX)
+    local y = math.clamp(pos.Y.Offset, minY, maxY)
+    return UDim2.new(pos.X.Scale, x, pos.Y.Scale, y)
+end
 
     connMgr:Track(titleBar.InputBegan:Connect(function(input)
         -- Re-entry guard: ignore a repeat InputBegan firing mid-hold, and
