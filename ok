@@ -617,26 +617,27 @@ end
         restyle(false)
     end
     function self:ApplyTheme(color, accent, isInitial)
-    local panelBg = Utils.Brighten(color, 1.2)
-    local textColor = Utils.GetTextColorFor(panelBg, accent)
-    local trackColor = enabled and Utils.Brighten(accent, 1.15) or Utils.Darken(color, 0.8)
-    local knobColor = Utils.GetLuminance(trackColor) > 0.55
-        and Color3.fromRGB(45, 45, 50)
-        or Color3.fromRGB(255, 255, 255)
-    if isInitial then
-        toggleFrame.BackgroundColor3 = panelBg
-        toggleLabel.TextColor3 = textColor
-        track.BackgroundColor3 = trackColor
-        knob.BackgroundColor3 = knobColor
-    else
-        TweenService:Create(toggleFrame, THEME_TWEEN_INFO, { BackgroundColor3 = panelBg }):Play()
-        TweenService:Create(toggleLabel, THEME_TWEEN_INFO, { TextColor3 = textColor }):Play()
-        TweenService:Create(track, THEME_TWEEN_INFO, { BackgroundColor3 = trackColor }):Play()
-        TweenService:Create(knob, THEME_TWEEN_INFO, { BackgroundColor3 = knobColor }):Play()
+        local panelBg = Utils.Brighten(color, 1.2)
+        local textColor = Utils.GetTextColorFor(panelBg, accent)
+        local darkBg = Utils.Darken(color, 0.8)
+        local trackColor = state and Utils.Brighten(accent, 1.15) or darkBg
+        local knobColor = Utils.GetLuminance(trackColor) > 0.55
+            and Color3.fromRGB(45, 45, 50)
+            or Color3.fromRGB(255, 255, 255)
+        if isInitial then
+            frame.BackgroundColor3 = panelBg
+            label.TextColor3 = textColor
+            track.BackgroundColor3 = trackColor
+            knob.BackgroundColor3 = knobColor
+        else
+            TweenService:Create(frame, THEME_TWEEN_INFO, { BackgroundColor3 = panelBg }):Play()
+            TweenService:Create(label, THEME_TWEEN_INFO, { TextColor3 = textColor }):Play()
+            TweenService:Create(track, THEME_TWEEN_INFO, { BackgroundColor3 = trackColor }):Play()
+            TweenService:Create(knob, THEME_TWEEN_INFO, { BackgroundColor3 = knobColor }):Play()
+        end
     end
-    if enabled and not selectedIndex then
-        pushGradientColors(isInitial)
-    end
+    theme:Subscribe(function(c, a, initial) self:ApplyTheme(c, a, initial) end)
+    return self
 end
 
 -- ---------- Slider ----------
@@ -1578,6 +1579,9 @@ bBox, bLbl = makeRGBField("B:", 3, updateColorFromRGB)
             TweenService:Create(box, THEME_TWEEN_INFO, { BackgroundColor3 = darkBg, TextColor3 = inputTextColor }):Play()
         end
     end
+end
+    theme:Subscribe(function(c, a, initial) self:ApplyTheme(c, a, initial) end)
+    return self
 end
 
 -- ---------- ThemeGrid (grid of preset color/accent swatches) ----------
