@@ -13,6 +13,7 @@
                        Textbox, Dropdown, MultiDropdown, ColorPicker, ThemeGrid, GradientPicker,
                        Notification)
         Tab        -> a page + its tab button; exposes Tab:AddXxx(opts) which delegates to Components
+        Config     -> Flags + SaveConfig/LoadConfig (writefile/readfile via executor)
 
     Every component returned by Components.* implements the same tiny interface:
         obj.Instance      -- root GuiObject
@@ -30,7 +31,32 @@
     closed programmatically instead, via `Selenix:Destroy()`.
     ============================================================
 
-    PATCH NOTES (this copy — real loading screen):
+    PATCH NOTES (this copy — Config system + auto-fit viewport):
+
+    NEW — Config (Flags + Save/Load):
+      Any control created via Tab:CreateXxx({..., Flag = "uniqueName"})
+      is now registered into Window._flags[flag]. Window:SaveConfig(name)
+      and Window:LoadConfig(name) serialize/restore every registered
+      control's value via :Get()/:Set(), through writefile/readfile
+      (wrapped in pcall since not every executor exposes them). Color3
+      values are encoded as {__color3=true, r,g,b} since JSONEncode can't
+      handle Color3 directly. Added :Set() to Slider/Textbox/Dropdown/
+      MultiDropdown/ColorPicker so LoadConfig can restore every control
+      type, not just Toggle (which already had :Set()).
+
+    NEW — Auto-fit UI to current screen size:
+      mainFrame's initial Size is now clamped to the current
+      workspace.CurrentCamera.ViewportSize (minus a margin) via
+      fitToViewport(), so a window configured larger than the screen
+      never spawns off-screen or clipped. A ViewportSize-changed listener
+      re-fits the window (tweened) whenever the viewport changes (e.g.
+      device rotation, window resize), as long as the user isn't actively
+      dragging/resizing/minimizing it. _setupResize's MAX_W/MAX_H are also
+      now computed from the live viewport instead of fixed constants, so
+      manual resize can't drag the window bigger than the screen either.
+    ============================================================
+
+    PATCH NOTES (carried over — real loading screen):
 
     The loading screen no longer fakes progress on a fixed clock
     (previously: tween the bar to 100% over 1.35s, then task.delay(1.6)
@@ -51,7 +77,7 @@
       step off individually.
     ============================================================
 
-    PATCH NOTES (3 fixes applied on top of the previous patch):
+    PATCH NOTES (carried over — 3 fixes):
 
     FIX 1 — Duplicate theme subscription in CreateTab (perf bug):
       Window:_buildChrome already subscribes once to the theme and calls
@@ -151,6 +177,7 @@ local RunService = game:GetService("RunService")
 local Players = game:GetService("Players")
 local UserInputService = game:GetService("UserInputService")
 local ContentProvider = game:GetService("ContentProvider")
+local HttpService = game:GetService("HttpService")
 local Player = Players.LocalPlayer
 
 local EASE = Enum.EasingStyle.Quint
@@ -754,6 +781,20 @@ function Components.Slider(parent, theme, connMgr, opts)
 
     local self = { Instance = frame }
     function self:Get() return value end
+    -- Programmatically set the value (used by Window:LoadConfig). Clamps
+    -- to [min, max] and rounds to the same precision as manual dragging,
+    -- then updates the visuals/label the same way update() does, and fires
+    -- opts.Callback so consumer code stays in sync.
+    function self:Set(v)
+        v = roundTo(math.clamp(v, min, max))
+        if v == value then return end
+        value = v
+        local alpha = (value - min) / range
+        label.Text = labelText()
+        fill.Size = UDim2.new(alpha, 0, 1, 0)
+        drag.Position = UDim2.new(alpha, 0, 0.5, 0)
+        if opts.Callback then opts.Callback(value) end
+    end
     function self:ApplyTheme(color, accent, isInitial)
         local panelBg = Utils.Brighten(color, 1.2)
         local textColor = Utils.GetTextColorFor(panelBg, accent)
@@ -824,6 +865,12 @@ function Components.Textbox(parent, theme, connMgr, opts)
 
     local self = { Instance = frame }
     function self:Get() return box.Text end
+    -- Programmatically set the text (used by Window:LoadConfig). Does not
+    -- fire opts.Callback (matches Toggle/Slider convention: only a real
+    -- FocusLost+Enter counts as a user commit), just updates the box text.
+    function self:Set(v)
+        box.Text = tostring(v)
+    end
     function self:ApplyTheme(color, accent, isInitial)
         local panelBg = Utils.Brighten(color, 1.2)
         local darkBg = Utils.Darken(color, 0.8)
@@ -1017,6 +1064,14 @@ function Components.Dropdown(parent, theme, connMgr, opts)
 
     local self = { Instance = exp.Container }
     function self:Get() return selected end
+    -- Programmatically select an option (used by Window:LoadConfig).
+    -- Silently ignores values that aren't in opts.Options.
+    function self:Set(v)
+        local found = false
+        for _, t in ipairs(options) do if t == v then found = true break end end
+        if not found then return end
+        select(v)
+    end
     function self:ApplyTheme(color, accent, isInitial)
         local panelBg = Utils.Brighten(color, 1.2)
         local headerTextColor = Utils.GetTextColorFor(panelBg, accent)
@@ -1150,6 +1205,25 @@ function Components.MultiDropdown(parent, theme, connMgr, opts)
         local out = {}
         for _, t in ipairs(options) do if selectedSet[t] then table.insert(out, t) end end
         return out
+    end
+    -- Programmatically set the full selection (used by Window:LoadConfig).
+    -- Expects an array of option strings; rebuilds selectedSet and restyles
+    -- every row + the summary label to match.
+    function self:Set(list_)
+        local newSet = {}
+        for _, v in ipairs(list_ or {}) do newSet[v] = true end
+        selectedSet = newSet
+        for _, row in ipairs(rows) do
+            local isSel = selectedSet[row.text] and true or false
+            TweenService:Create(row.btn, TweenInfo.new(0.25, EASE, EASE_OUT), { BackgroundColor3 = baseColorFor(row.text) }):Play()
+            TweenService:Create(row.check, TweenInfo.new(0.25, EASE, EASE_OUT), { TextTransparency = isSel and 0 or 1 }):Play()
+        end
+        valueLabel.Text = summaryText()
+        if opts.Callback then
+            local out = {}
+            for _, t in ipairs(options) do if selectedSet[t] then table.insert(out, t) end end
+            opts.Callback(out)
+        end
     end
     function self:ApplyTheme(color, accent, isInitial)
         local panelBg = Utils.Brighten(color, 1.2)
@@ -1556,6 +1630,12 @@ function Components.ColorPicker(parent, theme, connMgr, opts)
 
     local self = { Instance = exp.Container }
     function self:Get() return current() end
+    -- Programmatically set the color (used by Window:LoadConfig). Expects
+    -- a Color3.
+    function self:Set(color)
+        hue, sat, val = color:ToHSV()
+        refresh()
+    end
     function self:ApplyTheme(color, accent, isInitial)
         local panelBg = Utils.Brighten(color, 1.2)
         local headerTextColor = Utils.GetTextColorFor(panelBg, accent)
@@ -2204,6 +2284,21 @@ local function destroyExisting(playerGui, name)
     if existing then existing:Destroy() end
 end
 
+-- Clamps a desired window size to the current viewport (minus a margin) so
+-- a window configured larger than the screen never spawns off-screen or
+-- clipped. Used both for the initial Size and for re-fitting on a
+-- ViewportSize change (device rotation, window resize, etc).
+local VIEWPORT_MARGIN = 40
+local MIN_FIT_W, MIN_FIT_H = 300, 220
+local function fitToViewport(size)
+    local viewport = workspace.CurrentCamera.ViewportSize
+    local maxW = math.max(viewport.X - VIEWPORT_MARGIN, MIN_FIT_W)
+    local maxH = math.max(viewport.Y - VIEWPORT_MARGIN, MIN_FIT_H)
+    local w = math.min(size.X.Offset, maxW)
+    local h = math.min(size.Y.Offset, maxH)
+    return UDim2.new(0, w, 0, h)
+end
+
 function Window.new(config)
     config = config or {}
     local title = config.Title or "Selenix"
@@ -2241,9 +2336,12 @@ function Window.new(config)
         -- config.Loading (optional): { Manual = bool, WaitForGameLoaded = bool,
         -- PreloadIcon = bool } — see _buildLoadingScreen / SetLoadingProgress.
         _loadingConfig = config.Loading or {},
+        -- Flag -> component object registry, populated by Tab:CreateXxx({Flag=...})
+        -- and consumed by SaveConfig/LoadConfig below.
+        _flags = {},
     }, Window)
 
-    self:_buildChrome(title, size)
+    self:_buildChrome(title, fitToViewport(size))
     self:_buildNotificationLayer()
     return self
 end
@@ -2426,6 +2524,7 @@ function Window:_buildChrome(title, originalSize)
 
     self:_setupResize(mainFrame, originalSize)
     self:_setupMinimize(mainFrame, minimizeBtn)
+    self:_setupViewportRefit(mainFrame)
 
     -- Theme subscription for chrome pieces. isInitial=true on the first
     -- (synchronous) call snaps every color instantly; every call after that
@@ -2454,6 +2553,25 @@ function Window:_buildChrome(title, originalSize)
 
         self:_restyleTabButtons(color, accent)
     end)
+end
+
+-- Re-fits mainFrame whenever the viewport changes (device rotation, window
+-- resize on PC, etc), as long as the user isn't actively dragging/resizing/
+-- minimizing it (those all manage mainFrame.Size/Position themselves and
+-- would fight this). Uses the same fitToViewport() clamp as the initial
+-- Size, and keeps self._currentTargetSize (used by _setupMinimize's
+-- restore step) in sync so restoring from minimized doesn't snap back to a
+-- stale pre-refit size.
+function Window:_setupViewportRefit(mainFrame)
+    local connMgr = self._connMgr
+    connMgr:Track(workspace.CurrentCamera:GetPropertyChangedSignal("ViewportSize"):Connect(function()
+        if self._minimized or self._resizing or self._animating or self._titleDragging then return end
+        local fitted = fitToViewport(mainFrame.Size)
+        if fitted ~= mainFrame.Size then
+            Animator.Tween(mainFrame, { Size = fitted }, 0.25):Play()
+            self._currentTargetSize = fitted
+        end
+    end))
 end
 
 -- The loading screen's progress bar now reflects REAL work instead of a
@@ -2697,9 +2815,19 @@ end
 
 function Window:_setupResize(mainFrame, originalSize)
     local connMgr = self._connMgr
-    local MIN_W, MIN_H, MAX_W, MAX_H = 340, 260, 700, 650
+    local MIN_W, MIN_H = 340, 260
     self._currentTargetSize = originalSize
     self._resizing = false
+
+    -- MAX_W/MAX_H are now computed from the live viewport (minus the same
+    -- margin fitToViewport uses) instead of fixed 700/650 constants, so a
+    -- manual resize-drag can't grow the window past the edges of a small
+    -- screen either.
+    local function maxSize()
+        local viewport = workspace.CurrentCamera.ViewportSize
+        return math.max(viewport.X - VIEWPORT_MARGIN, MIN_W),
+               math.max(viewport.Y - VIEWPORT_MARGIN, MIN_H)
+    end
 
     local handle = Instance.new("TextButton")
     handle.AnchorPoint = Vector2.new(1, 1)
@@ -2765,6 +2893,7 @@ function Window:_setupResize(mainFrame, originalSize)
         if self._resizing and input == activeInput
             and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
             local delta = input.Position - dragStart
+            local MAX_W, MAX_H = maxSize()
             local w = math.clamp(startSize.X.Offset + delta.X, MIN_W, MAX_W)
             local h = math.clamp(startSize.Y.Offset + delta.Y, MIN_H, MAX_H)
             -- Position untouched: with the top-left anchor set above, the
@@ -3042,6 +3171,7 @@ function Window:CreateTab(name)
         _button = btn,
         _theme = theme,
         _connMgr = connMgr,
+        _window = self, -- lets TabMeta:CreateXxx register Flags on Window:_flags
         _order = 0,
     }, TabMeta)
     table.insert(self._tabs, tab)
@@ -3063,6 +3193,88 @@ end
 
 function Window:GetTheme() return self._theme end
 function Window:GetGradients() return self._gradients end
+
+--============================================================
+-- MODULE: Config (Flags + Save/Load)
+-- Any control created via Tab:CreateXxx({..., Flag = "uniqueName"}) is
+-- registered here (see TabMeta:CreateXxx below). SaveConfig(name) reads
+-- every registered control's current value via :Get() and writes it to
+-- a JSON file; LoadConfig(name) reads that file back and calls :Set() on
+-- each matching control. Both are wrapped in pcall and check for the
+-- executor globals (writefile/readfile/isfile/makefolder/isfolder) since
+-- not every executor exposes them — callers should check the returned
+-- boolean rather than assume success.
+--============================================================
+function Window:_registerFlag(flag, obj)
+    if not flag then return end
+    self._flags[flag] = obj
+end
+
+local function configFolder()
+    if not (isfolder and makefolder) then return nil end
+    local folder = "Selenix/Config"
+    if not isfolder(folder) then makefolder(folder) end
+    return folder
+end
+
+-- Serializes every registered flag's current value to
+-- Selenix/Config/<name>.json. Color3 values can't be JSON-encoded
+-- directly, so they're wrapped as {__color3=true, r,g,b} and unwrapped
+-- again in LoadConfig.
+function Window:SaveConfig(name)
+    if not writefile then return false, "executor has no writefile" end
+
+    local folder = configFolder()
+    local path = (folder and (folder .. "/") or "") .. (name or "default") .. ".json"
+
+    local data = {}
+    for flag, obj in pairs(self._flags) do
+        if obj.Get then
+            local ok, v = pcall(function() return obj:Get() end)
+            if ok then
+                if typeof(v) == "Color3" then
+                    data[flag] = { __color3 = true, r = v.R, g = v.G, b = v.B }
+                else
+                    data[flag] = v
+                end
+            end
+        end
+    end
+
+    local okEncode, encoded = pcall(HttpService.JSONEncode, HttpService, data)
+    if not okEncode then return false, "JSONEncode failed" end
+    local okWrite = pcall(writefile, path, encoded)
+    if not okWrite then return false, "writefile failed" end
+    return true
+end
+
+-- Reads Selenix/Config/<name>.json (if present) and calls :Set(value) on
+-- every registered flag whose name appears in the saved data. Controls
+-- without a :Set() method (older custom components, etc) are silently
+-- skipped rather than erroring the whole load.
+function Window:LoadConfig(name)
+    if not (readfile and isfile) then return false, "executor has no readfile/isfile" end
+
+    local folder = configFolder()
+    local path = (folder and (folder .. "/") or "") .. (name or "default") .. ".json"
+    if not isfile(path) then return false, "config file not found" end
+
+    local okRead, raw = pcall(readfile, path)
+    if not okRead then return false, "readfile failed" end
+    local okDecode, data = pcall(HttpService.JSONDecode, HttpService, raw)
+    if not okDecode or type(data) ~= "table" then return false, "JSONDecode failed" end
+
+    for flag, obj in pairs(self._flags) do
+        local v = data[flag]
+        if v ~= nil and obj.Set then
+            if type(v) == "table" and v.__color3 then
+                v = Color3.new(v.r, v.g, v.b)
+            end
+            pcall(function() obj:Set(v) end)
+        end
+    end
+    return true
+end
 
 --============================================================
 -- Notification layer
@@ -3136,7 +3348,9 @@ end
 
 --============================================================
 -- Tab methods
--- Thin wrappers that assign a LayoutOrder and forward to Components.*
+-- Thin wrappers that assign a LayoutOrder and forward to Components.*.
+-- Every control-creating method also registers opts.Flag (if given) into
+-- Window._flags so SaveConfig/LoadConfig can find it.
 --============================================================
 local function nextOrder(tab)
     tab._order = tab._order + 1
@@ -3156,32 +3370,44 @@ end
 function TabMeta:CreateToggle(opts)
     opts = opts or {}
     opts.LayoutOrder = nextOrder(self)
-    return Components.Toggle(self._page, self._theme, self._connMgr, opts)
+    local obj = Components.Toggle(self._page, self._theme, self._connMgr, opts)
+    self._window:_registerFlag(opts.Flag, obj)
+    return obj
 end
 function TabMeta:CreateSlider(opts)
     opts = opts or {}
     opts.LayoutOrder = nextOrder(self)
-    return Components.Slider(self._page, self._theme, self._connMgr, opts)
+    local obj = Components.Slider(self._page, self._theme, self._connMgr, opts)
+    self._window:_registerFlag(opts.Flag, obj)
+    return obj
 end
 function TabMeta:CreateTextbox(opts)
     opts = opts or {}
     opts.LayoutOrder = nextOrder(self)
-    return Components.Textbox(self._page, self._theme, self._connMgr, opts)
+    local obj = Components.Textbox(self._page, self._theme, self._connMgr, opts)
+    self._window:_registerFlag(opts.Flag, obj)
+    return obj
 end
 function TabMeta:CreateDropdown(opts)
     opts = opts or {}
     opts.LayoutOrder = nextOrder(self)
-    return Components.Dropdown(self._page, self._theme, self._connMgr, opts)
+    local obj = Components.Dropdown(self._page, self._theme, self._connMgr, opts)
+    self._window:_registerFlag(opts.Flag, obj)
+    return obj
 end
 function TabMeta:CreateMultiDropdown(opts)
     opts = opts or {}
     opts.LayoutOrder = nextOrder(self)
-    return Components.MultiDropdown(self._page, self._theme, self._connMgr, opts)
+    local obj = Components.MultiDropdown(self._page, self._theme, self._connMgr, opts)
+    self._window:_registerFlag(opts.Flag, obj)
+    return obj
 end
 function TabMeta:CreateColorPicker(opts)
     opts = opts or {}
     opts.LayoutOrder = nextOrder(self)
-    return Components.ColorPicker(self._page, self._theme, self._connMgr, opts)
+    local obj = Components.ColorPicker(self._page, self._theme, self._connMgr, opts)
+    self._window:_registerFlag(opts.Flag, obj)
+    return obj
 end
 function TabMeta:CreateThemeGrid(opts)
     opts = opts or {}
