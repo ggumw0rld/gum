@@ -640,10 +640,16 @@ function Components.Toggle(parent, theme, connMgr, opts)
     local function restyle(instant)
         local darkBg = Utils.Darken(theme.Color, 0.8)
         local trackColor = state and Utils.Brighten(theme.Accent, 1.15) or darkBg
+        -- Knob color is computed for contrast against its own track color
+        -- (not a fixed light gray) so it stays visible whether the track is
+        -- currently the dark "off" background or the brightened accent
+        -- "on" color, and on light themes where a fixed light knob would
+        -- otherwise wash out against a light track.
+        local knobColor = Utils.GetTextColorFor(trackColor, theme.Accent)
         local knobX = state and (52 - 22 - 3) or 3
         local info = TweenInfo.new(instant and 0 or 0.3, EASE, EASE_OUT)
         TweenService:Create(track, info, { BackgroundColor3 = trackColor }):Play()
-        TweenService:Create(knob, info, { Position = UDim2.new(0, knobX, 0.5, 0) }):Play()
+        TweenService:Create(knob, info, { Position = UDim2.new(0, knobX, 0.5, 0), BackgroundColor3 = knobColor }):Play()
     end
 
     connMgr:Track(track.MouseButton1Click:Connect(function()
@@ -799,16 +805,23 @@ function Components.Slider(parent, theme, connMgr, opts)
         local panelBg = Utils.Brighten(color, 1.2)
         local textColor = Utils.GetTextColorFor(panelBg, accent)
         local darkBg = Utils.Darken(color, 0.8)
+        -- The drag handle is 20px tall against a 4px bar, so most of its
+        -- visible area actually sits over the panel background rather than
+        -- the thin track/fill strip beneath it — same contrast-safe color
+        -- as the label, reusing `textColor`, keeps it themed instead of a
+        -- fixed white that used to wash out on light themes.
         if isInitial then
             frame.BackgroundColor3 = panelBg
             label.TextColor3 = textColor
             bar.BackgroundColor3 = darkBg
             fill.BackgroundColor3 = accent
+            drag.BackgroundColor3 = textColor
         else
             TweenService:Create(frame, THEME_TWEEN_INFO, { BackgroundColor3 = panelBg }):Play()
             TweenService:Create(label, THEME_TWEEN_INFO, { TextColor3 = textColor }):Play()
             TweenService:Create(bar, THEME_TWEEN_INFO, { BackgroundColor3 = darkBg }):Play()
             TweenService:Create(fill, THEME_TWEEN_INFO, { BackgroundColor3 = accent }):Play()
+            TweenService:Create(drag, THEME_TWEEN_INFO, { BackgroundColor3 = textColor }):Play()
         end
     end
     theme:Subscribe(function(c, a, initial) self:ApplyTheme(c, a, initial) end)
