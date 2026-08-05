@@ -3372,6 +3372,22 @@ function Window:ListConfigs()
     return names
 end
 
+-- Deletes Selenix/Config/<name>.json. Wrapped in pcall since not every
+-- executor exposes delfile; returns false with a reason string (not an
+-- error) when the config doesn't exist or the executor can't delete
+-- files, so callers can surface it via Notify() the same way Save/Load do.
+function Window:DeleteConfig(name)
+    if not delfile then return false, "executor has no delfile" end
+    if not (name and name ~= "") then return false, "config name is empty" end
+
+    local path = configPath(name)
+    if not (isfile and isfile(path)) then return false, "config file not found" end
+
+    local okDelete = pcall(delfile, path)
+    if not okDelete then return false, "delfile failed" end
+    return true
+end
+
 --============================================================
 -- Notification layer
 -- Independent of mainFrame (parented directly to the ScreenGui) so
@@ -3520,17 +3536,18 @@ end
 -- ---------- CreateConfigList ----------
 -- Ready-made "Config List" section: a Dropdown listing every config
 -- already saved on disk (Window:ListConfigs()), a Textbox to name a new
--- (or existing) config, and Save/Load buttons. This is the piece that was
--- actually missing before — SaveConfig/LoadConfig only worked if the
--- consumer script already knew a config's name, and the Dropdown
+-- (or existing) config, and Save/Load/Delete buttons. This is the piece
+-- that was actually missing before — SaveConfig/LoadConfig only worked if
+-- the consumer script already knew a config's name, and the Dropdown
 -- component had no way to repopulate its options after a new file was
--- saved (fixed above via Components.Dropdown:Refresh).
+-- saved or an old one deleted (fixed above via Components.Dropdown:Refresh).
 --
 -- opts (all optional):
 --   Text          -- dropdown label, default "Config đã lưu:"
 --   NameText      -- textbox label, default "Tên config:"
 --   SaveText      -- save button text, default "Lưu Config"
 --   LoadText      -- load button text, default "Tải Config"
+--   DeleteText    -- delete button text, default "Xoá Config"
 --   AutoLoadLast  -- if true, immediately loads the most recent (last in
 --                    the sorted list) saved config, if any, right after
 --                    building this section
@@ -3580,6 +3597,27 @@ function TabMeta:CreateConfigList(opts)
                 window:Notify({
                     Title = ok and "Đã tải" or "Lỗi",
                     Text = ok and ("Đã tải config \"" .. name .. "\"") or (err or "Không thể tải config"),
+                    Type = ok and "success" or "error",
+                })
+            end
+        end,
+    })
+
+    self:CreateButton({
+        Text = opts.DeleteText or "Xoá Config",
+        Callback = function()
+            local name = nameBox:Get()
+            local ok, err = window:DeleteConfig(name)
+            -- Don't keep the current dropdown selection here (unlike Save)
+            -- — the entry that was just selected/typed is the one that no
+            -- longer exists on disk, so falling back to whatever's first
+            -- in the refreshed list is the correct behavior.
+            refreshList(false)
+            if ok then nameBox:Set("") end
+            if window.Notify then
+                window:Notify({
+                    Title = ok and "Đã xoá" or "Lỗi",
+                    Text = ok and ("Đã xoá config \"" .. name .. "\"") or (err or "Không thể xoá config"),
                     Type = ok and "success" or "error",
                 })
             end
