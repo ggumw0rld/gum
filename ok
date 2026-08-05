@@ -1865,9 +1865,13 @@ function Components.GradientPicker(parent, theme, connMgr, opts)
         toggleLabel.Text = (opts.Text or "Chế độ Gradient") .. ": " .. (enabled and "Bật" or "Tắt")
         local darkBg = Utils.Darken(theme.Color, 0.8)
         local trackColor = enabled and Utils.Brighten(theme.Accent, 1.15) or darkBg
+        -- Same contrast-against-track logic as Components.Toggle's knob —
+        -- this toggle used to hardcode a fixed light-gray knob that never
+        -- got retinted here or in ApplyTheme below.
+        local knobColor = Utils.GetTextColorFor(trackColor, theme.Accent)
         local knobX = enabled and (52 - 22 - 3) or 3
         TweenService:Create(track, TweenInfo.new(0.3, EASE, EASE_OUT), { BackgroundColor3 = trackColor }):Play()
-        TweenService:Create(knob, TweenInfo.new(0.3, EASE, EASE_OUT), { Position = UDim2.new(0, knobX, 0.5, 0) }):Play()
+        TweenService:Create(knob, TweenInfo.new(0.3, EASE, EASE_OUT), { Position = UDim2.new(0, knobX, 0.5, 0), BackgroundColor3 = knobColor }):Play()
         for _, entry in ipairs(gradients) do entry.Gradient.Enabled = enabled end
         if enabled then pushGradientColors(true) end
     end
@@ -1932,14 +1936,17 @@ function Components.GradientPicker(parent, theme, connMgr, opts)
         -- when `enabled` was false, so picking a new theme while gradient
         -- mode was ON left the toggle showing the *old* accent color.
         local trackColor = enabled and Utils.Brighten(accent, 1.15) or Utils.Darken(color, 0.8)
+        local knobColor = Utils.GetTextColorFor(trackColor, accent)
         if isInitial then
             toggleFrame.BackgroundColor3 = panelBg
             toggleLabel.TextColor3 = textColor
             track.BackgroundColor3 = trackColor
+            knob.BackgroundColor3 = knobColor
         else
             TweenService:Create(toggleFrame, THEME_TWEEN_INFO, { BackgroundColor3 = panelBg }):Play()
             TweenService:Create(toggleLabel, THEME_TWEEN_INFO, { TextColor3 = textColor }):Play()
             TweenService:Create(track, THEME_TWEEN_INFO, { BackgroundColor3 = trackColor }):Play()
+            TweenService:Create(knob, THEME_TWEEN_INFO, { BackgroundColor3 = knobColor }):Play()
         end
         if enabled and not selectedIndex then
             pushGradientColors(isInitial)
