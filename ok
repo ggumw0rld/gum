@@ -170,6 +170,18 @@
          (Completed / manual completion callback), instead of guessing
          durations or running fade and resize in parallel.
     ============================================================
+
+    PATCH NOTES (this copy — Additions merged in):
+      Merged in the "ADDITIONS" drop-in patch:
+        - Components.Divider    (section header / separator line)
+        - Components.Paragraph  (title + wrapped body text, optional collapse)
+        - Components.Dropdown / Components.MultiDropdown now support
+          opts.Searchable = true (adds a filter textbox above the option
+          list; rows are filtered via Visible so filtering stays cheap,
+          and the filter clears whenever the dropdown closes).
+        - TabMeta:CreateDivider / TabMeta:CreateParagraph wrappers added
+          alongside the other TabMeta:CreateXxx methods.
+    ============================================================
 ]]
 
 local TweenService = game:GetService("TweenService")
@@ -909,6 +921,170 @@ function Components.Textbox(parent, theme, connMgr, opts)
     return self
 end
 
+-- ---------- Divider / Section ----------
+-- A section header used to visually group controls within a tab. Renders
+-- optional title text plus a thin horizontal rule; unlike Label, this is
+-- meant purely as a layout separator, not a themed panel background.
+--
+-- opts: { Text (optional), Size (optional) }
+function Components.Divider(parent, theme, connMgr, opts)
+    opts = opts or {}
+    local hasText = opts.Text and opts.Text ~= ""
+
+    local holder = Instance.new("Frame")
+    holder.Size = opts.Size or UDim2.new(1, 0, 0, hasText and 30 or 14)
+    holder.LayoutOrder = opts.LayoutOrder or 0
+    holder.BackgroundTransparency = 1
+    holder.Parent = parent
+
+    local label
+    if hasText then
+        label = Instance.new("TextLabel")
+        label.Size = UDim2.new(1, 0, 0, 18)
+        label.Position = UDim2.new(0, 0, 0, 0)
+        label.BackgroundTransparency = 1
+        label.Text = opts.Text
+        label.TextXAlignment = Enum.TextXAlignment.Left
+        label.Font = Enum.Font.GothamBold
+        label.TextSize = 13
+        label.Parent = holder
+        Utils.AddPadding(label, UDim.new(0, 2))
+    end
+
+    local line = Instance.new("Frame")
+    line.Size = UDim2.new(1, 0, 0, 1)
+    line.Position = UDim2.new(0, 0, 1, -1)
+    line.BorderSizePixel = 0
+    line.Parent = holder
+    Utils.AddCorner(line, UDim.new(1, 0))
+
+    local self = { Instance = holder }
+    function self:ApplyTheme(color, accent, isInitial)
+        local darkBg = Utils.Darken(color, 0.8)
+        local textColor = Utils.GetTextColorFor(color, accent)
+        -- Muted the same way Components.Label does for opts.Muted, since a
+        -- section title should read as secondary, not primary, text.
+        local mutedText = (Utils.GetLuminance(color) > 0.55)
+            and Color3.new(textColor.R * 0.6, textColor.G * 0.6, textColor.B * 0.6)
+            or Color3.new(0.55 + textColor.R * 0.25, 0.55 + textColor.G * 0.25, 0.55 + textColor.B * 0.25)
+        if isInitial then
+            if label then label.TextColor3 = mutedText end
+            line.BackgroundColor3 = darkBg
+        else
+            if label then TweenService:Create(label, THEME_TWEEN_INFO, { TextColor3 = mutedText }):Play() end
+            TweenService:Create(line, THEME_TWEEN_INFO, { BackgroundColor3 = darkBg }):Play()
+        end
+    end
+    theme:Subscribe(function(c, a, initial) self:ApplyTheme(c, a, initial) end)
+    return self
+end
+
+-- ---------- Paragraph ----------
+-- A block of wrapped body text under a bold title. Optionally collapsible
+-- (opts.Collapsible = true) so a long explanation can start hidden and be
+-- expanded on click, matching the same header-click affordance as
+-- ExpandableHeader-based controls (Dropdown/ColorPicker/etc), but without
+-- a themed panel background of its own — it sits directly on the tab page
+-- like Components.Label does.
+--
+-- opts: { Title, Text, Collapsible (default false), DefaultOpen (default false) }
+function Components.Paragraph(parent, theme, connMgr, opts)
+    opts = opts or {}
+    local collapsible = opts.Collapsible == true
+    local open = (not collapsible) or (opts.DefaultOpen == true)
+
+    local holder = Instance.new(collapsible and "TextButton" or "Frame")
+    holder.Size = opts.Size or UDim2.new(1, 0, 0, 0)
+    holder.AutomaticSize = Enum.AutomaticSize.Y
+    holder.LayoutOrder = opts.LayoutOrder or 0
+    holder.BackgroundTransparency = 1
+    if collapsible then
+        holder.Text = ""
+        holder.AutoButtonColor = false
+    end
+    holder.Parent = parent
+
+    local inner = Instance.new("Frame")
+    inner.Size = UDim2.new(1, 0, 0, 0)
+    inner.AutomaticSize = Enum.AutomaticSize.Y
+    inner.BackgroundTransparency = 1
+    inner.Parent = holder
+    local layout = Instance.new("UIListLayout")
+    layout.Padding = UDim.new(0, 4)
+    layout.Parent = inner
+    Utils.AddPadding(inner, UDim.new(0, 15), UDim.new(0, 15), UDim.new(0, 8), UDim.new(0, 8))
+
+    local titleRow = Instance.new("Frame")
+    titleRow.Size = UDim2.new(1, 0, 0, 20)
+    titleRow.LayoutOrder = 1
+    titleRow.BackgroundTransparency = 1
+    titleRow.Parent = inner
+
+    local titleLabel = Instance.new("TextLabel")
+    titleLabel.Size = UDim2.new(1, -20, 1, 0)
+    titleLabel.BackgroundTransparency = 1
+    titleLabel.Text = opts.Title or ""
+    titleLabel.TextXAlignment = Enum.TextXAlignment.Left
+    titleLabel.Font = Enum.Font.GothamBold
+    titleLabel.TextSize = 15
+    titleLabel.Parent = titleRow
+
+    local arrow
+    if collapsible then
+        arrow = Instance.new("TextLabel")
+        arrow.AnchorPoint = Vector2.new(1, 0.5)
+        arrow.Position = UDim2.new(1, 0, 0.5, 0)
+        arrow.Size = UDim2.new(0, 18, 0, 18)
+        arrow.BackgroundTransparency = 1
+        arrow.Text = "▾"
+        arrow.Rotation = open and 180 or 0
+        arrow.Font = Enum.Font.GothamBold
+        arrow.TextSize = 14
+        arrow.Parent = titleRow
+    end
+
+    local body = Instance.new("TextLabel")
+    body.Size = UDim2.new(1, 0, 0, 0)
+    body.AutomaticSize = Enum.AutomaticSize.Y
+    body.LayoutOrder = 2
+    body.BackgroundTransparency = 1
+    body.Text = opts.Text or ""
+    body.TextWrapped = true
+    body.TextXAlignment = Enum.TextXAlignment.Left
+    body.TextYAlignment = Enum.TextYAlignment.Top
+    body.Font = Enum.Font.Gotham
+    body.TextSize = 13
+    body.Visible = open
+    body.Parent = inner
+
+    if collapsible then
+        connMgr:Track(holder.MouseButton1Click:Connect(function()
+            open = not open
+            body.Visible = open
+            TweenService:Create(arrow, TweenInfo.new(0.25, EASE, EASE_OUT), { Rotation = open and 180 or 0 }):Play()
+        end))
+    end
+
+    local self = { Instance = holder }
+    function self:ApplyTheme(color, accent, isInitial)
+        local titleColor = Utils.GetTextColorFor(color, accent)
+        local bodyColor = (Utils.GetLuminance(color) > 0.55)
+            and Color3.new(titleColor.R * 0.7, titleColor.G * 0.7, titleColor.B * 0.7)
+            or Color3.new(0.7 + titleColor.R * 0.3, 0.7 + titleColor.G * 0.3, 0.7 + titleColor.B * 0.3)
+        if isInitial then
+            titleLabel.TextColor3 = titleColor
+            body.TextColor3 = bodyColor
+            if arrow then arrow.TextColor3 = titleColor end
+        else
+            TweenService:Create(titleLabel, THEME_TWEEN_INFO, { TextColor3 = titleColor }):Play()
+            TweenService:Create(body, THEME_TWEEN_INFO, { TextColor3 = bodyColor }):Play()
+            if arrow then TweenService:Create(arrow, THEME_TWEEN_INFO, { TextColor3 = titleColor }):Play() end
+        end
+    end
+    theme:Subscribe(function(c, a, initial) self:ApplyTheme(c, a, initial) end)
+    return self
+end
+
 -- ---------- ExpandableHeader ----------
 -- Shared "header row that expands into a body panel" used by Dropdown,
 -- MultiDropdown and ColorPicker. Collapses three near-identical blocks
@@ -1010,13 +1186,22 @@ function Components.ExpandableHeader(parent, theme, connMgr, opts)
 end
 
 -- ---------- Dropdown (single select) ----------
+-- Supports opts.Searchable = true, which adds a filter TextBox above the
+-- option list. Typing filters rows by a case-insensitive substring match
+-- on their text (Visible toggled per-row; UIListLayout ignores invisible
+-- children, so the list reflows automatically with no manual
+-- repositioning needed). opts.SearchPlaceholder overrides the placeholder
+-- text. The filter clears whenever the dropdown closes.
 function Components.Dropdown(parent, theme, connMgr, opts)
     local optionHeight = 32
+    local searchable = opts.Searchable == true
+    local SEARCH_ROW_HEIGHT = 34
     local optionButtons = {}
     local options, selected
 
     local function bodyHeightFor(count)
-        return count * optionHeight + math.max(count - 1, 0) * 6
+        local base = count * optionHeight + math.max(count - 1, 0) * 6
+        return searchable and (base + SEARCH_ROW_HEIGHT) or base
     end
 
     options = opts.Options or {}
@@ -1041,8 +1226,47 @@ function Components.Dropdown(parent, theme, connMgr, opts)
     valueLabel.TextTruncate = Enum.TextTruncate.AtEnd
     valueLabel.Parent = exp.Header
 
+    -- Search row (only built when Searchable is true)
+    local searchBox
+    if searchable then
+        local searchHolder = Instance.new("Frame")
+        searchHolder.Size = UDim2.new(1, 0, 0, 28)
+        searchHolder.LayoutOrder = 0
+        searchHolder.BackgroundTransparency = 1
+        searchHolder.Parent = exp.Body
+
+        searchBox = Instance.new("TextBox")
+        searchBox.Size = UDim2.new(1, 0, 1, 0)
+        searchBox.Text = ""
+        searchBox.PlaceholderText = opts.SearchPlaceholder or "Tìm kiếm..."
+        searchBox.PlaceholderColor3 = Color3.fromRGB(150, 150, 160)
+        searchBox.TextColor3 = Color3.fromRGB(255, 255, 255)
+        searchBox.Font = Enum.Font.Gotham
+        searchBox.TextSize = 13
+        searchBox.ClearTextOnFocus = false
+        searchBox.TextXAlignment = Enum.TextXAlignment.Left
+        searchBox.Parent = searchHolder
+        Utils.AddPadding(searchBox, UDim.new(0, 10))
+        Utils.AddCorner(searchBox, UDim.new(0, 6))
+
+        local searchStroke = Instance.new("UIStroke")
+        searchStroke.Thickness = 1.5
+        searchStroke.Transparency = 1
+        searchStroke.Parent = searchBox
+        connMgr:Track(searchBox.Focused:Connect(function()
+            TweenService:Create(searchStroke, TweenInfo.new(0.25, EASE, EASE_OUT), { Transparency = 0 }):Play()
+        end))
+        connMgr:Track(searchBox.FocusLost:Connect(function()
+            TweenService:Create(searchStroke, TweenInfo.new(0.25, EASE, EASE_OUT), { Transparency = 1 }):Play()
+        end))
+
+        exp._searchHolder = searchHolder
+        exp._searchStroke = searchStroke
+    end
+
     local list = Instance.new("Frame")
     list.Size = UDim2.new(1, 0, 1, 0)
+    list.Position = searchable and UDim2.new(0, 0, 0, SEARCH_ROW_HEIGHT) or UDim2.new(0, 0, 0, 0)
     list.BackgroundTransparency = 1
     list.Parent = exp.Body
     local layout = Instance.new("UIListLayout")
@@ -1064,6 +1288,17 @@ function Components.Dropdown(parent, theme, connMgr, opts)
             }):Play()
         end
         if opts.Callback then opts.Callback(text) end
+    end
+
+    -- Filters existing rows by Visible instead of destroying/rebuilding
+    -- them, so filtering while typing stays cheap (no Instance churn per
+    -- keystroke). UIListLayout automatically skips invisible children, so
+    -- the visible rows reflow with no gaps.
+    local function applyFilter(query)
+        query = (query or ""):lower()
+        for _, row in ipairs(optionButtons) do
+            row.btn.Visible = (query == "") or row.text:lower():find(query, 1, true) ~= nil
+        end
     end
 
     -- Rebuilds the option rows in `list` from the `options` array. Used both
@@ -1099,8 +1334,26 @@ function Components.Dropdown(parent, theme, connMgr, opts)
 
             table.insert(optionButtons, { btn = btn, text = text })
         end
+
+        if searchable then applyFilter(searchBox.Text) end
     end
     rebuildOptions()
+
+    if searchable then
+        connMgr:Track(searchBox:GetPropertyChangedSignal("Text"):Connect(function()
+            applyFilter(searchBox.Text)
+        end))
+        -- Clear the filter (and refocus the list) whenever the dropdown
+        -- closes, so reopening it always starts from the full list.
+        local origToggle = opts.OnToggle
+        opts.OnToggle = function(isOpen)
+            if not isOpen then
+                searchBox.Text = ""
+                applyFilter("")
+            end
+            if origToggle then origToggle(isOpen) end
+        end
+    end
 
     local self = { Instance = exp.Container }
     function self:Get() return selected end
@@ -1134,17 +1387,30 @@ function Components.Dropdown(parent, theme, connMgr, opts)
         local panelBg = Utils.Brighten(color, 1.2)
         local headerTextColor = Utils.GetTextColorFor(panelBg, accent)
         local valueTextColor = (Utils.GetLuminance(panelBg) > 0.55) and Color3.fromRGB(90, 90, 100) or Color3.fromRGB(190, 190, 200)
+        local darkBg = Utils.Darken(color, 0.8)
         if isInitial then
             exp.Header.BackgroundColor3 = panelBg
             exp.TitleLabel.TextColor3 = headerTextColor
             valueLabel.TextColor3 = valueTextColor
             for _, row in ipairs(optionButtons) do row.btn.BackgroundColor3 = baseColorFor(row.text) end
+            if searchable then
+                searchBox.BackgroundColor3 = darkBg
+                searchBox.TextColor3 = Utils.GetTextColorFor(darkBg, accent)
+                exp._searchStroke.Color = accent
+            end
         else
             TweenService:Create(exp.Header, THEME_TWEEN_INFO, { BackgroundColor3 = panelBg }):Play()
             TweenService:Create(exp.TitleLabel, THEME_TWEEN_INFO, { TextColor3 = headerTextColor }):Play()
             TweenService:Create(valueLabel, THEME_TWEEN_INFO, { TextColor3 = valueTextColor }):Play()
             for _, row in ipairs(optionButtons) do
                 TweenService:Create(row.btn, THEME_TWEEN_INFO, { BackgroundColor3 = baseColorFor(row.text) }):Play()
+            end
+            if searchable then
+                TweenService:Create(searchBox, THEME_TWEEN_INFO, {
+                    BackgroundColor3 = darkBg,
+                    TextColor3 = Utils.GetTextColorFor(darkBg, accent),
+                }):Play()
+                TweenService:Create(exp._searchStroke, THEME_TWEEN_INFO, { Color = accent }):Play()
             end
         end
     end
@@ -1153,10 +1419,14 @@ function Components.Dropdown(parent, theme, connMgr, opts)
 end
 
 -- ---------- MultiDropdown ----------
+-- Same opts.Searchable support as Dropdown above.
 function Components.MultiDropdown(parent, theme, connMgr, opts)
     local options = opts.Options or {}
     local optionHeight = 32
+    local searchable = opts.Searchable == true
+    local SEARCH_ROW_HEIGHT = 34
     local bodyHeight = #options * optionHeight + math.max(#options - 1, 0) * 6
+    if searchable then bodyHeight = bodyHeight + SEARCH_ROW_HEIGHT end
     local selectedSet = {}
     for _, v in ipairs(opts.Default or {}) do selectedSet[v] = true end
 
@@ -1189,8 +1459,45 @@ function Components.MultiDropdown(parent, theme, connMgr, opts)
     valueLabel.TextTruncate = Enum.TextTruncate.AtEnd
     valueLabel.Parent = exp.Header
 
+    local searchBox
+    if searchable then
+        local searchHolder = Instance.new("Frame")
+        searchHolder.Size = UDim2.new(1, 0, 0, 28)
+        searchHolder.LayoutOrder = 0
+        searchHolder.BackgroundTransparency = 1
+        searchHolder.Parent = exp.Body
+
+        searchBox = Instance.new("TextBox")
+        searchBox.Size = UDim2.new(1, 0, 1, 0)
+        searchBox.Text = ""
+        searchBox.PlaceholderText = opts.SearchPlaceholder or "Tìm kiếm..."
+        searchBox.PlaceholderColor3 = Color3.fromRGB(150, 150, 160)
+        searchBox.TextColor3 = Color3.fromRGB(255, 255, 255)
+        searchBox.Font = Enum.Font.Gotham
+        searchBox.TextSize = 13
+        searchBox.ClearTextOnFocus = false
+        searchBox.TextXAlignment = Enum.TextXAlignment.Left
+        searchBox.Parent = searchHolder
+        Utils.AddPadding(searchBox, UDim.new(0, 10))
+        Utils.AddCorner(searchBox, UDim.new(0, 6))
+
+        local searchStroke = Instance.new("UIStroke")
+        searchStroke.Thickness = 1.5
+        searchStroke.Transparency = 1
+        searchStroke.Parent = searchBox
+        connMgr:Track(searchBox.Focused:Connect(function()
+            TweenService:Create(searchStroke, TweenInfo.new(0.25, EASE, EASE_OUT), { Transparency = 0 }):Play()
+        end))
+        connMgr:Track(searchBox.FocusLost:Connect(function()
+            TweenService:Create(searchStroke, TweenInfo.new(0.25, EASE, EASE_OUT), { Transparency = 1 }):Play()
+        end))
+
+        exp._searchStroke = searchStroke
+    end
+
     local list = Instance.new("Frame")
     list.Size = UDim2.new(1, 0, 1, 0)
+    list.Position = searchable and UDim2.new(0, 0, 0, SEARCH_ROW_HEIGHT) or UDim2.new(0, 0, 0, 0)
     list.BackgroundTransparency = 1
     list.Parent = exp.Body
     local layout = Instance.new("UIListLayout")
@@ -1217,6 +1524,13 @@ function Components.MultiDropdown(parent, theme, connMgr, opts)
             local out = {}
             for _, t in ipairs(options) do if selectedSet[t] then table.insert(out, t) end end
             opts.Callback(out)
+        end
+    end
+
+    local function applyFilter(query)
+        query = (query or ""):lower()
+        for _, row in ipairs(rows) do
+            row.btn.Visible = (query == "") or row.text:lower():find(query, 1, true) ~= nil
         end
     end
 
@@ -1258,6 +1572,20 @@ function Components.MultiDropdown(parent, theme, connMgr, opts)
         table.insert(rows, { btn = btn, check = check, text = text })
     end
 
+    if searchable then
+        connMgr:Track(searchBox:GetPropertyChangedSignal("Text"):Connect(function()
+            applyFilter(searchBox.Text)
+        end))
+        local origToggle = opts.OnToggle
+        opts.OnToggle = function(isOpen)
+            if not isOpen then
+                searchBox.Text = ""
+                applyFilter("")
+            end
+            if origToggle then origToggle(isOpen) end
+        end
+    end
+
     local self = { Instance = exp.Container }
     function self:Get()
         local out = {}
@@ -1287,17 +1615,30 @@ function Components.MultiDropdown(parent, theme, connMgr, opts)
         local panelBg = Utils.Brighten(color, 1.2)
         local headerTextColor = Utils.GetTextColorFor(panelBg, accent)
         local valueTextColor = (Utils.GetLuminance(panelBg) > 0.55) and Color3.fromRGB(90, 90, 100) or Color3.fromRGB(190, 190, 200)
+        local darkBg = Utils.Darken(color, 0.8)
         if isInitial then
             exp.Header.BackgroundColor3 = panelBg
             exp.TitleLabel.TextColor3 = headerTextColor
             valueLabel.TextColor3 = valueTextColor
             for _, row in ipairs(rows) do row.btn.BackgroundColor3 = baseColorFor(row.text) end
+            if searchable then
+                searchBox.BackgroundColor3 = darkBg
+                searchBox.TextColor3 = Utils.GetTextColorFor(darkBg, accent)
+                exp._searchStroke.Color = accent
+            end
         else
             TweenService:Create(exp.Header, THEME_TWEEN_INFO, { BackgroundColor3 = panelBg }):Play()
             TweenService:Create(exp.TitleLabel, THEME_TWEEN_INFO, { TextColor3 = headerTextColor }):Play()
             TweenService:Create(valueLabel, THEME_TWEEN_INFO, { TextColor3 = valueTextColor }):Play()
             for _, row in ipairs(rows) do
                 TweenService:Create(row.btn, THEME_TWEEN_INFO, { BackgroundColor3 = baseColorFor(row.text) }):Play()
+            end
+            if searchable then
+                TweenService:Create(searchBox, THEME_TWEEN_INFO, {
+                    BackgroundColor3 = darkBg,
+                    TextColor3 = Utils.GetTextColorFor(darkBg, accent),
+                }):Play()
+                TweenService:Create(exp._searchStroke, THEME_TWEEN_INFO, { Color = accent }):Play()
             end
         end
     end
@@ -3531,6 +3872,16 @@ function TabMeta:CreateGradientPicker(opts)
     opts.LayoutOrder = nextOrder(self)
     nextOrder(self) -- GradientPicker also creates the grid one order below
     return Components.GradientPicker(self._page, self._theme, self._connMgr, opts)
+end
+function TabMeta:CreateDivider(opts)
+    opts = opts or {}
+    opts.LayoutOrder = nextOrder(self)
+    return Components.Divider(self._page, self._theme, self._connMgr, opts)
+end
+function TabMeta:CreateParagraph(opts)
+    opts = opts or {}
+    opts.LayoutOrder = nextOrder(self)
+    return Components.Paragraph(self._page, self._theme, self._connMgr, opts)
 end
 
 -- ---------- CreateConfigList ----------
