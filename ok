@@ -1,6 +1,6 @@
 --[[
     ============================================================
-    Selenix UI Library — Modular Rewrite (FIXED)
+    Selenix UI Library — Modular Rewrite (FIXED + Keybind)
     ============================================================
     Same visual/behavioural feature set as the original monolithic
     script, reorganized into independent modules:
@@ -11,7 +11,7 @@
         Window     -> chrome: loading screen, titlebar, drag, resize, minimize
         Components -> factory functions for each control (Button, Label, Toggle, Slider,
                        Textbox, Dropdown, MultiDropdown, ColorPicker, ThemeGrid, GradientPicker,
-                       Notification)
+                       Keybind, Notification)
         Tab        -> a page + its tab button; exposes Tab:AddXxx(opts) which delegates to Components
         Config     -> Flags + SaveConfig/LoadConfig (writefile/readfile via executor)
 
@@ -29,6 +29,20 @@
 
     The window has no in-UI close button / close-confirm dialog — it is
     closed programmatically instead, via `Selenix:Destroy()`.
+
+    CHANGES IN THIS REVISION:
+      * Fix: Dropdown/MultiDropdown row buttons now use their own
+        per-instance ConnectionManager ("rowConnMgr") that is fully
+        disconnected before each Refresh()/rebuild, instead of leaking a
+        growing pile of dead connections into the window's shared
+        ConnectionManager every time :Refresh() is called (e.g. every
+        Save/Delete in CreateConfigList).
+      * New: Components.Keybind + TabMeta:CreateKeybind, following the
+        same {Instance, Get, Set, ApplyTheme} contract as Toggle/Slider/
+        Textbox, so it auto-registers into SaveConfig/LoadConfig via
+        opts.Flag. Includes a per-window "only one Keybind capturing at a
+        time" guard (keybindListening) so rebinding one Keybind can't
+        spuriously fire another Keybind's Pressed() callback.
     ============================================================
 ]]
 
@@ -173,6 +187,15 @@ function ConnectionManager:DisconnectAll()
     end
     table.clear(self._connections)
 end
+
+-- Weak-keyed by connMgr (== per window, since each Window.new gets its own
+-- ConnectionManager). Tracks whether ANY Keybind belonging to that window
+-- is currently capturing input, so other Keybinds on the same window can
+-- suppress their Pressed() callback while a rebind is in progress —
+-- otherwise typing the target key while rebinding Keybind A would also
+-- fire Keybind B's/C's Pressed() if they happen to share that key. Weak
+-- keys mean this table self-cleans once a window's connMgr is GC'd.
+local keybindListening = setmetatable({}, { __mode = "k" })
 
 --============================================================
 -- MODULE: Animator
@@ -1096,6 +1119,15 @@ function Components.Dropdown(parent, theme, connMgr, opts)
     local optionButtons = {}
     local options, selected
 
+    -- FIX: rows are rebuilt on every :Refresh() call (e.g. every Save/Delete
+    -- via CreateConfigList). Previously every row's connections were tracked
+    -- directly on the shared `connMgr`, so destroying+recreating rows left
+    -- the dead connections from the old rows sitting in connMgr forever —
+    -- a slow leak that grows every refresh. rowConnMgr is disconnected in
+    -- full at the top of every rebuild, right before the old buttons are
+    -- destroyed, so only the CURRENT rows' connections are ever alive.
+    local rowConnMgr = ConnectionManager.new()
+
     local function bodyHeightFor(count)
         local base = count * optionHeight + math.max(count - 1, 0) * 6
         return searchable and (base + SEARCH_ROW_HEIGHT) or base
@@ -1197,6 +1229,7 @@ function Components.Dropdown(parent, theme, connMgr, opts)
     -- repopulated at runtime (e.g. a "saved configs" list that changes as
     -- the user saves new ones) instead of being frozen at creation time.
     local function rebuildOptions()
+        rowConnMgr:DisconnectAll() -- drop connections belonging to the OLD rows first
         for _, row in ipairs(optionButtons) do row.btn:Destroy() end
         table.clear(optionButtons)
 
@@ -1213,15 +1246,15 @@ function Components.Dropdown(parent, theme, connMgr, opts)
             btn.Parent = list
             Utils.AddCorner(btn, UDim.new(0, 6))
             Utils.AddPadding(btn, UDim.new(0, 10))
-            Animator.AddThickenStroke(btn, connMgr)
+            Animator.AddThickenStroke(btn, rowConnMgr)
 
-            connMgr:Track(btn.MouseEnter:Connect(function()
+            rowConnMgr:Track(btn.MouseEnter:Connect(function()
                 TweenService:Create(btn, TweenInfo.new(0.18, EASE, EASE_OUT), { BackgroundColor3 = Utils.Brighten(baseColorFor(text), 1.2) }):Play()
             end))
-            connMgr:Track(btn.MouseLeave:Connect(function()
+            rowConnMgr:Track(btn.MouseLeave:Connect(function()
                 TweenService:Create(btn, TweenInfo.new(0.18, EASE, EASE_OUT), { BackgroundColor3 = baseColorFor(text) }):Play()
             end))
-            connMgr:Track(btn.MouseButton1Click:Connect(function() select(text) end))
+            rowConnMgr:Track(btn.MouseButton1Click:Connect(function() select(text) end))
 
             table.insert(optionButtons, { btn = btn, text = text })
         end
@@ -1274,6 +1307,14 @@ function Components.Dropdown(parent, theme, connMgr, opts)
         rebuildOptions()
         valueLabel.Text = selected or ""
     end
+    -- Drops the row-level connections. Not called automatically (the
+    -- Container is normally torn down with the rest of the window via
+    -- connMgr:DisconnectAll()), but exposed for symmetry with the
+    -- {Instance, ApplyTheme, Destroy} component contract and for anyone
+    -- who wants to discard a Dropdown independently of its window.
+    function self:Destroy()
+        rowConnMgr:DisconnectAll()
+    end
     function self:ApplyTheme(color, accent, isInitial)
         local panelBg = Utils.Brighten(color, 1.2)
         local headerTextColor = Utils.GetTextColorFor(panelBg, accent)
@@ -1316,6 +1357,11 @@ function Components.MultiDropdown(parent, theme, connMgr, opts)
     local SEARCH_ROW_HEIGHT = 34
     local selectedSet = {}
     for _, v in ipairs(opts.Default or {}) do selectedSet[v] = true end
+
+    -- Same fix as Dropdown above: row connections live on their own
+    -- ConnectionManager so :Refresh() can drop the old rows' connections
+    -- instead of leaking them into the shared window connMgr.
+    local rowConnMgr = ConnectionManager.new()
 
     local function bodyHeightFor(count)
         local base = count * optionHeight + math.max(count - 1, 0) * 6
@@ -1416,9 +1462,9 @@ function Components.MultiDropdown(parent, theme, connMgr, opts)
     end
 
     -- Rebuilds the option rows in `list` from the `options` array. Used both
-    -- at creation and by :Refresh() below (mirrors Dropdown:Refresh, which
-    -- MultiDropdown previously had no equivalent of).
+    -- at creation and by :Refresh() below (mirrors Dropdown:Refresh).
     local function rebuildRows()
+        rowConnMgr:DisconnectAll() -- drop connections belonging to the OLD rows first
         for _, row in ipairs(rows) do row.btn:Destroy() end
         table.clear(rows)
 
@@ -1448,14 +1494,14 @@ function Components.MultiDropdown(parent, theme, connMgr, opts)
             check.TextTransparency = selectedSet[text] and 0 or 1
             check.Parent = btn
 
-            Animator.AddThickenStroke(btn, connMgr)
-            connMgr:Track(btn.MouseEnter:Connect(function()
+            Animator.AddThickenStroke(btn, rowConnMgr)
+            rowConnMgr:Track(btn.MouseEnter:Connect(function()
                 TweenService:Create(btn, TweenInfo.new(0.18, EASE, EASE_OUT), { BackgroundColor3 = Utils.Brighten(baseColorFor(text), 1.2) }):Play()
             end))
-            connMgr:Track(btn.MouseLeave:Connect(function()
+            rowConnMgr:Track(btn.MouseLeave:Connect(function()
                 TweenService:Create(btn, TweenInfo.new(0.18, EASE, EASE_OUT), { BackgroundColor3 = baseColorFor(text) }):Play()
             end))
-            connMgr:Track(btn.MouseButton1Click:Connect(function() toggle(text) end))
+            rowConnMgr:Track(btn.MouseButton1Click:Connect(function() toggle(text) end))
 
             table.insert(rows, { btn = btn, check = check, text = text })
         end
@@ -1520,6 +1566,10 @@ function Components.MultiDropdown(parent, theme, connMgr, opts)
         exp.SetBodyHeight(bodyHeightFor(#options))
         rebuildRows()
         valueLabel.Text = summaryText()
+    end
+    -- See Dropdown:Destroy above.
+    function self:Destroy()
+        rowConnMgr:DisconnectAll()
     end
     function self:ApplyTheme(color, accent, isInitial)
         local panelBg = Utils.Brighten(color, 1.2)
@@ -2230,6 +2280,142 @@ function Components.GradientPicker(parent, theme, connMgr, opts)
         if enabled and not selectedIndex then
             pushGradientColors(isInitial)
         end
+    end
+    theme:Subscribe(function(c, a, initial) self:ApplyTheme(c, a, initial) end)
+    return self
+end
+
+-- ---------- Keybind ----------
+-- opts: {
+--   Text (label), Default (Enum.KeyCode or nil), EmptyText (shown when
+--   unbound), Flag (for SaveConfig/LoadConfig), Callback(keyCode) — fires
+--   when the user finishes (re)binding a key, Pressed() — fires whenever
+--   the currently-bound key is pressed while NOT rebinding.
+-- }
+--
+-- Click the key button to enter "listening" mode (button shows "..." and
+-- turns accent-colored); the next keyboard key pressed becomes the new
+-- bind (Escape cancels without changing anything). Only one Keybind per
+-- window may listen at a time — see keybindListening above — so rebinding
+-- one Keybind can't accidentally trigger another Keybind's Pressed() for
+-- the same keystroke.
+function Components.Keybind(parent, theme, connMgr, opts)
+    local frame = Instance.new("Frame")
+    frame.Size = opts.Size or UDim2.new(1, 0, 0, 40)
+    frame.LayoutOrder = opts.LayoutOrder or 0
+    frame.Parent = parent
+    Utils.AddCorner(frame, UDim.new(0, 8))
+
+    local label = Instance.new("TextLabel")
+    label.Size = UDim2.new(1, -110, 1, 0)
+    label.Position = UDim2.new(0, 10, 0, 0)
+    label.BackgroundTransparency = 1
+    label.Text = opts.Text or "Phím tắt"
+    label.TextColor3 = Color3.fromRGB(255, 255, 255)
+    label.TextXAlignment = Enum.TextXAlignment.Left
+    label.Font = Enum.Font.GothamBold
+    label.TextSize = 16
+    label.Parent = frame
+
+    local keyBtn = Instance.new("TextButton")
+    keyBtn.AnchorPoint = Vector2.new(1, 0.5)
+    keyBtn.Position = UDim2.new(1, -10, 0.5, 0)
+    keyBtn.Size = UDim2.new(0, 90, 0, 28)
+    keyBtn.AutoButtonColor = false
+    keyBtn.Font = Enum.Font.GothamBold
+    keyBtn.TextSize = 13
+    keyBtn.Parent = frame
+    Utils.AddCorner(keyBtn, UDim.new(0, 6))
+    Animator.AddThickenStroke(keyBtn, connMgr)
+
+    local currentKey = opts.Default
+    local listening = false
+
+    local function keyText()
+        if listening then return "..." end
+        if currentKey then return currentKey.Name end
+        return opts.EmptyText or "Chưa đặt"
+    end
+    keyBtn.Text = keyText()
+
+    local function restyleKeyBtn(instant)
+        local darkBg = Utils.Darken(theme.Color, 0.8)
+        local bg = listening and theme.Accent or darkBg
+        local info = TweenInfo.new(instant and 0 or 0.2, EASE, EASE_OUT)
+        TweenService:Create(keyBtn, info, {
+            BackgroundColor3 = bg,
+            TextColor3 = Utils.GetTextColorFor(bg, theme.Accent),
+        }):Play()
+    end
+
+    local function setListening(v)
+        listening = v
+        keybindListening[connMgr] = v or nil -- clear the key entirely when turning off, so the table doesn't grow
+        keyBtn.Text = keyText()
+        restyleKeyBtn(false)
+    end
+
+    connMgr:Track(keyBtn.MouseButton1Click:Connect(function()
+        -- Don't start listening if some OTHER Keybind on this window is
+        -- already mid-rebind — avoids two controls racing to capture the
+        -- same next keystroke.
+        if not listening and not keybindListening[connMgr] then
+            setListening(true)
+        end
+    end))
+
+    -- Single InputBegan handler covers both roles: capturing a new key
+    -- while listening, and firing Pressed() for the already-bound key
+    -- during normal use — avoids registering two overlapping InputBegan
+    -- connections per Keybind.
+    connMgr:Track(UserInputService.InputBegan:Connect(function(input, processed)
+        if input.UserInputType ~= Enum.UserInputType.Keyboard then return end
+
+        if listening then
+            if input.KeyCode == Enum.KeyCode.Escape then
+                setListening(false)
+                return
+            end
+            currentKey = input.KeyCode
+            setListening(false)
+            if opts.Callback then opts.Callback(currentKey) end
+            return
+        end
+
+        -- While ANY Keybind on this window is mid-rebind, every other
+        -- Keybind suppresses its own Pressed() — the key being typed right
+        -- now is meant to set a new bind elsewhere, not to "use" this one.
+        if not processed and currentKey and input.KeyCode == currentKey
+            and not keybindListening[connMgr] then
+            if opts.Pressed then opts.Pressed() end
+        end
+    end))
+
+    local self = { Instance = frame }
+    -- Returns the key's Name (string) rather than the EnumItem, so it
+    -- round-trips through SaveConfig/LoadConfig's JSON encoding (which
+    -- only special-cases Color3) with no extra handling needed.
+    function self:Get() return currentKey and currentKey.Name or nil end
+    -- Programmatically bind a key by name (used by Window:LoadConfig).
+    -- Silently ignores names that aren't valid Enum.KeyCode members.
+    function self:Set(name)
+        if type(name) ~= "string" then return end
+        local key = Enum.KeyCode[name]
+        if not key then return end
+        currentKey = key
+        keyBtn.Text = keyText()
+    end
+    function self:ApplyTheme(color, accent, isInitial)
+        local panelBg = Utils.Brighten(color, 1.2)
+        local textColor = Utils.GetTextColorFor(panelBg, accent)
+        if isInitial then
+            frame.BackgroundColor3 = panelBg
+            label.TextColor3 = textColor
+        else
+            TweenService:Create(frame, THEME_TWEEN_INFO, { BackgroundColor3 = panelBg }):Play()
+            TweenService:Create(label, THEME_TWEEN_INFO, { TextColor3 = textColor }):Play()
+        end
+        restyleKeyBtn(isInitial)
     end
     theme:Subscribe(function(c, a, initial) self:ApplyTheme(c, a, initial) end)
     return self
@@ -3634,6 +3820,13 @@ function TabMeta:CreateParagraph(opts)
     opts = opts or {}
     opts.LayoutOrder = nextOrder(self)
     return Components.Paragraph(self._page, self._theme, self._connMgr, opts)
+end
+function TabMeta:CreateKeybind(opts)
+    opts = opts or {}
+    opts.LayoutOrder = nextOrder(self)
+    local obj = Components.Keybind(self._page, self._theme, self._connMgr, opts)
+    self._window:_registerFlag(opts.Flag, obj)
+    return obj
 end
 
 function TabMeta:CreateConfigList(opts)
