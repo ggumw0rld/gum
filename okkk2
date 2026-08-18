@@ -1,0 +1,3723 @@
+--[[
+    ============================================================
+    Selenix UI Library — Modular Rewrite (FIXED + Keybind)
+    ============================================================
+    Same visual/behavioural feature set as the original monolithic
+    script, reorganized into independent modules:
+
+        Utils      -> color math, corner/padding/stroke helpers, hex <-> Color3
+        Animator   -> hover/press stroke effect, generic tween + gradient-lerp helper
+        Theme      -> holds the current {Color, Accent}, notifies subscribers on change
+        Window     -> chrome: loading screen, titlebar, drag, resize, minimize
+        Components -> factory functions for each control (Button, Label, Toggle, Slider,
+                       Textbox, Dropdown, MultiDropdown, ColorPicker, ThemeGrid, GradientPicker,
+                       Keybind, Notification)
+        Tab        -> a page + its tab button; exposes Tab:AddXxx(opts) which delegates to Components
+        Config     -> Flags + SaveConfig/LoadConfig (writefile/readfile via executor)
+
+    Every component returned by Components.* implements the same tiny interface:
+        obj.Instance      -- root GuiObject
+        obj:ApplyTheme(color, accent)  -- called automatically by Theme:Apply()
+        obj:Destroy()                  -- optional cleanup
+
+    This keeps the file a single drop-in script (works fine from an executor,
+    no ReplicatedStorage / require() needed) while still being a real
+    component library internally: every control is built once, in one place,
+    and reused instead of copy-pasted three times (the old Dropdown /
+    MultiDropdown / ColorPicker collapsible-header logic is now one
+    `Components.ExpandableHeader` helper shared by all three).
+
+    The window has no in-UI close button / close-confirm dialog — it is
+    closed programmatically instead, via `Selenix:Destroy()`.
+
+    CHANGES IN THIS REVISION:
+      * Fix: Dropdown/MultiDropdown row buttons now use their own
+        per-instance ConnectionManager ("rowConnMgr") that is fully
+        disconnected before each Refresh()/rebuild, instead of leaking a
+        growing pile of dead connections into the window's shared
+        ConnectionManager every time :Refresh() is called (e.g. every
+        Save/Delete in CreateConfigList).
+      * New: Components.Keybind + TabMeta:CreateKeybind, following the
+        same {Instance, Get, Set, ApplyTheme} contract as Toggle/Slider/
+        Textbox, so it auto-registers into SaveConfig/LoadConfig via
+        opts.Flag. Includes a per-window "only one Keybind capturing at a
+        time" guard (keybindListening) so rebinding one Keybind can't
+        spuriously fire another Keybind's Pressed() callback.
+      * New (this revision): a batch of additional controls — Checkbox,
+        RadioGroup, Stepper (numeric +/-), SearchBox, ProgressBar, Rating,
+        Image, Textarea (multi-line), Table (read-only data grid), Badge,
+        and a shared Utils.AddTooltip helper any control's .Instance can be
+        wired to. See "MODULE: Components (extra controls)" below.
+    ============================================================
+]]
+
+local TweenService = game:GetService("TweenService")
+local RunService = game:GetService("RunService")
+local Players = game:GetService("Players")
+local UserInputService = game:GetService("UserInputService")
+local ContentProvider = game:GetService("ContentProvider")
+local HttpService = game:GetService("HttpService")
+local Player = Players.LocalPlayer
+
+local EASE = Enum.EasingStyle.Quint
+local EASE_OUT = Enum.EasingDirection.Out
+local EASE_IN = Enum.EasingDirection.In
+
+-- Shared duration for the "theme changed" recolor tween used by every
+-- component's ApplyTheme(). Previously most components just snapped their
+-- colors straight to the new theme instead of tweening, so picking a new
+-- theme in ThemeGrid looked jarring/inconsistent (only the tab buttons
+-- actually animated). Everything below now tweens using this constant.
+local THEME_TWEEN_DURATION = 0.3
+local THEME_TWEEN_INFO = TweenInfo.new(THEME_TWEEN_DURATION, EASE, EASE_OUT)
+
+--============================================================
+-- MODULE: Utils
+--============================================================
+local Utils = {}
+
+function Utils.Brighten(color, factor)
+    return Color3.new(
+        math.min(color.R * factor, 1),
+        math.min(color.G * factor, 1),
+        math.min(color.B * factor, 1)
+    )
+end
+Utils.Darken = Utils.Brighten -- factor < 1 darkens, factor > 1 brightens; same math either way
+
+function Utils.GetLuminance(c)
+    return 0.299 * c.R + 0.587 * c.G + 0.114 * c.B
+end
+
+-- Contrast-safe text color for a given background, lightly tinted with `tint` (usually the accent)
+function Utils.GetTextColorFor(bg, tint)
+    if Utils.GetLuminance(bg) > 0.55 then
+        return Color3.new(
+            math.min(tint.R * 0.55 + 0.02, 1),
+            math.min(tint.G * 0.55 + 0.02, 1),
+            math.min(tint.B * 0.55 + 0.02, 1)
+        )
+    else
+        return Color3.new(
+            math.min(0.82 + tint.R * 0.18, 1),
+            math.min(0.82 + tint.G * 0.18, 1),
+            math.min(0.82 + tint.B * 0.18, 1)
+        )
+    end
+end
+
+-- Near-white color, lightly tinted by `tint` (usually the accent), regardless
+-- of what it will sit on top of. Used for control knobs (Toggle,
+-- GradientPicker's toggle) that should always read as "white" at a glance
+-- but still pick up a touch of the current theme's accent so they don't look
+-- totally disconnected from it.
+function Utils.GetKnobColor(tint)
+    return Color3.new(
+        math.min(0.88 + tint.R * 0.12, 1),
+        math.min(0.88 + tint.G * 0.12, 1),
+        math.min(0.88 + tint.B * 0.12, 1)
+    )
+end
+
+function Utils.AddCorner(parent, radius)
+    local c = Instance.new("UICorner")
+    c.CornerRadius = radius or UDim.new(0, 8)
+    c.Parent = parent
+    return c
+end
+
+-- Bo góc riêng từng góc (per-corner UICorner rounding, fully released on
+-- Roblox June 23, 2026: TopLeftRadius / TopRightRadius / BottomLeftRadius /
+-- BottomRightRadius). Truyền nil cho góc nào muốn giữ vuông (mặc định 0).
+function Utils.AddCornerEx(parent, topLeft, topRight, bottomLeft, bottomRight)
+    local c = Instance.new("UICorner")
+    c.TopLeftRadius = topLeft or UDim.new(0, 0)
+    c.TopRightRadius = topRight or UDim.new(0, 0)
+    c.BottomLeftRadius = bottomLeft or UDim.new(0, 0)
+    c.BottomRightRadius = bottomRight or UDim.new(0, 0)
+    c.Parent = parent
+    return c
+end
+
+function Utils.AddPadding(parent, left, right, top, bottom)
+    local p = Instance.new("UIPadding")
+    if left then p.PaddingLeft = left end
+    if right then p.PaddingRight = right end
+    if top then p.PaddingTop = top end
+    if bottom then p.PaddingBottom = bottom end
+    p.Parent = parent
+    return p
+end
+
+function Utils.ToHex(color)
+    return string.format("#%02X%02X%02X",
+        math.floor(color.R * 255 + 0.5),
+        math.floor(color.G * 255 + 0.5),
+        math.floor(color.B * 255 + 0.5))
+end
+
+-- Returns color, success
+function Utils.HexToColor3(text)
+    local hex = text:gsub("#", ""):gsub("%s", "")
+    if #hex ~= 6 or hex:match("[^0-9a-fA-F]") then
+        return nil, false
+    end
+    local r = tonumber(hex:sub(1, 2), 16)
+    local g = tonumber(hex:sub(3, 4), 16)
+    local b = tonumber(hex:sub(5, 6), 16)
+    return Color3.fromRGB(r, g, b), true
+end
+
+--============================================================
+-- MODULE: ConnectionManager
+-- Central place to track every RBXScriptConnection created by the
+-- UI so Window:Destroy() can cleanly tear everything down (fixes
+-- the "leak on rerun" class of bugs from the original script).
+--============================================================
+local ConnectionManager = {}
+ConnectionManager.__index = ConnectionManager
+
+function ConnectionManager.new()
+    return setmetatable({ _connections = {} }, ConnectionManager)
+end
+
+function ConnectionManager:Track(conn)
+    table.insert(self._connections, conn)
+    return conn
+end
+
+function ConnectionManager:DisconnectAll()
+    for _, conn in ipairs(self._connections) do
+        if conn.Connected then conn:Disconnect() end
+    end
+    table.clear(self._connections)
+end
+
+-- Weak-keyed by connMgr (== per window, since each Window.new gets its own
+-- ConnectionManager). Tracks whether ANY Keybind belonging to that window
+-- is currently capturing input, so other Keybinds on the same window can
+-- suppress their Pressed() callback while a rebind is in progress —
+-- otherwise typing the target key while rebinding Keybind A would also
+-- fire Keybind B's/C's Pressed() if they happen to share that key. Weak
+-- keys mean this table self-cleans once a window's connMgr is GC'd.
+local keybindListening = setmetatable({}, { __mode = "k" })
+
+--============================================================
+-- MODULE: Animator
+--============================================================
+local Animator = {}
+
+local HOVER_THICKNESS = 1.5
+local PRESSED_THICKNESS = 1.5
+
+-- Adds the thin "outline grows on hover/press" stroke used by every clickable control.
+function Animator.AddThickenStroke(btn, connMgr)
+    local stroke = Instance.new("UIStroke")
+    stroke.Name = "ThickenStroke"
+    stroke.Thickness = 0
+    stroke.Color = Color3.fromRGB(255, 255, 255)
+    stroke.Transparency = 0.5
+    stroke.ApplyStrokeMode = Enum.ApplyStrokeMode.Border
+    stroke.Parent = btn
+
+    local function to(thickness, dur)
+        TweenService:Create(stroke, TweenInfo.new(dur, EASE, EASE_OUT), { Thickness = thickness }):Play()
+    end
+
+    connMgr:Track(btn.MouseEnter:Connect(function() to(HOVER_THICKNESS, 0.25) end))
+    connMgr:Track(btn.MouseLeave:Connect(function() to(0, 0.25) end))
+    connMgr:Track(btn.MouseButton1Down:Connect(function() to(PRESSED_THICKNESS, 0.12) end))
+    connMgr:Track(btn.MouseButton1Up:Connect(function() to(HOVER_THICKNESS, 0.18) end))
+    connMgr:Track(btn.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.Touch then to(PRESSED_THICKNESS, 0.12) end
+    end))
+    connMgr:Track(btn.InputEnded:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.Touch then to(0, 0.25) end
+    end))
+
+    return stroke
+end
+
+-- Background-color hover effect.
+-- baseColor can be:
+--   * nil                -> "live" mode: auto-brighten whatever BackgroundColor3
+--                           currently is when the mouse enters, and restore that
+--                           captured value on leave. Only safe for buttons whose
+--                           color is never changed by anything else afterwards.
+--   * a function          -> "reactive" mode: on both enter and leave, the base
+--                           color is *recomputed* by calling baseColor() fresh,
+--                           instead of relying on a value captured at MouseEnter
+--                           time. Use this whenever the button's real base color
+--                           is also being retweened elsewhere (e.g. by
+--                           Theme:Apply()) — otherwise a theme change that lands
+--                           while the mouse is still hovering gets silently
+--                           overwritten by the *stale* pre-change color the next
+--                           time MouseLeave fires.
+--   * a Color3             -> "static" mode: fixed base/hover colors, used for
+--                           chrome buttons whose colors never depend on theme.
+function Animator.AddHoverEffect(btn, connMgr, baseColor, hoverColor, skipStroke)
+    if not skipStroke then Animator.AddThickenStroke(btn, connMgr) end
+    local isDynamic = (type(baseColor) == "function")
+    local liveMode = (baseColor == nil)
+    local storedBase
+
+    connMgr:Track(btn.MouseEnter:Connect(function()
+        if isDynamic then
+            TweenService:Create(btn, TweenInfo.new(0.25, EASE, EASE_OUT), { BackgroundColor3 = Utils.Brighten(baseColor(), 1.2) }):Play()
+        elseif liveMode then
+            storedBase = btn.BackgroundColor3
+            TweenService:Create(btn, TweenInfo.new(0.25, EASE, EASE_OUT), { BackgroundColor3 = Utils.Brighten(storedBase, 1.2) }):Play()
+        elseif hoverColor then
+            TweenService:Create(btn, TweenInfo.new(0.25, EASE, EASE_OUT), { BackgroundColor3 = hoverColor }):Play()
+        end
+    end))
+    connMgr:Track(btn.MouseLeave:Connect(function()
+        if isDynamic then
+            TweenService:Create(btn, TweenInfo.new(0.25, EASE, EASE_OUT), { BackgroundColor3 = baseColor() }):Play()
+        elseif liveMode then
+            if storedBase then
+                TweenService:Create(btn, TweenInfo.new(0.25, EASE, EASE_OUT), { BackgroundColor3 = storedBase }):Play()
+            end
+        elseif baseColor then
+            TweenService:Create(btn, TweenInfo.new(0.25, EASE, EASE_OUT), { BackgroundColor3 = baseColor }):Play()
+        end
+    end))
+end
+
+function Animator.Tween(obj, props, duration, style, dir)
+    return TweenService:Create(obj, TweenInfo.new(duration or 0.3, style or EASE, dir or EASE_OUT), props)
+end
+
+-- TweenService cannot tween ColorSequence, so gradient recoloring is done with a
+-- manual per-frame lerp between two flat colors (start/end keypoints).
+local activeGradientLerps = setmetatable({}, { __mode = "k" }) -- weak keys: entries self-clean if `grad` is GC'd/destroyed mid-lerp
+function Animator.TweenGradientColor(grad, colorSeq, duration, connMgr, instant)
+    if activeGradientLerps[grad] then
+        activeGradientLerps[grad]:Disconnect()
+        activeGradientLerps[grad] = nil
+    end
+    if instant then
+        grad.Color = colorSeq
+        return
+    end
+    local targetC1 = colorSeq.Keypoints[1].Value
+    local targetC2 = colorSeq.Keypoints[#colorSeq.Keypoints].Value
+    local startSeq = grad.Color
+    local startC1 = startSeq.Keypoints[1].Value
+    local startC2 = startSeq.Keypoints[#startSeq.Keypoints].Value
+    local startTime = tick()
+
+    local conn
+    conn = RunService.Heartbeat:Connect(function()
+        -- grad may have been Destroy()'d while this Heartbeat connection was
+        -- still pending disconnect (e.g. Window:Destroy() mid-lerp); guard
+        -- against writing to / reading a dead Instance instead of relying
+        -- solely on ConnectionManager's teardown timing.
+        if not grad.Parent then
+            conn:Disconnect()
+            activeGradientLerps[grad] = nil
+            return
+        end
+        local alpha = math.clamp((tick() - startTime) / (duration or 0.35), 0, 1)
+        grad.Color = ColorSequence.new(startC1:Lerp(targetC1, alpha), startC2:Lerp(targetC2, alpha))
+        if alpha >= 1 then
+            conn:Disconnect()
+            activeGradientLerps[grad] = nil
+        end
+    end)
+    if connMgr then connMgr:Track(conn) end
+    activeGradientLerps[grad] = conn
+end
+
+-- Manually drives GroupTransparency frame-by-frame instead of letting
+-- TweenService interpolate it internally. CanvasGroup composites its whole
+-- subtree into an offscreen buffer; on some executors that buffer doesn't
+-- get re-composited in sync with TweenService's internal interpolation, so
+-- the fade tween "completes" logically while nothing visibly changes until
+-- the final frame (reads as a hard pop instead of a fade). Writing
+-- GroupTransparency explicitly every Heartbeat forces a real redraw each
+-- step, so the fade is guaranteed to actually render.
+function Animator.FadeCanvasGroup(group, target, duration, connMgr, onComplete)
+    local start = group.GroupTransparency
+    local startTime = os.clock()
+    local conn
+    conn = RunService.Heartbeat:Connect(function()
+        if not group.Parent then
+            conn:Disconnect()
+            return
+        end
+        local alpha = math.clamp((os.clock() - startTime) / duration, 0, 1)
+        local eased = 1 - (1 - alpha) ^ 3 -- cubic-out, matches the feel of EASE/EASE_OUT elsewhere
+        group.GroupTransparency = start + (target - start) * eased
+        if alpha >= 1 then
+            conn:Disconnect()
+            if onComplete then onComplete() end
+        end
+    end)
+    if connMgr then connMgr:Track(conn) end
+    return conn
+end
+
+--============================================================
+-- MODULE: Theme
+-- Single source of truth for {Color, Accent}. Components register
+-- themselves once and get restyled automatically on every change,
+-- instead of the old approach of manually listing every object in
+-- one giant ApplyTheme() function.
+--============================================================
+local Theme = {}
+Theme.__index = Theme
+
+function Theme.new(color, accent)
+    return setmetatable({
+        Color = color,
+        Accent = accent,
+        _subscribers = {},
+    }, Theme)
+end
+
+-- fn(color, accent, isInitial) is called immediately once with isInitial=true,
+-- then again with isInitial=false on every subsequent Apply(). Passing this
+-- flag lets every subscriber snap on the first paint and only tween on real
+-- theme changes, instead of each component having to hand-roll its own
+-- "initialized" flag (which most of them previously didn't, causing a
+-- visible flash-then-tween on creation — see Components.* ApplyTheme below).
+function Theme:Subscribe(fn)
+    table.insert(self._subscribers, fn)
+    fn(self.Color, self.Accent, true)
+end
+
+function Theme:Apply(color, accent)
+    self.Color, self.Accent = color, accent
+    for _, fn in ipairs(self._subscribers) do
+        fn(color, accent, false)
+    end
+end
+
+function Theme:PanelColors()
+    local panelBg = Utils.Brighten(self.Color, 1.2)
+    local darkBg = Utils.Darken(self.Color, 0.8)
+    return panelBg, darkBg,
+        Utils.GetTextColorFor(panelBg, self.Accent),
+        Utils.GetTextColorFor(darkBg, self.Accent)
+end
+
+--============================================================
+-- MODULE: Components
+-- Every factory returns { Instance, ApplyTheme(color,accent), Destroy() }
+--============================================================
+local Components = {}
+
+-- ---------- Label ----------
+function Components.Label(parent, theme, connMgr, opts)
+    local holder = Instance.new("Frame")
+    holder.Size = opts.Size or UDim2.new(1, 0, 0, 34)
+    holder.LayoutOrder = opts.LayoutOrder or 0
+    holder.BackgroundTransparency = 1
+    holder.Parent = parent
+
+    local label = Instance.new("TextLabel")
+    label.Size = UDim2.new(1, 0, 1, 0)
+    label.BackgroundTransparency = 1
+    label.Text = opts.Text or ""
+    label.TextXAlignment = Enum.TextXAlignment.Left
+    label.TextYAlignment = Enum.TextYAlignment.Top
+    label.Font = opts.Bold and Enum.Font.GothamBold or Enum.Font.Gotham
+    label.TextSize = opts.TextSize or 14
+    label.TextWrapped = true
+    label.Parent = holder
+    if opts.Padded ~= false then Utils.AddPadding(label, UDim.new(0, 15)) end
+
+    local self = { Instance = holder }
+    -- Labels sit directly on mainFrame's background (no panel of their own),
+    -- so their contrast-safe color is computed against the live theme.Color
+    -- itself rather than the brightened "panel" background other controls
+    -- use. opts.Muted dims that same contrast-safe color instead of using a
+    -- fixed gray, so muted labels stay readable on both dark and light themes.
+    function self:ApplyTheme(color, accent, isInitial)
+        local textColor = Utils.GetTextColorFor(color, accent)
+        if opts.Muted then
+            textColor = (Utils.GetLuminance(color) > 0.55)
+                and Color3.new(textColor.R * 0.7, textColor.G * 0.7, textColor.B * 0.7)
+                or Color3.new(0.7 + textColor.R * 0.3, 0.7 + textColor.G * 0.3, 0.7 + textColor.B * 0.3)
+        end
+        if isInitial then
+            label.TextColor3 = textColor
+        else
+            TweenService:Create(label, THEME_TWEEN_INFO, { TextColor3 = textColor }):Play()
+        end
+    end
+    theme:Subscribe(function(c, a, initial) self:ApplyTheme(c, a, initial) end)
+    return self
+end
+
+-- ---------- Button ----------
+function Components.Button(parent, theme, connMgr, opts)
+    local holder = Instance.new("Frame")
+    holder.Size = opts.Size or UDim2.new(1, 0, 0, 40)
+    holder.LayoutOrder = opts.LayoutOrder or 0
+    holder.BackgroundTransparency = 1
+    holder.Parent = parent
+
+    local btn = Instance.new("TextButton")
+    btn.Size = UDim2.new(1, 0, 1, 0)
+    btn.Text = opts.Text or "Button"
+    btn.TextColor3 = Color3.fromRGB(255, 255, 255)
+    btn.Font = Enum.Font.GothamBold
+    btn.TextSize = 16
+    btn.TextXAlignment = Enum.TextXAlignment.Left
+    btn.Parent = holder
+    Utils.AddPadding(btn, UDim.new(0, 15))
+    Utils.AddCorner(btn, UDim.new(0, 8))
+    -- Reactive mode: base color is recomputed fresh from the live theme on
+    -- every enter/leave, so a theme change landing mid-hover can't get
+    -- clobbered by a stale pre-change color when the mouse leaves.
+    Animator.AddHoverEffect(btn, connMgr, function() return Utils.Brighten(theme.Color, 1.2) end)
+
+    if opts.Callback then
+        connMgr:Track(btn.MouseButton1Click:Connect(opts.Callback))
+    end
+
+    local self = { Instance = holder }
+    function self:ApplyTheme(color, accent, isInitial)
+        local panelBg = Utils.Brighten(color, 1.2)
+        local textColor = Utils.GetTextColorFor(panelBg, accent)
+        if isInitial then
+            btn.BackgroundColor3 = panelBg
+            btn.TextColor3 = textColor
+        else
+            TweenService:Create(btn, THEME_TWEEN_INFO, {
+                BackgroundColor3 = panelBg,
+                TextColor3 = textColor,
+            }):Play()
+        end
+    end
+    theme:Subscribe(function(c, a, initial) self:ApplyTheme(c, a, initial) end)
+    return self
+end
+
+-- ---------- Toggle ----------
+function Components.Toggle(parent, theme, connMgr, opts)
+    local frame = Instance.new("Frame")
+    frame.Size = opts.Size or UDim2.new(1, 0, 0, 40)
+    frame.LayoutOrder = opts.LayoutOrder or 0
+    frame.Parent = parent
+    Utils.AddCorner(frame, UDim.new(0, 8))
+
+    local label = Instance.new("TextLabel")
+    label.Size = UDim2.new(1, -85, 1, 0)
+    label.Position = UDim2.new(0, 10, 0, 0)
+    label.BackgroundTransparency = 1
+    label.TextColor3 = Color3.fromRGB(255, 255, 255)
+    label.TextXAlignment = Enum.TextXAlignment.Left
+    label.Font = Enum.Font.GothamBold
+    label.TextSize = 16
+    label.Parent = frame
+
+    local track = Instance.new("TextButton")
+    track.AnchorPoint = Vector2.new(1, 0.5)
+    track.Position = UDim2.new(1, -15, 0.5, 0)
+    track.Size = UDim2.new(0, 52, 0, 28)
+    track.Text = ""
+    track.AutoButtonColor = false
+    track.Parent = frame
+    Utils.AddCorner(track, UDim.new(1, 0))
+
+    local knob = Instance.new("Frame")
+    knob.AnchorPoint = Vector2.new(0, 0.5)
+    knob.Position = UDim2.new(0, 3, 0.5, 0)
+    knob.Size = UDim2.new(0, 22, 0, 22)
+    knob.BackgroundColor3 = Color3.fromRGB(220, 220, 225)
+    knob.BorderSizePixel = 0
+    knob.Parent = track
+    Utils.AddCorner(knob, UDim.new(1, 0))
+
+    local state = opts.Default or false
+    local function labelText()
+        return (opts.Text or "Trạng thái") .. ": " .. (state and (opts.OnText or "Bật") or (opts.OffText or "Tắt"))
+    end
+    label.Text = labelText()
+
+    local function restyle(instant)
+        local darkBg = Utils.Darken(theme.Color, 0.8)
+        local trackColor = state and Utils.Brighten(theme.Accent, 1.15) or darkBg
+        -- Knob stays near-white at all times (readable/consistent regardless
+        -- of on/off track color) but is still lightly tinted by the live
+        -- accent so it doesn't look totally disconnected from the theme.
+        local knobColor = Utils.GetKnobColor(theme.Accent)
+        local knobX = state and (52 - 22 - 3) or 3
+        local info = TweenInfo.new(instant and 0 or 0.3, EASE, EASE_OUT)
+        TweenService:Create(track, info, { BackgroundColor3 = trackColor }):Play()
+        TweenService:Create(knob, info, { Position = UDim2.new(0, knobX, 0.5, 0), BackgroundColor3 = knobColor }):Play()
+    end
+
+    connMgr:Track(track.MouseButton1Click:Connect(function()
+        state = not state
+        label.Text = labelText()
+        restyle(false)
+        if opts.Callback then opts.Callback(state) end
+    end))
+
+    local self = { Instance = frame }
+    function self:Get() return state end
+    function self:Set(v)
+        if v == state then return end
+        state = v
+        label.Text = labelText()
+        restyle(false)
+    end
+    function self:ApplyTheme(color, accent, isInitial)
+        local panelBg = Utils.Brighten(color, 1.2)
+        local textColor = Utils.GetTextColorFor(panelBg, accent)
+        if isInitial then
+            frame.BackgroundColor3 = panelBg
+            label.TextColor3 = textColor
+        else
+            TweenService:Create(frame, THEME_TWEEN_INFO, { BackgroundColor3 = panelBg }):Play()
+            TweenService:Create(label, THEME_TWEEN_INFO, { TextColor3 = textColor }):Play()
+        end
+        restyle(isInitial)
+    end
+    theme:Subscribe(function(c, a, initial) self:ApplyTheme(c, a, initial) end)
+    return self
+end
+
+-- ---------- Slider ----------
+-- opts.Decimals (integer, default 0) lets the slider represent fractional
+-- values (e.g. 0.0-1.0 uniforms) instead of always rounding to whole
+-- numbers — previously `value = math.round(...)` made it impossible to
+-- drive a 0-1 float parameter from this control at all.
+function Components.Slider(parent, theme, connMgr, opts)
+    local min, max = opts.Min or 0, opts.Max or 100
+    -- Guard against a misconfigured Min == Max (or Min > Max): every alpha
+    -- calculation below divides by (max - min), which previously produced
+    -- NaN positions/sizes (and a NaN drag value) instead of just clamping.
+    local range = (max > min) and (max - min) or 1
+    local decimals = math.max(math.floor(opts.Decimals or 0), 0)
+    local step = 10 ^ (-decimals) -- smallest representable increment at this precision
+
+    local function roundTo(n)
+        local mult = 10 ^ decimals
+        return math.round(n * mult) / mult
+    end
+    local function fmt(n)
+        if decimals <= 0 then return tostring(math.floor(n + 0.5)) end
+        return string.format("%." .. decimals .. "f", n)
+    end
+
+    local value = roundTo(math.clamp(opts.Default or min, min, max))
+    local suffix = opts.Suffix or "%"
+
+    local frame = Instance.new("Frame")
+    frame.Size = opts.Size or UDim2.new(1, 0, 0, 40)
+    frame.LayoutOrder = opts.LayoutOrder or 0
+    frame.Parent = parent
+    Utils.AddCorner(frame, UDim.new(0, 8))
+
+    local label = Instance.new("TextLabel")
+    label.Size = UDim2.new(0.45, 0, 1, 0)
+    label.Position = UDim2.new(0, 10, 0, 0)
+    label.BackgroundTransparency = 1
+    label.TextColor3 = Color3.fromRGB(255, 255, 255)
+    label.TextXAlignment = Enum.TextXAlignment.Left
+    label.Font = Enum.Font.GothamBold
+    label.TextSize = 15
+    label.Parent = frame
+
+    local function labelText() return (opts.Text or "Giá trị") .. ": " .. fmt(value) .. suffix end
+    label.Text = labelText()
+
+    local bar = Instance.new("Frame")
+    bar.Size = UDim2.new(0.35, 0, 0, 4)
+    bar.Position = UDim2.new(0.58, 0, 0, 18)
+    bar.BorderSizePixel = 0
+    bar.Parent = frame
+    Utils.AddCorner(bar, UDim.new(1, 0))
+
+    local fill = Instance.new("Frame")
+    fill.Size = UDim2.new((value - min) / range, 0, 1, 0)
+    fill.BorderSizePixel = 0
+    fill.Parent = bar
+    Utils.AddCorner(fill, UDim.new(1, 0))
+
+    local drag = Instance.new("TextButton")
+    drag.Size = UDim2.new(0, 20, 0, 20)
+    drag.AnchorPoint = Vector2.new(0.5, 0.5)
+    drag.Position = UDim2.new((value - min) / range, 0, 0.5, 0)
+    drag.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+    drag.Text = ""
+    drag.ZIndex = 2
+    drag.Parent = bar
+    Utils.AddCorner(drag, UDim.new(1, 0))
+
+    local dragging = false
+    local function update(inputPos)
+        local absPos, absSize = bar.AbsolutePosition, bar.AbsoluteSize
+        local alpha = math.clamp((inputPos.X - absPos.X) / absSize.X, 0, 1)
+        value = roundTo(min + alpha * range)
+        alpha = (value - min) / range
+        label.Text = labelText()
+        fill.Size = UDim2.new(alpha, 0, 1, 0)
+        drag.Position = UDim2.new(alpha, 0, 0.5, 0)
+        if opts.Callback then opts.Callback(value) end
+    end
+
+    connMgr:Track(drag.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = true
+        end
+    end))
+    connMgr:Track(bar.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = true
+            update(input.Position)
+        end
+    end))
+    connMgr:Track(UserInputService.InputEnded:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            dragging = false
+        end
+    end))
+    connMgr:Track(UserInputService.InputChanged:Connect(function(input)
+        if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+            update(input.Position)
+        end
+    end))
+
+    local self = { Instance = frame }
+    function self:Get() return value end
+    -- Programmatically set the value (used by Window:LoadConfig). Clamps
+    -- to [min, max] and rounds to the same precision as manual dragging,
+    -- then updates the visuals/label the same way update() does, and fires
+    -- opts.Callback so consumer code stays in sync.
+    function self:Set(v)
+        v = roundTo(math.clamp(v, min, max))
+        if v == value then return end
+        value = v
+        local alpha = (value - min) / range
+        label.Text = labelText()
+        fill.Size = UDim2.new(alpha, 0, 1, 0)
+        drag.Position = UDim2.new(alpha, 0, 0.5, 0)
+        if opts.Callback then opts.Callback(value) end
+    end
+    function self:ApplyTheme(color, accent, isInitial)
+        local panelBg = Utils.Brighten(color, 1.2)
+        local textColor = Utils.GetTextColorFor(panelBg, accent)
+        local darkBg = Utils.Darken(color, 0.8)
+        -- The drag handle is 20px tall against a 4px bar, so most of its
+        -- visible area actually sits over the panel background rather than
+        -- the thin track/fill strip beneath it — same contrast-safe color
+        -- as the label, reusing `textColor`, keeps it themed instead of a
+        -- fixed white that used to wash out on light themes.
+        if isInitial then
+            frame.BackgroundColor3 = panelBg
+            label.TextColor3 = textColor
+            bar.BackgroundColor3 = darkBg
+            fill.BackgroundColor3 = accent
+            drag.BackgroundColor3 = textColor
+        else
+            TweenService:Create(frame, THEME_TWEEN_INFO, { BackgroundColor3 = panelBg }):Play()
+            TweenService:Create(label, THEME_TWEEN_INFO, { TextColor3 = textColor }):Play()
+            TweenService:Create(bar, THEME_TWEEN_INFO, { BackgroundColor3 = darkBg }):Play()
+            TweenService:Create(fill, THEME_TWEEN_INFO, { BackgroundColor3 = accent }):Play()
+            TweenService:Create(drag, THEME_TWEEN_INFO, { BackgroundColor3 = textColor }):Play()
+        end
+    end
+    theme:Subscribe(function(c, a, initial) self:ApplyTheme(c, a, initial) end)
+    return self
+end
+
+-- ---------- Textbox ----------
+function Components.Textbox(parent, theme, connMgr, opts)
+    local frame = Instance.new("Frame")
+    frame.Size = opts.Size or UDim2.new(1, 0, 0, 40)
+    frame.LayoutOrder = opts.LayoutOrder or 0
+    frame.Parent = parent
+    Utils.AddCorner(frame, UDim.new(0, 8))
+
+    local label = Instance.new("TextLabel")
+    label.Size = UDim2.new(0, 90, 1, 0)
+    label.Position = UDim2.new(0, 10, 0, 0)
+    label.BackgroundTransparency = 1
+    label.Text = opts.Text or "Nhập:"
+    label.TextColor3 = Color3.fromRGB(255, 255, 255)
+    label.TextXAlignment = Enum.TextXAlignment.Left
+    label.Font = Enum.Font.GothamBold
+    label.TextSize = 15
+    label.Parent = frame
+
+    local box = Instance.new("TextBox")
+    box.AnchorPoint = Vector2.new(1, 0.5)
+    box.Position = UDim2.new(1, -10, 0.5, 0)
+    box.Size = UDim2.new(0, 150, 0, 28)
+    box.Text = opts.Default or ""
+    box.PlaceholderText = opts.Placeholder or "Nhập nội dung..."
+    box.PlaceholderColor3 = Color3.fromRGB(150, 150, 160)
+    box.TextColor3 = Color3.fromRGB(255, 255, 255)
+    box.Font = Enum.Font.Gotham
+    box.TextSize = 14
+    box.ClearTextOnFocus = false
+    box.ClipsDescendants = true
+    box.Parent = frame
+    Utils.AddPadding(box, UDim.new(0, 10), UDim.new(0, 10))
+    Utils.AddCorner(box, UDim.new(0, 6))
+
+    connMgr:Track(box.FocusLost:Connect(function(enterPressed)
+        if enterPressed and opts.Callback then opts.Callback(box.Text) end
+    end))
+
+    local self = { Instance = frame }
+    function self:Get() return box.Text end
+    -- Programmatically set the text (used by Window:LoadConfig). Does not
+    -- fire opts.Callback (matches Toggle/Slider convention: only a real
+    -- FocusLost+Enter counts as a user commit), just updates the box text.
+    function self:Set(v)
+        box.Text = tostring(v)
+    end
+    function self:ApplyTheme(color, accent, isInitial)
+        local panelBg = Utils.Brighten(color, 1.2)
+        local darkBg = Utils.Darken(color, 0.8)
+        local labelTextColor = Utils.GetTextColorFor(panelBg, accent)
+        local boxTextColor = Utils.GetTextColorFor(darkBg, accent)
+        if isInitial then
+            frame.BackgroundColor3 = panelBg
+            label.TextColor3 = labelTextColor
+            box.BackgroundColor3 = darkBg
+            box.TextColor3 = boxTextColor
+        else
+            TweenService:Create(frame, THEME_TWEEN_INFO, { BackgroundColor3 = panelBg }):Play()
+            TweenService:Create(label, THEME_TWEEN_INFO, { TextColor3 = labelTextColor }):Play()
+            TweenService:Create(box, THEME_TWEEN_INFO, {
+                BackgroundColor3 = darkBg,
+                TextColor3 = boxTextColor,
+            }):Play()
+        end
+    end
+    theme:Subscribe(function(c, a, initial) self:ApplyTheme(c, a, initial) end)
+    return self
+end
+
+-- ---------- Divider / Section ----------
+-- A section header used to visually group controls within a tab. Renders
+-- optional title text plus a thin horizontal rule; unlike Label, this is
+-- meant purely as a layout separator, not a themed panel background.
+--
+-- opts: { Text (optional), Size (optional) }
+function Components.Divider(parent, theme, connMgr, opts)
+    opts = opts or {}
+    local hasText = opts.Text and opts.Text ~= ""
+
+    local holder = Instance.new("Frame")
+    holder.Size = opts.Size or UDim2.new(1, 0, 0, hasText and 30 or 14)
+    holder.LayoutOrder = opts.LayoutOrder or 0
+    holder.BackgroundTransparency = 1
+    holder.Parent = parent
+
+    local label
+    if hasText then
+        label = Instance.new("TextLabel")
+        label.Size = UDim2.new(1, 0, 0, 18)
+        label.Position = UDim2.new(0, 0, 0, 0)
+        label.BackgroundTransparency = 1
+        label.Text = opts.Text
+        label.TextXAlignment = Enum.TextXAlignment.Left
+        label.Font = Enum.Font.GothamBold
+        label.TextSize = 13
+        label.Parent = holder
+        Utils.AddPadding(label, UDim.new(0, 2))
+    end
+
+    local line = Instance.new("Frame")
+    line.Size = UDim2.new(1, 0, 0, 1)
+    line.Position = UDim2.new(0, 0, 1, -1)
+    line.BorderSizePixel = 0
+    line.Parent = holder
+    Utils.AddCorner(line, UDim.new(1, 0))
+
+    local self = { Instance = holder }
+    function self:ApplyTheme(color, accent, isInitial)
+        local darkBg = Utils.Darken(color, 0.8)
+        local textColor = Utils.GetTextColorFor(color, accent)
+        -- Muted the same way Components.Label does for opts.Muted, since a
+        -- section title should read as secondary, not primary, text.
+        local mutedText = (Utils.GetLuminance(color) > 0.55)
+            and Color3.new(textColor.R * 0.6, textColor.G * 0.6, textColor.B * 0.6)
+            or Color3.new(0.55 + textColor.R * 0.25, 0.55 + textColor.G * 0.25, 0.55 + textColor.B * 0.25)
+        if isInitial then
+            if label then label.TextColor3 = mutedText end
+            line.BackgroundColor3 = darkBg
+        else
+            if label then TweenService:Create(label, THEME_TWEEN_INFO, { TextColor3 = mutedText }):Play() end
+            TweenService:Create(line, THEME_TWEEN_INFO, { BackgroundColor3 = darkBg }):Play()
+        end
+    end
+    theme:Subscribe(function(c, a, initial) self:ApplyTheme(c, a, initial) end)
+    return self
+end
+
+-- ---------- Paragraph ----------
+-- A block of wrapped body text under a bold title. Optionally collapsible
+-- (opts.Collapsible = true) so a long explanation can start hidden and be
+-- expanded on click, matching the same header-click affordance as
+-- ExpandableHeader-based controls (Dropdown/ColorPicker/etc), but without
+-- a themed panel background of its own — it sits directly on the tab page
+-- like Components.Label does.
+--
+-- The collapse/expand itself is animated: the body sits inside a clipped
+-- "bodyClip" frame whose height is tweened between 0 and the body's
+-- natural (AutomaticSize-computed) height, with the body's text fading in
+-- lockstep, instead of the old instant Visible-toggle snap.
+--
+-- opts: { Title, Text, Collapsible (default false), DefaultOpen (default false) }
+function Components.Paragraph(parent, theme, connMgr, opts)
+    opts = opts or {}
+    local collapsible = opts.Collapsible == true
+    local open = (not collapsible) or (opts.DefaultOpen == true)
+
+    local holder = Instance.new(collapsible and "TextButton" or "Frame")
+    holder.Size = opts.Size or UDim2.new(1, 0, 0, 0)
+    holder.AutomaticSize = Enum.AutomaticSize.Y
+    holder.LayoutOrder = opts.LayoutOrder or 0
+    holder.BackgroundTransparency = 1
+    if collapsible then
+        holder.Text = ""
+        holder.AutoButtonColor = false
+    end
+    holder.Parent = parent
+
+    local inner = Instance.new("Frame")
+    inner.Size = UDim2.new(1, 0, 0, 0)
+    inner.AutomaticSize = Enum.AutomaticSize.Y
+    inner.BackgroundTransparency = 1
+    inner.Parent = holder
+    local layout = Instance.new("UIListLayout")
+    layout.Padding = UDim.new(0, 4)
+    layout.Parent = inner
+    Utils.AddPadding(inner, UDim.new(0, 15), UDim.new(0, 15), UDim.new(0, 8), UDim.new(0, 8))
+
+    local titleRow = Instance.new("Frame")
+    titleRow.Size = UDim2.new(1, 0, 0, 20)
+    titleRow.LayoutOrder = 1
+    titleRow.BackgroundTransparency = 1
+    titleRow.Parent = inner
+
+    local titleLabel = Instance.new("TextLabel")
+    titleLabel.Size = UDim2.new(1, -20, 1, 0)
+    titleLabel.BackgroundTransparency = 1
+    titleLabel.Text = opts.Title or ""
+    titleLabel.TextXAlignment = Enum.TextXAlignment.Left
+    titleLabel.Font = Enum.Font.GothamBold
+    titleLabel.TextSize = 15
+    titleLabel.Parent = titleRow
+
+    local arrow
+    if collapsible then
+        arrow = Instance.new("TextLabel")
+        arrow.AnchorPoint = Vector2.new(1, 0.5)
+        arrow.Position = UDim2.new(1, 0, 0.5, 0)
+        arrow.Size = UDim2.new(0, 18, 0, 18)
+        arrow.BackgroundTransparency = 1
+        arrow.Text = "▾"
+        arrow.Rotation = open and 180 or 0
+        arrow.Font = Enum.Font.GothamBold
+        arrow.TextSize = 14
+        arrow.Parent = titleRow
+    end
+
+    -- bodyClip: the actual LayoutOrder=2 child of `inner`. Its height is
+    -- what gets tweened between 0 and the body's natural height, and its
+    -- ClipsDescendants=true crops the body text during that tween instead
+    -- of it just snapping visible/invisible. `body` itself always keeps
+    -- AutomaticSize = Y and stays parented (and un-hidden) inside it, so
+    -- its natural height can be measured/re-measured at any time via
+    -- body.AbsoluteSize.Y regardless of the clip's current height.
+    local bodyClip = Instance.new("Frame")
+    bodyClip.Size = UDim2.new(1, 0, 0, 0)
+    bodyClip.LayoutOrder = 2
+    bodyClip.BackgroundTransparency = 1
+    bodyClip.ClipsDescendants = true
+    bodyClip.Parent = inner
+
+    local body = Instance.new("TextLabel")
+    body.Size = UDim2.new(1, 0, 0, 0)
+    body.AutomaticSize = Enum.AutomaticSize.Y
+    body.BackgroundTransparency = 1
+    body.Text = opts.Text or ""
+    body.TextWrapped = true
+    body.TextXAlignment = Enum.TextXAlignment.Left
+    body.TextYAlignment = Enum.TextYAlignment.Top
+    body.Font = Enum.Font.Gotham
+    body.TextSize = 13
+    body.TextTransparency = open and 0 or 1
+    body.Parent = bodyClip
+
+    local COLLAPSE_DURATION = 0.3
+
+    -- Sets bodyClip's height instantly to match the body's current natural
+    -- height (used for the initial paint, so a DefaultOpen=true paragraph
+    -- doesn't play an opening animation the moment it's created).
+    local function snapToNatural(isOpen)
+        bodyClip.Size = UDim2.new(1, 0, 0, isOpen and body.AbsoluteSize.Y or 0)
+    end
+
+    if collapsible then
+        -- Body text needs one render step before AbsoluteSize.Y reflects the
+        -- actual wrapped height, so the very first paint is deferred a frame
+        -- (matches the pattern used elsewhere in this library for
+        -- AutomaticSize convergence, e.g. Components.Notification).
+        task.defer(function()
+            RunService.Heartbeat:Wait()
+            snapToNatural(open)
+        end)
+
+        connMgr:Track(holder.MouseButton1Click:Connect(function()
+            open = not open
+            TweenService:Create(arrow, TweenInfo.new(0.25, EASE, EASE_OUT), { Rotation = open and 180 or 0 }):Play()
+            local targetHeight = open and body.AbsoluteSize.Y or 0
+            TweenService:Create(bodyClip, TweenInfo.new(COLLAPSE_DURATION, EASE, EASE_OUT), {
+                Size = UDim2.new(1, 0, 0, targetHeight),
+            }):Play()
+            TweenService:Create(body, TweenInfo.new(open and COLLAPSE_DURATION * 0.8 or COLLAPSE_DURATION * 0.5, EASE, EASE_OUT), {
+                TextTransparency = open and 0 or 1,
+            }):Play()
+        end))
+    else
+        -- Not collapsible: always fully open, same one-frame defer so the
+        -- clip's height matches the text's real wrapped height immediately.
+        task.defer(function()
+            RunService.Heartbeat:Wait()
+            snapToNatural(true)
+        end)
+    end
+
+    local self = { Instance = holder }
+    function self:ApplyTheme(color, accent, isInitial)
+        local titleColor = Utils.GetTextColorFor(color, accent)
+        local bodyColor = (Utils.GetLuminance(color) > 0.55)
+            and Color3.new(titleColor.R * 0.7, titleColor.G * 0.7, titleColor.B * 0.7)
+            or Color3.new(0.7 + titleColor.R * 0.3, 0.7 + titleColor.G * 0.3, 0.7 + titleColor.B * 0.3)
+        if isInitial then
+            titleLabel.TextColor3 = titleColor
+            body.TextColor3 = bodyColor
+            if arrow then arrow.TextColor3 = titleColor end
+        else
+            TweenService:Create(titleLabel, THEME_TWEEN_INFO, { TextColor3 = titleColor }):Play()
+            TweenService:Create(body, THEME_TWEEN_INFO, { TextColor3 = bodyColor }):Play()
+            if arrow then TweenService:Create(arrow, THEME_TWEEN_INFO, { TextColor3 = titleColor }):Play() end
+        end
+    end
+    theme:Subscribe(function(c, a, initial) self:ApplyTheme(c, a, initial) end)
+    return self
+end
+
+-- ---------- ExpandableHeader ----------
+-- Shared "header row that expands into a body panel" used by Dropdown,
+-- MultiDropdown and ColorPicker. Collapses three near-identical blocks
+-- from the original script into one reusable piece.
+function Components.ExpandableHeader(parent, theme, connMgr, opts)
+    local closedHeight = opts.ClosedHeight or 46
+    local bodyHeight = opts.BodyHeight or 200
+    local openHeight = closedHeight + bodyHeight + 6
+
+    local container = Instance.new("Frame")
+    container.Size = opts.Size or UDim2.new(1, 0, 0, closedHeight)
+    container.LayoutOrder = opts.LayoutOrder or 0
+    container.BackgroundTransparency = 1
+    container.ClipsDescendants = true
+    container.Parent = parent
+
+    local header = Instance.new("TextButton")
+    header.Size = UDim2.new(1, -4, 0, 40)
+    header.Position = UDim2.new(0, 2, 0, 3)
+    header.Text = ""
+    header.AutoButtonColor = false
+    header.Parent = container
+    Utils.AddCorner(header, UDim.new(0, 8))
+
+    local titleLabel = Instance.new("TextLabel")
+    titleLabel.Name = "Title"
+    titleLabel.Size = UDim2.new(1, -95, 1, 0)
+    titleLabel.Position = UDim2.new(0, 10, 0, 0)
+    titleLabel.BackgroundTransparency = 1
+    titleLabel.Text = opts.Text or ""
+    titleLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
+    titleLabel.TextXAlignment = Enum.TextXAlignment.Left
+    titleLabel.Font = Enum.Font.GothamBold
+    titleLabel.TextSize = 15
+    titleLabel.Parent = header
+
+    local arrow = Instance.new("TextLabel")
+    arrow.AnchorPoint = Vector2.new(1, 0.5)
+    arrow.Position = UDim2.new(1, -12, 0.5, 0)
+    arrow.Size = UDim2.new(0, 18, 0, 18)
+    arrow.BackgroundTransparency = 1
+    arrow.Text = "▾"
+    arrow.TextColor3 = Color3.fromRGB(255, 255, 255)
+    arrow.Font = Enum.Font.GothamBold
+    arrow.TextSize = 16
+    arrow.Parent = header
+
+    local body = Instance.new("Frame")
+    body.Position = UDim2.new(0, 2, 0, 47)
+    body.Size = UDim2.new(1, -4, 0, bodyHeight)
+    body.BackgroundTransparency = 1
+    body.Parent = container
+
+    -- Reactive mode: recompute the header's base color fresh from the live
+    -- theme on every enter/leave (see Animator.AddHoverEffect) instead of
+    -- capturing it once — otherwise a theme change while the header is
+    -- hovered gets overwritten by the stale color on MouseLeave.
+    Animator.AddHoverEffect(header, connMgr, function() return Utils.Brighten(theme.Color, 1.2) end)
+
+    local open, animating = false, false
+    local function setOpen(v)
+        if animating or v == open then return end
+        animating = true
+        open = v
+        TweenService:Create(arrow, TweenInfo.new(0.3, EASE, EASE_OUT), { Rotation = open and 180 or 0 }):Play()
+        local tw = TweenService:Create(container, TweenInfo.new(0.33, EASE, EASE_OUT), {
+            Size = UDim2.new(1, 0, 0, open and openHeight or closedHeight)
+        })
+        -- Gated on the tween's own Completed event so `animating` clears in
+        -- sync with the actual on-screen animation instead of a fixed
+        -- task.delay guess (which can unlock slightly early/late under lag
+        -- and reads as stuttery timing).
+        tw.Completed:Connect(function() animating = false end)
+        tw:Play()
+        if opts.OnToggle then opts.OnToggle(open) end
+    end
+    connMgr:Track(header.MouseButton1Click:Connect(function() setOpen(not open) end))
+
+    return {
+        Container = container,
+        Header = header,
+        TitleLabel = titleLabel,
+        Arrow = arrow,
+        Body = body,
+        SetOpen = setOpen,
+        -- Exposes closedHeight/openHeight and a way to change bodyHeight at
+        -- runtime (see Components.Dropdown:Refresh below), so a caller can
+        -- rebuild the body content and have the expand/collapse size still
+        -- match the new content instead of clipping it or leaving dead space.
+        GetClosedHeight = function() return closedHeight end,
+        SetBodyHeight = function(newBodyHeight)
+            bodyHeight = newBodyHeight
+            openHeight = closedHeight + bodyHeight + 6
+            if open then
+                container.Size = UDim2.new(1, 0, 0, openHeight)
+            end
+        end,
+    }
+end
+
+-- ---------- Dropdown (single select) ----------
+-- Supports opts.Searchable = true, which adds a filter TextBox above the
+-- option list. Typing filters rows by a case-insensitive substring match
+-- on their text (Visible toggled per-row; UIListLayout ignores invisible
+-- children, so the list reflows automatically with no manual
+-- repositioning needed). opts.SearchPlaceholder overrides the placeholder
+-- text. The filter clears whenever the dropdown closes.
+function Components.Dropdown(parent, theme, connMgr, opts)
+    local optionHeight = 32
+    local searchable = opts.Searchable == true
+    local SEARCH_ROW_HEIGHT = 34
+    local optionButtons = {}
+    local options, selected
+
+    -- FIX: rows are rebuilt on every :Refresh() call (e.g. every Save/Delete
+    -- via CreateConfigList). Previously every row's connections were tracked
+    -- directly on the shared `connMgr`, so destroying+recreating rows left
+    -- the dead connections from the old rows sitting in connMgr forever —
+    -- a slow leak that grows every refresh. rowConnMgr is disconnected in
+    -- full at the top of every rebuild, right before the old buttons are
+    -- destroyed, so only the CURRENT rows' connections are ever alive.
+    local rowConnMgr = ConnectionManager.new()
+
+    local function bodyHeightFor(count)
+        local base = count * optionHeight + math.max(count - 1, 0) * 6
+        return searchable and (base + SEARCH_ROW_HEIGHT) or base
+    end
+
+    options = opts.Options or {}
+    selected = opts.Default or options[1]
+
+    local exp = Components.ExpandableHeader(parent, theme, connMgr, {
+        Text = opts.Text or "Chọn mục:",
+        LayoutOrder = opts.LayoutOrder,
+        BodyHeight = bodyHeightFor(#options),
+        -- Proxy so ExpandableHeader always calls whatever opts.OnToggle
+        -- currently is, looked up at call time — the searchable block below
+        -- reassigns opts.OnToggle *after* this header is built, so without
+        -- this indirection ExpandableHeader would keep calling `nil`
+        -- forever and the "clear filter on close" behavior would never fire.
+        OnToggle = function(isOpen) if opts.OnToggle then opts.OnToggle(isOpen) end end,
+    })
+
+    local valueLabel = Instance.new("TextLabel")
+    valueLabel.AnchorPoint = Vector2.new(1, 0.5)
+    valueLabel.Position = UDim2.new(1, -35, 0.5, 0)
+    valueLabel.Size = UDim2.new(0, 110, 1, 0)
+    valueLabel.BackgroundTransparency = 1
+    valueLabel.Text = selected or ""
+    valueLabel.TextColor3 = Color3.fromRGB(190, 190, 200)
+    valueLabel.TextXAlignment = Enum.TextXAlignment.Right
+    valueLabel.Font = Enum.Font.Gotham
+    valueLabel.TextSize = 14
+    valueLabel.TextTruncate = Enum.TextTruncate.AtEnd
+    valueLabel.Parent = exp.Header
+
+    -- Search row (only built when Searchable is true)
+    local searchBox
+    if searchable then
+        local searchHolder = Instance.new("Frame")
+        searchHolder.Size = UDim2.new(1, 0, 0, 28)
+        searchHolder.LayoutOrder = 0
+        searchHolder.BackgroundTransparency = 1
+        searchHolder.Parent = exp.Body
+
+        searchBox = Instance.new("TextBox")
+        searchBox.Size = UDim2.new(1, 0, 1, 0)
+        searchBox.Text = ""
+        searchBox.PlaceholderText = opts.SearchPlaceholder or "Tìm kiếm..."
+        searchBox.PlaceholderColor3 = Color3.fromRGB(150, 150, 160)
+        searchBox.TextColor3 = Color3.fromRGB(255, 255, 255)
+        searchBox.Font = Enum.Font.Gotham
+        searchBox.TextSize = 13
+        searchBox.ClearTextOnFocus = false
+        searchBox.TextXAlignment = Enum.TextXAlignment.Left
+        searchBox.Parent = searchHolder
+        Utils.AddPadding(searchBox, UDim.new(0, 10))
+        Utils.AddCorner(searchBox, UDim.new(0, 6))
+
+        exp._searchHolder = searchHolder
+    end
+
+    local list = Instance.new("Frame")
+    list.Size = UDim2.new(1, 0, 1, 0)
+    list.Position = searchable and UDim2.new(0, 0, 0, SEARCH_ROW_HEIGHT) or UDim2.new(0, 0, 0, 0)
+    list.BackgroundTransparency = 1
+    list.Parent = exp.Body
+    local layout = Instance.new("UIListLayout")
+    layout.SortOrder = Enum.SortOrder.LayoutOrder
+    layout.Padding = UDim.new(0, 6)
+    layout.Parent = list
+
+    local function baseColorFor(text)
+        return (text == selected) and theme.Accent or Utils.Darken(theme.Color, 0.8)
+    end
+
+    local function select(text)
+        selected = text
+        valueLabel.Text = text or ""
+        for _, row in ipairs(optionButtons) do
+            local isSel = (row.text == text)
+            TweenService:Create(row.btn, TweenInfo.new(0.25, EASE, EASE_OUT), {
+                BackgroundColor3 = isSel and theme.Accent or Utils.Darken(theme.Color, 0.8)
+            }):Play()
+        end
+        if opts.Callback then opts.Callback(text) end
+    end
+
+    -- Filters existing rows by Visible instead of destroying/rebuilding
+    -- them, so filtering while typing stays cheap (no Instance churn per
+    -- keystroke). UIListLayout automatically skips invisible children, so
+    -- the visible rows reflow with no gaps.
+    local function applyFilter(query)
+        query = (query or ""):lower()
+        for _, row in ipairs(optionButtons) do
+            row.btn.Visible = (query == "") or row.text:lower():find(query, 1, true) ~= nil
+        end
+    end
+
+    -- Rebuilds the option rows in `list` from the `options` array. Used both
+    -- at creation and by :Refresh() below, so a Dropdown's Options can be
+    -- repopulated at runtime (e.g. a "saved configs" list that changes as
+    -- the user saves new ones) instead of being frozen at creation time.
+    local function rebuildOptions()
+        rowConnMgr:DisconnectAll() -- drop connections belonging to the OLD rows first
+        for _, row in ipairs(optionButtons) do row.btn:Destroy() end
+        table.clear(optionButtons)
+
+        for i, text in ipairs(options) do
+            local btn = Instance.new("TextButton")
+            btn.Size = UDim2.new(1, 0, 0, optionHeight)
+            btn.LayoutOrder = i
+            btn.BackgroundColor3 = baseColorFor(text)
+            btn.Text = text
+            btn.TextXAlignment = Enum.TextXAlignment.Left
+            btn.TextColor3 = Color3.fromRGB(255, 255, 255)
+            btn.Font = Enum.Font.Gotham
+            btn.TextSize = 14
+            btn.Parent = list
+            Utils.AddCorner(btn, UDim.new(0, 6))
+            Utils.AddPadding(btn, UDim.new(0, 10))
+            Animator.AddThickenStroke(btn, rowConnMgr)
+
+            rowConnMgr:Track(btn.MouseEnter:Connect(function()
+                TweenService:Create(btn, TweenInfo.new(0.18, EASE, EASE_OUT), { BackgroundColor3 = Utils.Brighten(baseColorFor(text), 1.2) }):Play()
+            end))
+            rowConnMgr:Track(btn.MouseLeave:Connect(function()
+                TweenService:Create(btn, TweenInfo.new(0.18, EASE, EASE_OUT), { BackgroundColor3 = baseColorFor(text) }):Play()
+            end))
+            rowConnMgr:Track(btn.MouseButton1Click:Connect(function() select(text) end))
+
+            table.insert(optionButtons, { btn = btn, text = text })
+        end
+
+        if searchable then applyFilter(searchBox.Text) end
+    end
+    rebuildOptions()
+
+    if searchable then
+        connMgr:Track(searchBox:GetPropertyChangedSignal("Text"):Connect(function()
+            applyFilter(searchBox.Text)
+        end))
+        -- Clear the filter (and refocus the list) whenever the dropdown
+        -- closes, so reopening it always starts from the full list.
+        local origToggle = opts.OnToggle
+        opts.OnToggle = function(isOpen)
+            if not isOpen then
+                searchBox.Text = ""
+                applyFilter("")
+            end
+            if origToggle then origToggle(isOpen) end
+        end
+    end
+
+    local self = { Instance = exp.Container }
+    function self:Get() return selected end
+    -- Programmatically select an option (used by Window:LoadConfig).
+    -- Silently ignores values that aren't in the current Options list.
+    function self:Set(v)
+        local found = false
+        for _, t in ipairs(options) do if t == v then found = true break end end
+        if not found then return end
+        select(v)
+    end
+    -- Replaces the Options list at runtime and rebuilds the option rows +
+    -- the expand/collapse body height to match. If keepSelection is false
+    -- (default), selection falls back to the first new option (or nil if
+    -- newOptions is empty); if true, the current selection is kept when it
+    -- still exists in newOptions, otherwise it also falls back.
+    function self:Refresh(newOptions, keepSelection)
+        options = newOptions or {}
+        if keepSelection then
+            local stillValid = false
+            for _, t in ipairs(options) do if t == selected then stillValid = true break end end
+            if not stillValid then selected = options[1] end
+        else
+            selected = options[1]
+        end
+        exp.SetBodyHeight(bodyHeightFor(#options))
+        rebuildOptions()
+        valueLabel.Text = selected or ""
+    end
+    -- Drops the row-level connections. Not called automatically (the
+    -- Container is normally torn down with the rest of the window via
+    -- connMgr:DisconnectAll()), but exposed for symmetry with the
+    -- {Instance, ApplyTheme, Destroy} component contract and for anyone
+    -- who wants to discard a Dropdown independently of its window.
+    function self:Destroy()
+        rowConnMgr:DisconnectAll()
+    end
+    function self:ApplyTheme(color, accent, isInitial)
+        local panelBg = Utils.Brighten(color, 1.2)
+        local headerTextColor = Utils.GetTextColorFor(panelBg, accent)
+        local valueTextColor = (Utils.GetLuminance(panelBg) > 0.55) and Color3.fromRGB(90, 90, 100) or Color3.fromRGB(190, 190, 200)
+        local darkBg = Utils.Darken(color, 0.8)
+        if isInitial then
+            exp.Header.BackgroundColor3 = panelBg
+            exp.TitleLabel.TextColor3 = headerTextColor
+            valueLabel.TextColor3 = valueTextColor
+            for _, row in ipairs(optionButtons) do row.btn.BackgroundColor3 = baseColorFor(row.text) end
+            if searchable then
+                searchBox.BackgroundColor3 = darkBg
+                searchBox.TextColor3 = Utils.GetTextColorFor(darkBg, accent)
+            end
+        else
+            TweenService:Create(exp.Header, THEME_TWEEN_INFO, { BackgroundColor3 = panelBg }):Play()
+            TweenService:Create(exp.TitleLabel, THEME_TWEEN_INFO, { TextColor3 = headerTextColor }):Play()
+            TweenService:Create(valueLabel, THEME_TWEEN_INFO, { TextColor3 = valueTextColor }):Play()
+            for _, row in ipairs(optionButtons) do
+                TweenService:Create(row.btn, THEME_TWEEN_INFO, { BackgroundColor3 = baseColorFor(row.text) }):Play()
+            end
+            if searchable then
+                TweenService:Create(searchBox, THEME_TWEEN_INFO, {
+                    BackgroundColor3 = darkBg,
+                    TextColor3 = Utils.GetTextColorFor(darkBg, accent),
+                }):Play()
+            end
+        end
+    end
+    theme:Subscribe(function(c, a, initial) self:ApplyTheme(c, a, initial) end)
+    return self
+end
+
+-- ---------- MultiDropdown ----------
+-- Same opts.Searchable support as Dropdown above.
+function Components.MultiDropdown(parent, theme, connMgr, opts)
+    local options = opts.Options or {}
+    local optionHeight = 32
+    local searchable = opts.Searchable == true
+    local SEARCH_ROW_HEIGHT = 34
+    local selectedSet = {}
+    for _, v in ipairs(opts.Default or {}) do selectedSet[v] = true end
+
+    -- Same fix as Dropdown above: row connections live on their own
+    -- ConnectionManager so :Refresh() can drop the old rows' connections
+    -- instead of leaking them into the shared window connMgr.
+    local rowConnMgr = ConnectionManager.new()
+
+    local function bodyHeightFor(count)
+        local base = count * optionHeight + math.max(count - 1, 0) * 6
+        return searchable and (base + SEARCH_ROW_HEIGHT) or base
+    end
+
+    local exp = Components.ExpandableHeader(parent, theme, connMgr, {
+        Text = opts.Text or "Chọn nhiều:",
+        LayoutOrder = opts.LayoutOrder,
+        BodyHeight = bodyHeightFor(#options),
+        -- Same OnToggle proxy fix as Dropdown above.
+        OnToggle = function(isOpen) if opts.OnToggle then opts.OnToggle(isOpen) end end,
+    })
+
+    local function summaryText()
+        local names = {}
+        for _, text in ipairs(options) do
+            if selectedSet[text] then table.insert(names, text) end
+        end
+        if #names == 0 then return "Chưa chọn" end
+        if #names == 1 then return names[1] end
+        return #names .. " đã chọn"
+    end
+
+    local valueLabel = Instance.new("TextLabel")
+    valueLabel.AnchorPoint = Vector2.new(1, 0.5)
+    valueLabel.Position = UDim2.new(1, -35, 0.5, 0)
+    valueLabel.Size = UDim2.new(0, 110, 1, 0)
+    valueLabel.BackgroundTransparency = 1
+    valueLabel.Text = summaryText()
+    valueLabel.TextColor3 = Color3.fromRGB(190, 190, 200)
+    valueLabel.TextXAlignment = Enum.TextXAlignment.Right
+    valueLabel.Font = Enum.Font.Gotham
+    valueLabel.TextSize = 14
+    valueLabel.TextTruncate = Enum.TextTruncate.AtEnd
+    valueLabel.Parent = exp.Header
+
+    local searchBox
+    if searchable then
+        local searchHolder = Instance.new("Frame")
+        searchHolder.Size = UDim2.new(1, 0, 0, 28)
+        searchHolder.LayoutOrder = 0
+        searchHolder.BackgroundTransparency = 1
+        searchHolder.Parent = exp.Body
+
+        searchBox = Instance.new("TextBox")
+        searchBox.Size = UDim2.new(1, 0, 1, 0)
+        searchBox.Text = ""
+        searchBox.PlaceholderText = opts.SearchPlaceholder or "Tìm kiếm..."
+        searchBox.PlaceholderColor3 = Color3.fromRGB(150, 150, 160)
+        searchBox.TextColor3 = Color3.fromRGB(255, 255, 255)
+        searchBox.Font = Enum.Font.Gotham
+        searchBox.TextSize = 13
+        searchBox.ClearTextOnFocus = false
+        searchBox.TextXAlignment = Enum.TextXAlignment.Left
+        searchBox.Parent = searchHolder
+        Utils.AddPadding(searchBox, UDim.new(0, 10))
+        Utils.AddCorner(searchBox, UDim.new(0, 6))
+    end
+
+    local list = Instance.new("Frame")
+    list.Size = UDim2.new(1, 0, 1, 0)
+    list.Position = searchable and UDim2.new(0, 0, 0, SEARCH_ROW_HEIGHT) or UDim2.new(0, 0, 0, 0)
+    list.BackgroundTransparency = 1
+    list.Parent = exp.Body
+    local layout = Instance.new("UIListLayout")
+    layout.SortOrder = Enum.SortOrder.LayoutOrder
+    layout.Padding = UDim.new(0, 6)
+    layout.Parent = list
+
+    local rows = {}
+    local function baseColorFor(text)
+        return selectedSet[text] and theme.Accent or Utils.Darken(theme.Color, 0.8)
+    end
+
+    local function toggle(text)
+        selectedSet[text] = (not selectedSet[text]) or nil
+        for _, row in ipairs(rows) do
+            if row.text == text then
+                local isSel = selectedSet[text] and true or false
+                TweenService:Create(row.btn, TweenInfo.new(0.25, EASE, EASE_OUT), { BackgroundColor3 = baseColorFor(text) }):Play()
+                TweenService:Create(row.check, TweenInfo.new(0.25, EASE, EASE_OUT), { TextTransparency = isSel and 0 or 1 }):Play()
+            end
+        end
+        valueLabel.Text = summaryText()
+        if opts.Callback then
+            local out = {}
+            for _, t in ipairs(options) do if selectedSet[t] then table.insert(out, t) end end
+            opts.Callback(out)
+        end
+    end
+
+    local function applyFilter(query)
+        query = (query or ""):lower()
+        for _, row in ipairs(rows) do
+            row.btn.Visible = (query == "") or row.text:lower():find(query, 1, true) ~= nil
+        end
+    end
+
+    -- Rebuilds the option rows in `list` from the `options` array. Used both
+    -- at creation and by :Refresh() below (mirrors Dropdown:Refresh).
+    local function rebuildRows()
+        rowConnMgr:DisconnectAll() -- drop connections belonging to the OLD rows first
+        for _, row in ipairs(rows) do row.btn:Destroy() end
+        table.clear(rows)
+
+        for i, text in ipairs(options) do
+            local btn = Instance.new("TextButton")
+            btn.Size = UDim2.new(1, 0, 0, optionHeight)
+            btn.LayoutOrder = i
+            btn.BackgroundColor3 = baseColorFor(text)
+            btn.Text = "   " .. text
+            btn.TextXAlignment = Enum.TextXAlignment.Left
+            btn.TextColor3 = Color3.fromRGB(255, 255, 255)
+            btn.Font = Enum.Font.Gotham
+            btn.TextSize = 14
+            btn.Parent = list
+            Utils.AddCorner(btn, UDim.new(0, 6))
+            Utils.AddPadding(btn, UDim.new(0, 10))
+
+            local check = Instance.new("TextLabel")
+            check.AnchorPoint = Vector2.new(1, 0.5)
+            check.Position = UDim2.new(1, -10, 0.5, 0)
+            check.Size = UDim2.new(0, 20, 1, 0)
+            check.BackgroundTransparency = 1
+            check.Text = "✓"
+            check.TextColor3 = Color3.fromRGB(255, 255, 255)
+            check.Font = Enum.Font.GothamBold
+            check.TextSize = 16
+            check.TextTransparency = selectedSet[text] and 0 or 1
+            check.Parent = btn
+
+            Animator.AddThickenStroke(btn, rowConnMgr)
+            rowConnMgr:Track(btn.MouseEnter:Connect(function()
+                TweenService:Create(btn, TweenInfo.new(0.18, EASE, EASE_OUT), { BackgroundColor3 = Utils.Brighten(baseColorFor(text), 1.2) }):Play()
+            end))
+            rowConnMgr:Track(btn.MouseLeave:Connect(function()
+                TweenService:Create(btn, TweenInfo.new(0.18, EASE, EASE_OUT), { BackgroundColor3 = baseColorFor(text) }):Play()
+            end))
+            rowConnMgr:Track(btn.MouseButton1Click:Connect(function() toggle(text) end))
+
+            table.insert(rows, { btn = btn, check = check, text = text })
+        end
+
+        if searchable then applyFilter(searchBox.Text) end
+    end
+    rebuildRows()
+
+    if searchable then
+        connMgr:Track(searchBox:GetPropertyChangedSignal("Text"):Connect(function()
+            applyFilter(searchBox.Text)
+        end))
+        local origToggle = opts.OnToggle
+        opts.OnToggle = function(isOpen)
+            if not isOpen then
+                searchBox.Text = ""
+                applyFilter("")
+            end
+            if origToggle then origToggle(isOpen) end
+        end
+    end
+
+    local self = { Instance = exp.Container }
+    function self:Get()
+        local out = {}
+        for _, t in ipairs(options) do if selectedSet[t] then table.insert(out, t) end end
+        return out
+    end
+    -- Programmatically set the full selection (used by Window:LoadConfig).
+    -- Expects an array of option strings; rebuilds selectedSet and restyles
+    -- every row + the summary label to match.
+    function self:Set(list_)
+        local newSet = {}
+        for _, v in ipairs(list_ or {}) do newSet[v] = true end
+        selectedSet = newSet
+        for _, row in ipairs(rows) do
+            local isSel = selectedSet[row.text] and true or false
+            TweenService:Create(row.btn, TweenInfo.new(0.25, EASE, EASE_OUT), { BackgroundColor3 = baseColorFor(row.text) }):Play()
+            TweenService:Create(row.check, TweenInfo.new(0.25, EASE, EASE_OUT), { TextTransparency = isSel and 0 or 1 }):Play()
+        end
+        valueLabel.Text = summaryText()
+        if opts.Callback then
+            local out = {}
+            for _, t in ipairs(options) do if selectedSet[t] then table.insert(out, t) end end
+            opts.Callback(out)
+        end
+    end
+    -- Replaces the Options list at runtime, same contract as
+    -- Dropdown:Refresh (keepSelection preserves any still-valid selected
+    -- entries instead of clearing the whole selection).
+    function self:Refresh(newOptions, keepSelection)
+        options = newOptions or {}
+        if keepSelection then
+            local newSet = {}
+            for _, t in ipairs(options) do
+                if selectedSet[t] then newSet[t] = true end
+            end
+            selectedSet = newSet
+        else
+            selectedSet = {}
+        end
+        exp.SetBodyHeight(bodyHeightFor(#options))
+        rebuildRows()
+        valueLabel.Text = summaryText()
+    end
+    -- See Dropdown:Destroy above.
+    function self:Destroy()
+        rowConnMgr:DisconnectAll()
+    end
+    function self:ApplyTheme(color, accent, isInitial)
+        local panelBg = Utils.Brighten(color, 1.2)
+        local headerTextColor = Utils.GetTextColorFor(panelBg, accent)
+        local valueTextColor = (Utils.GetLuminance(panelBg) > 0.55) and Color3.fromRGB(90, 90, 100) or Color3.fromRGB(190, 190, 200)
+        local darkBg = Utils.Darken(color, 0.8)
+        if isInitial then
+            exp.Header.BackgroundColor3 = panelBg
+            exp.TitleLabel.TextColor3 = headerTextColor
+            valueLabel.TextColor3 = valueTextColor
+            for _, row in ipairs(rows) do row.btn.BackgroundColor3 = baseColorFor(row.text) end
+            if searchable then
+                searchBox.BackgroundColor3 = darkBg
+                searchBox.TextColor3 = Utils.GetTextColorFor(darkBg, accent)
+            end
+        else
+            TweenService:Create(exp.Header, THEME_TWEEN_INFO, { BackgroundColor3 = panelBg }):Play()
+            TweenService:Create(exp.TitleLabel, THEME_TWEEN_INFO, { TextColor3 = headerTextColor }):Play()
+            TweenService:Create(valueLabel, THEME_TWEEN_INFO, { TextColor3 = valueTextColor }):Play()
+            for _, row in ipairs(rows) do
+                TweenService:Create(row.btn, THEME_TWEEN_INFO, { BackgroundColor3 = baseColorFor(row.text) }):Play()
+            end
+            if searchable then
+                TweenService:Create(searchBox, THEME_TWEEN_INFO, {
+                    BackgroundColor3 = darkBg,
+                    TextColor3 = Utils.GetTextColorFor(darkBg, accent),
+                }):Play()
+            end
+        end
+    end
+    theme:Subscribe(function(c, a, initial) self:ApplyTheme(c, a, initial) end)
+    return self
+end
+
+-- ---------- ColorPicker ----------
+function Components.ColorPicker(parent, theme, connMgr, opts)
+    local hue, sat, val = 0, 0, 1
+    if opts.Default then hue, sat, val = opts.Default:ToHSV() end
+
+    local BODY_HEIGHT = 406
+    local exp = Components.ExpandableHeader(parent, theme, connMgr, {
+        Text = opts.Text or "Chọn màu:",
+        LayoutOrder = opts.LayoutOrder,
+        BodyHeight = BODY_HEIGHT,
+    })
+
+    local function current() return Color3.fromHSV(hue, sat, val) end
+
+    local hexLabel = Instance.new("TextLabel")
+    hexLabel.AnchorPoint = Vector2.new(1, 0.5)
+    hexLabel.Position = UDim2.new(1, -60, 0.5, 0)
+    hexLabel.Size = UDim2.new(0, 80, 1, 0)
+    hexLabel.BackgroundTransparency = 1
+    hexLabel.Text = Utils.ToHex(current())
+    hexLabel.TextColor3 = Color3.fromRGB(190, 190, 200)
+    hexLabel.TextXAlignment = Enum.TextXAlignment.Right
+    hexLabel.Font = Enum.Font.Gotham
+    hexLabel.TextSize = 14
+    hexLabel.Parent = exp.Header
+
+    local swatch = Instance.new("Frame")
+    swatch.AnchorPoint = Vector2.new(1, 0.5)
+    swatch.Position = UDim2.new(1, -38, 0.5, 0)
+    swatch.Size = UDim2.new(0, 22, 0, 22)
+    swatch.BackgroundColor3 = current()
+    swatch.BorderSizePixel = 0
+    swatch.Parent = exp.Header
+    Utils.AddCorner(swatch, UDim.new(0, 6))
+    local swatchStroke = Instance.new("UIStroke")
+    swatchStroke.Color = Color3.fromRGB(255, 255, 255)
+    swatchStroke.Transparency = 0.6
+    swatchStroke.Parent = swatch
+
+    -- SV box
+    local sv = Instance.new("TextButton")
+    sv.Size = UDim2.new(1, 0, 0, 150)
+    sv.BackgroundColor3 = Color3.fromHSV(hue, 1, 1)
+    sv.Text = ""
+    sv.AutoButtonColor = false
+    sv.ClipsDescendants = true
+    sv.Parent = exp.Body
+    Utils.AddCorner(sv, UDim.new(0, 8))
+
+    local svWhite = Instance.new("Frame")
+    svWhite.Size = UDim2.new(1, 0, 1, 0)
+    svWhite.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+    svWhite.BorderSizePixel = 0
+    svWhite.ZIndex = 1
+    svWhite.Parent = sv
+    Utils.AddCorner(svWhite, UDim.new(0, 8))
+    local svSatGrad = Instance.new("UIGradient")
+    svSatGrad.Color = ColorSequence.new(Color3.fromRGB(255, 255, 255), Color3.fromRGB(255, 255, 255))
+    svSatGrad.Transparency = NumberSequence.new(0, 1)
+    svSatGrad.Parent = svWhite
+
+    local svBlack = Instance.new("Frame")
+    svBlack.Size = UDim2.new(1, 0, 1, 0)
+    svBlack.BackgroundColor3 = Color3.fromRGB(0, 0, 0)
+    svBlack.BorderSizePixel = 0
+    svBlack.ZIndex = 2
+    svBlack.Parent = sv
+    Utils.AddCorner(svBlack, UDim.new(0, 8))
+    local svValGrad = Instance.new("UIGradient")
+    svValGrad.Rotation = 90
+    svValGrad.Color = ColorSequence.new(Color3.fromRGB(0, 0, 0), Color3.fromRGB(0, 0, 0))
+    svValGrad.Transparency = NumberSequence.new(1, 0)
+    svValGrad.Parent = svBlack
+
+    local svCursor = Instance.new("Frame")
+    svCursor.Size = UDim2.new(0, 14, 0, 14)
+    svCursor.AnchorPoint = Vector2.new(0.5, 0.5)
+    svCursor.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+    svCursor.BorderSizePixel = 0
+    svCursor.ZIndex = 3
+    svCursor.Parent = sv
+    Utils.AddCorner(svCursor, UDim.new(1, 0))
+    local svCursorStroke = Instance.new("UIStroke")
+    svCursorStroke.Thickness = 2
+    svCursorStroke.Color = Color3.fromRGB(20, 20, 25)
+    svCursorStroke.Parent = svCursor
+
+    -- Hue bar
+    local hueBar = Instance.new("TextButton")
+    hueBar.Size = UDim2.new(1, 0, 0, 18)
+    hueBar.Position = UDim2.new(0, 0, 0, 162)
+    hueBar.Text = ""
+    hueBar.AutoButtonColor = false
+    hueBar.Parent = exp.Body
+    Utils.AddCorner(hueBar, UDim.new(1, 0))
+    local hueGrad = Instance.new("UIGradient")
+    hueGrad.Color = ColorSequence.new({
+        ColorSequenceKeypoint.new(0.000, Color3.fromRGB(255, 0, 0)),
+        ColorSequenceKeypoint.new(0.167, Color3.fromRGB(255, 255, 0)),
+        ColorSequenceKeypoint.new(0.333, Color3.fromRGB(0, 255, 0)),
+        ColorSequenceKeypoint.new(0.500, Color3.fromRGB(0, 255, 255)),
+        ColorSequenceKeypoint.new(0.667, Color3.fromRGB(0, 0, 255)),
+        ColorSequenceKeypoint.new(0.833, Color3.fromRGB(255, 0, 255)),
+        ColorSequenceKeypoint.new(1.000, Color3.fromRGB(255, 0, 0)),
+    })
+    hueGrad.Parent = hueBar
+    local hueCursor = Instance.new("Frame")
+    hueCursor.Size = UDim2.new(0, 6, 1, 6)
+    hueCursor.AnchorPoint = Vector2.new(0.5, 0.5)
+    hueCursor.Position = UDim2.new(0, 0, 0.5, 0)
+    hueCursor.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+    hueCursor.BorderSizePixel = 0
+    hueCursor.ZIndex = 3
+    hueCursor.Parent = hueBar
+    Utils.AddCorner(hueCursor, UDim.new(0, 3))
+    local hueCursorStroke = Instance.new("UIStroke")
+    hueCursorStroke.Thickness = 1.5
+    hueCursorStroke.Color = Color3.fromRGB(20, 20, 25)
+    hueCursorStroke.Parent = hueCursor
+
+    -- Black/white (value) bar
+    local bwBar = Instance.new("TextButton")
+    bwBar.Size = UDim2.new(1, 0, 0, 18)
+    bwBar.Position = UDim2.new(0, 0, 0, 188)
+    bwBar.Text = ""
+    bwBar.AutoButtonColor = false
+    bwBar.Parent = exp.Body
+    Utils.AddCorner(bwBar, UDim.new(1, 0))
+    local bwGrad = Instance.new("UIGradient")
+    bwGrad.Color = ColorSequence.new(Color3.fromRGB(0, 0, 0), Color3.fromRGB(255, 255, 255))
+    bwGrad.Parent = bwBar
+    local bwCursor = Instance.new("Frame")
+    bwCursor.Size = UDim2.new(0, 6, 1, 6)
+    bwCursor.AnchorPoint = Vector2.new(0.5, 0.5)
+    bwCursor.Position = UDim2.new(0, 0, 0.5, 0)
+    bwCursor.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+    bwCursor.BorderSizePixel = 0
+    bwCursor.ZIndex = 3
+    bwCursor.Parent = bwBar
+    Utils.AddCorner(bwCursor, UDim.new(0, 3))
+    local bwCursorStroke = Instance.new("UIStroke")
+    bwCursorStroke.Thickness = 1.5
+    bwCursorStroke.Color = Color3.fromRGB(20, 20, 25)
+    bwCursorStroke.Parent = bwCursor
+
+    -- Hex input
+    local hexRow = Instance.new("Frame")
+    hexRow.Size = UDim2.new(1, 0, 0, 32)
+    hexRow.Position = UDim2.new(0, 0, 0, 214)
+    hexRow.BackgroundTransparency = 1
+    hexRow.Parent = exp.Body
+    local hexRowLabel = Instance.new("TextLabel")
+    hexRowLabel.Size = UDim2.new(0, 40, 1, 0)
+    hexRowLabel.BackgroundTransparency = 1
+    hexRowLabel.Text = "HEX:"
+    hexRowLabel.TextColor3 = Color3.fromRGB(200, 200, 210)
+    hexRowLabel.Font = Enum.Font.GothamBold
+    hexRowLabel.TextSize = 14
+    hexRowLabel.TextXAlignment = Enum.TextXAlignment.Left
+    hexRowLabel.Parent = hexRow
+    local hexBox = Instance.new("TextBox")
+    hexBox.AnchorPoint = Vector2.new(1, 0.5)
+    hexBox.Position = UDim2.new(1, 0, 0.5, 0)
+    hexBox.Size = UDim2.new(0, 110, 0, 28)
+    hexBox.BackgroundColor3 = Color3.fromRGB(20, 20, 25)
+    hexBox.Text = Utils.ToHex(current())
+    hexBox.TextColor3 = Color3.fromRGB(255, 255, 255)
+    hexBox.Font = Enum.Font.Gotham
+    hexBox.TextSize = 14
+    hexBox.ClearTextOnFocus = false
+    hexBox.Parent = hexRow
+    Utils.AddCorner(hexBox, UDim.new(0, 6))
+    Utils.AddPadding(hexBox, UDim.new(0, 8))
+
+    -- RGB inputs (vertical, non-overlapping)
+    local rgbRow = Instance.new("Frame")
+    rgbRow.Size = UDim2.new(1, 0, 0, 108)
+    rgbRow.Position = UDim2.new(0, 0, 0, 254)
+    rgbRow.BackgroundTransparency = 1
+    rgbRow.Parent = exp.Body
+    local rgbLayout = Instance.new("UIListLayout")
+    rgbLayout.Padding = UDim.new(0, 6)
+    rgbLayout.Parent = rgbRow
+
+    local refresh -- forward declaration
+
+    local function sanitizeRGBText(txt)
+        local filtered = txt:gsub("%D", "")
+        if #filtered > 3 then filtered = filtered:sub(1, 3) end
+        local num = tonumber(filtered) or 0
+        if num > 255 then filtered = "255" end
+        if filtered == "" then filtered = "0" end
+        return filtered
+    end
+
+    -- RGB fields used to call refresh() on EVERY keystroke via
+    -- GetPropertyChangedSignal("Text"), which re-set ~10 properties (hex
+    -- label, all three color bars, both cursors, swatch, sibling boxes)
+    -- per character typed. Typing "255" fired 3 full refreshes. Debounced
+    -- with task.defer so rapid keystrokes within the same frame collapse
+    -- into a single refresh, while still feeling instant to the user.
+    local rgbRefreshPending = false
+    local function requestRGBRefresh(onCommit)
+        if rgbRefreshPending then return end
+        rgbRefreshPending = true
+        task.defer(function()
+            rgbRefreshPending = false
+            onCommit()
+        end)
+    end
+
+    -- Labels created for each RGB field (R:/G:/B:), tracked here so
+    -- ApplyTheme can restyle them like every other field label — previously
+    -- they (and the hex/RGB input boxes below) were left at a fixed color
+    -- and never reacted to a theme change at all, unlike the visually
+    -- identical Components.Textbox input.
+    local rgbLabels = {}
+
+    local function makeRGBField(labelText, order, onCommit)
+        local holder = Instance.new("Frame")
+        holder.Size = UDim2.new(1, 0, 0, 32)
+        holder.LayoutOrder = order
+        holder.BackgroundTransparency = 1
+        holder.Parent = rgbRow
+        local lbl = Instance.new("TextLabel")
+        lbl.Size = UDim2.new(0, 30, 1, 0)
+        lbl.BackgroundTransparency = 1
+        lbl.Text = labelText
+        lbl.TextColor3 = Color3.fromRGB(200, 200, 210)
+        lbl.Font = Enum.Font.GothamBold
+        lbl.TextSize = 14
+        lbl.TextXAlignment = Enum.TextXAlignment.Left
+        lbl.Parent = holder
+        table.insert(rgbLabels, lbl)
+        local box = Instance.new("TextBox")
+        box.Position = UDim2.new(0, 34, 0, 0)
+        box.Size = UDim2.new(1, -34, 1, 0)
+        box.BackgroundColor3 = Color3.fromRGB(20, 20, 25)
+        box.Text = "0"
+        box.TextColor3 = Color3.fromRGB(255, 255, 255)
+        box.Font = Enum.Font.Gotham
+        box.TextSize = 14
+        box.ClearTextOnFocus = false
+        box.Parent = holder
+        Utils.AddCorner(box, UDim.new(0, 6))
+        Utils.AddPadding(box, UDim.new(0, 6))
+
+        local isUpdating = false
+        connMgr:Track(box:GetPropertyChangedSignal("Text"):Connect(function()
+            if isUpdating then return end
+            local clean = sanitizeRGBText(box.Text)
+            if clean ~= box.Text then
+                isUpdating = true
+                box.Text = clean
+                box.CursorPosition = #clean + 1
+                isUpdating = false
+            end
+            requestRGBRefresh(onCommit)
+        end))
+        connMgr:Track(box.FocusLost:Connect(function()
+            local clean = sanitizeRGBText(box.Text)
+            if clean ~= box.Text then box.Text = clean end
+            onCommit()
+        end))
+        return box
+    end
+
+    local rBox, gBox, bBox
+    local function updateColorFromRGB()
+        local r = math.clamp(tonumber(rBox.Text) or 0, 0, 255)
+        local g = math.clamp(tonumber(gBox.Text) or 0, 0, 255)
+        local b = math.clamp(tonumber(bBox.Text) or 0, 0, 255)
+        hue, sat, val = Color3.fromRGB(r, g, b):ToHSV()
+        refresh()
+    end
+    rBox = makeRGBField("R:", 1, updateColorFromRGB)
+    gBox = makeRGBField("G:", 2, updateColorFromRGB)
+    bBox = makeRGBField("B:", 3, updateColorFromRGB)
+
+    -- Presets
+    local presetColors = opts.Presets or {
+        Color3.fromRGB(255, 255, 255), Color3.fromRGB(0, 0, 0),
+        Color3.fromRGB(255, 60, 60), Color3.fromRGB(255, 150, 40),
+        Color3.fromRGB(255, 230, 50), Color3.fromRGB(60, 220, 90),
+        Color3.fromRGB(50, 210, 220), Color3.fromRGB(60, 120, 255),
+        Color3.fromRGB(170, 80, 255), Color3.fromRGB(255, 90, 180),
+    }
+    local presetRow = Instance.new("Frame")
+    presetRow.Size = UDim2.new(1, 0, 0, 26)
+    presetRow.Position = UDim2.new(0, 0, 0, 370)
+    presetRow.BackgroundTransparency = 1
+    presetRow.Parent = exp.Body
+    local presetLayout = Instance.new("UIListLayout")
+    presetLayout.FillDirection = Enum.FillDirection.Horizontal
+    presetLayout.Padding = UDim.new(0, 6)
+    presetLayout.Parent = presetRow
+
+    refresh = function()
+        local pureHue = Color3.fromHSV(hue, 1, 1)
+        sv.BackgroundColor3 = pureHue
+        local picked = current()
+        swatch.BackgroundColor3 = picked
+        hexLabel.Text = Utils.ToHex(picked)
+        if not hexBox:IsFocused() then hexBox.Text = Utils.ToHex(picked) end
+        if not rBox:IsFocused() then rBox.Text = tostring(math.floor(picked.R * 255 + 0.5)) end
+        if not gBox:IsFocused() then gBox.Text = tostring(math.floor(picked.G * 255 + 0.5)) end
+        if not bBox:IsFocused() then bBox.Text = tostring(math.floor(picked.B * 255 + 0.5)) end
+        svCursor.Position = UDim2.new(sat, 0, 1 - val, 0)
+        hueCursor.Position = UDim2.new(hue, 0, 0.5, 0)
+        bwCursor.Position = UDim2.new(val, 0, 0.5, 0)
+        bwGrad.Color = ColorSequence.new(Color3.fromRGB(0, 0, 0), Color3.fromHSV(hue, sat, 1))
+        if opts.Callback then opts.Callback(picked) end
+    end
+
+    for _, presetColor in ipairs(presetColors) do
+        local pbtn = Instance.new("TextButton")
+        pbtn.Size = UDim2.new(0, 26, 0, 26)
+        pbtn.BackgroundColor3 = presetColor
+        pbtn.Text = ""
+        pbtn.Parent = presetRow
+        Utils.AddCorner(pbtn, UDim.new(0, 6))
+        Animator.AddThickenStroke(pbtn, connMgr)
+        connMgr:Track(pbtn.MouseButton1Click:Connect(function()
+            hue, sat, val = presetColor:ToHSV()
+            refresh()
+        end))
+    end
+
+    -- Drag handling for SV box / hue bar / bw bar
+    local activeDrag = nil
+    local function updateSV(pos)
+        local absPos, absSize = sv.AbsolutePosition, sv.AbsoluteSize
+        sat = math.clamp((pos.X - absPos.X) / absSize.X, 0, 1)
+        val = 1 - math.clamp((pos.Y - absPos.Y) / absSize.Y, 0, 1)
+        refresh()
+    end
+    local function updateHue(pos)
+        local absPos, absSize = hueBar.AbsolutePosition, hueBar.AbsoluteSize
+        hue = math.clamp((pos.X - absPos.X) / absSize.X, 0, 1)
+        refresh()
+    end
+    local function updateBW(pos)
+        local absPos, absSize = bwBar.AbsolutePosition, bwBar.AbsoluteSize
+        val = math.clamp((pos.X - absPos.X) / absSize.X, 0, 1)
+        refresh()
+    end
+
+    connMgr:Track(sv.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            activeDrag = "sv"; updateSV(input.Position)
+        end
+    end))
+    connMgr:Track(hueBar.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            activeDrag = "hue"; updateHue(input.Position)
+        end
+    end))
+    connMgr:Track(bwBar.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            activeDrag = "bw"; updateBW(input.Position)
+        end
+    end))
+    connMgr:Track(UserInputService.InputEnded:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            activeDrag = nil
+        end
+    end))
+    connMgr:Track(UserInputService.InputChanged:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then
+            if activeDrag == "sv" then updateSV(input.Position)
+            elseif activeDrag == "hue" then updateHue(input.Position)
+            elseif activeDrag == "bw" then updateBW(input.Position) end
+        end
+    end))
+
+    connMgr:Track(hexBox.FocusLost:Connect(function(enterPressed)
+        if enterPressed then
+            local color, ok = Utils.HexToColor3(hexBox.Text)
+            if ok then
+                hue, sat, val = color:ToHSV()
+                refresh()
+                return
+            end
+        end
+        hexBox.Text = Utils.ToHex(current())
+    end))
+
+    refresh()
+
+    local self = { Instance = exp.Container }
+    function self:Get() return current() end
+    -- Programmatically set the color (used by Window:LoadConfig). Expects
+    -- a Color3.
+    function self:Set(color)
+        hue, sat, val = color:ToHSV()
+        refresh()
+    end
+    function self:ApplyTheme(color, accent, isInitial)
+        local panelBg = Utils.Brighten(color, 1.2)
+        local headerTextColor = Utils.GetTextColorFor(panelBg, accent)
+        local hexTextColor = (Utils.GetLuminance(panelBg) > 0.55) and Color3.fromRGB(90, 90, 100) or Color3.fromRGB(190, 190, 200)
+        -- The RGB/HEX numeric input boxes previously stayed a fixed dark
+        -- gray no matter the theme (unlike Components.Textbox's identical-
+        -- purpose input, which always tracks Utils.Darken(color, 0.8)) — now
+        -- themed the same way, for consistency with every other input field
+        -- in the library.
+        local darkBg = Utils.Darken(color, 0.8)
+        local boxTextColor = Utils.GetTextColorFor(darkBg, accent)
+        if isInitial then
+            exp.Header.BackgroundColor3 = panelBg
+            exp.TitleLabel.TextColor3 = headerTextColor
+            hexLabel.TextColor3 = hexTextColor
+            hexRowLabel.TextColor3 = headerTextColor
+            hexBox.BackgroundColor3 = darkBg
+            hexBox.TextColor3 = boxTextColor
+            for _, lbl in ipairs(rgbLabels) do lbl.TextColor3 = headerTextColor end
+            for _, box in ipairs({ rBox, gBox, bBox }) do
+                box.BackgroundColor3 = darkBg
+                box.TextColor3 = boxTextColor
+            end
+        else
+            TweenService:Create(exp.Header, THEME_TWEEN_INFO, { BackgroundColor3 = panelBg }):Play()
+            TweenService:Create(exp.TitleLabel, THEME_TWEEN_INFO, { TextColor3 = headerTextColor }):Play()
+            TweenService:Create(hexLabel, THEME_TWEEN_INFO, { TextColor3 = hexTextColor }):Play()
+            TweenService:Create(hexRowLabel, THEME_TWEEN_INFO, { TextColor3 = headerTextColor }):Play()
+            TweenService:Create(hexBox, THEME_TWEEN_INFO, { BackgroundColor3 = darkBg, TextColor3 = boxTextColor }):Play()
+            for _, lbl in ipairs(rgbLabels) do
+                TweenService:Create(lbl, THEME_TWEEN_INFO, { TextColor3 = headerTextColor }):Play()
+            end
+            for _, box in ipairs({ rBox, gBox, bBox }) do
+                TweenService:Create(box, THEME_TWEEN_INFO, { BackgroundColor3 = darkBg, TextColor3 = boxTextColor }):Play()
+            end
+        end
+    end
+    theme:Subscribe(function(c, a, initial) self:ApplyTheme(c, a, initial) end)
+    return self
+end
+
+-- ---------- ThemeGrid (grid of preset color/accent swatches) ----------
+function Components.ThemeGrid(parent, theme, connMgr, opts)
+    local presets = opts.Presets or {}
+
+    local container = Instance.new("Frame")
+    container.Size = UDim2.new(1, 0, 0, 0)
+    container.AutomaticSize = Enum.AutomaticSize.Y
+    container.LayoutOrder = opts.LayoutOrder or 0
+    container.BackgroundTransparency = 1
+    container.Parent = parent
+    local grid = Instance.new("UIGridLayout")
+    grid.CellSize = UDim2.new(0, 44, 0, 44)
+    grid.CellPadding = UDim2.new(0, 14, 0, 14)
+    grid.HorizontalAlignment = Enum.HorizontalAlignment.Center
+    grid.SortOrder = Enum.SortOrder.LayoutOrder
+    grid.Parent = container
+
+    local swatches = {}
+    local selectedIndex = opts.DefaultIndex or 1
+
+    local function selectIndex(index)
+        selectedIndex = index
+        for i, s in ipairs(swatches) do
+            local isSel = (i == index)
+            TweenService:Create(s.stroke, TweenInfo.new(0.25, EASE, EASE_OUT), { Transparency = isSel and 0 or 1 }):Play()
+            TweenService:Create(s.check, TweenInfo.new(0.25, EASE, EASE_OUT), { TextTransparency = isSel and 0 or 1 }):Play()
+        end
+    end
+
+    for index, preset in ipairs(presets) do
+        local color, accent = preset[1], preset[2]
+        local previewColor = Utils.Brighten(color, 1.7)
+        local btn = Instance.new("TextButton")
+        btn.Size = UDim2.new(0, 44, 0, 44)
+        btn.BackgroundColor3 = previewColor
+        btn.Text = ""
+        btn.Parent = container
+        Utils.AddCorner(btn, UDim.new(1, 0))
+
+        local stroke = Instance.new("UIStroke")
+        stroke.Thickness = 2.5
+        stroke.Color = Color3.fromRGB(255, 255, 255)
+        stroke.Transparency = (index == selectedIndex) and 0 or 1
+        stroke.Parent = btn
+
+        local check = Instance.new("TextLabel")
+        check.Size = UDim2.new(1, 0, 1, 0)
+        check.BackgroundTransparency = 1
+        check.Text = "✓"
+        check.TextColor3 = Color3.fromRGB(255, 255, 255)
+        check.Font = Enum.Font.GothamBold
+        check.TextSize = 20
+        check.TextTransparency = (index == selectedIndex) and 0 or 1
+        check.ZIndex = 2
+        check.Parent = btn
+
+        table.insert(swatches, { check = check, stroke = stroke })
+
+        Animator.AddThickenStroke(btn, connMgr)
+        connMgr:Track(btn.MouseEnter:Connect(function()
+            TweenService:Create(btn, TweenInfo.new(0.25, EASE, EASE_OUT), { BackgroundColor3 = Utils.Brighten(previewColor, 1.15) }):Play()
+        end))
+        connMgr:Track(btn.MouseLeave:Connect(function()
+            TweenService:Create(btn, TweenInfo.new(0.25, EASE, EASE_OUT), { BackgroundColor3 = previewColor }):Play()
+        end))
+        connMgr:Track(btn.MouseButton1Click:Connect(function()
+            theme:Apply(color, accent)
+            selectIndex(index)
+            if opts.Callback then opts.Callback(color, accent) end
+        end))
+    end
+
+    local self = { Instance = container }
+    function self:ApplyTheme() end -- swatches show fixed preset colors, not the live theme
+    return self
+end
+
+-- ---------- GradientPicker (toggle + preset gradient grid) ----------
+function Components.GradientPicker(parent, theme, connMgr, opts)
+    local gradients = opts.TargetGradients or {} -- list of UIGradient objects to drive
+    local presets = opts.Presets or {}
+
+    local toggleFrame = Instance.new("Frame")
+    toggleFrame.Size = UDim2.new(1, 0, 0, 40)
+    toggleFrame.LayoutOrder = opts.LayoutOrder or 0
+    toggleFrame.Parent = parent
+    Utils.AddCorner(toggleFrame, UDim.new(0, 8))
+
+    local toggleLabel = Instance.new("TextLabel")
+    toggleLabel.Size = UDim2.new(1, -85, 1, 0)
+    toggleLabel.Position = UDim2.new(0, 10, 0, 0)
+    toggleLabel.BackgroundTransparency = 1
+    toggleLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
+    toggleLabel.TextXAlignment = Enum.TextXAlignment.Left
+    toggleLabel.Font = Enum.Font.GothamBold
+    toggleLabel.TextSize = 16
+    toggleLabel.Parent = toggleFrame
+
+    local track = Instance.new("TextButton")
+    track.AnchorPoint = Vector2.new(1, 0.5)
+    track.Position = UDim2.new(1, -15, 0.5, 0)
+    track.Size = UDim2.new(0, 52, 0, 28)
+    track.Text = ""
+    track.AutoButtonColor = false
+    track.Parent = toggleFrame
+    Utils.AddCorner(track, UDim.new(1, 0))
+    local knob = Instance.new("Frame")
+    knob.AnchorPoint = Vector2.new(0, 0.5)
+    knob.Position = UDim2.new(0, 3, 0.5, 0)
+    knob.Size = UDim2.new(0, 22, 0, 22)
+    knob.BackgroundColor3 = Color3.fromRGB(220, 220, 225)
+    knob.BorderSizePixel = 0
+    knob.Parent = track
+    Utils.AddCorner(knob, UDim.new(1, 0))
+
+    local gridContainer = Instance.new("Frame")
+    gridContainer.Size = UDim2.new(1, 0, 0, 0)
+    gridContainer.AutomaticSize = Enum.AutomaticSize.Y
+    gridContainer.LayoutOrder = (opts.LayoutOrder or 0) + 1
+    gridContainer.BackgroundTransparency = 1
+    gridContainer.Parent = parent
+    local grid = Instance.new("UIGridLayout")
+    grid.CellSize = UDim2.new(0, 44, 0, 44)
+    grid.CellPadding = UDim2.new(0, 14, 0, 14)
+    grid.HorizontalAlignment = Enum.HorizontalAlignment.Center
+    grid.SortOrder = Enum.SortOrder.LayoutOrder
+    grid.Parent = gridContainer
+
+    local GRADIENT_BRIGHTEN = 1.35
+    local enabled = false
+    local selectedIndex = nil
+    local swatches = {}
+
+    local function pushGradientColors(instant)
+        local c1, c2
+        if selectedIndex then
+            c1, c2 = presets[selectedIndex][1], presets[selectedIndex][2]
+        else
+            c1, c2 = theme.Color, theme.Accent
+        end
+        local b1, b2 = Utils.Brighten(c1, GRADIENT_BRIGHTEN), Utils.Brighten(c2, GRADIENT_BRIGHTEN)
+        for _, entry in ipairs(gradients) do
+            local grad, tint = entry.Gradient, entry.Tint or 1
+            local sc = ColorSequence.new(Utils.Darken(b1, tint), Utils.Darken(b2, tint))
+            Animator.TweenGradientColor(grad, sc, 0.35, connMgr, instant)
+        end
+    end
+
+    local function setEnabled(v)
+        enabled = v
+        toggleLabel.Text = (opts.Text or "Chế độ Gradient") .. ": " .. (enabled and "Bật" or "Tắt")
+        local darkBg = Utils.Darken(theme.Color, 0.8)
+        local trackColor = enabled and Utils.Brighten(theme.Accent, 1.15) or darkBg
+        -- Same near-white-but-tinted knob treatment as Components.Toggle —
+        -- always reads as white, still tinted lightly by the live accent.
+        local knobColor = Utils.GetKnobColor(theme.Accent)
+        local knobX = enabled and (52 - 22 - 3) or 3
+        TweenService:Create(track, TweenInfo.new(0.3, EASE, EASE_OUT), { BackgroundColor3 = trackColor }):Play()
+        TweenService:Create(knob, TweenInfo.new(0.3, EASE, EASE_OUT), { Position = UDim2.new(0, knobX, 0.5, 0), BackgroundColor3 = knobColor }):Play()
+        for _, entry in ipairs(gradients) do entry.Gradient.Enabled = enabled end
+        if enabled then pushGradientColors(true) end
+    end
+
+    connMgr:Track(track.MouseButton1Click:Connect(function() setEnabled(not enabled) end))
+
+    local function selectPreset(index)
+        selectedIndex = index
+        for i, s in ipairs(swatches) do
+            local isSel = (i == index)
+            TweenService:Create(s.stroke, TweenInfo.new(0.25, EASE, EASE_OUT), { Transparency = isSel and 0 or 1 }):Play()
+            TweenService:Create(s.check, TweenInfo.new(0.25, EASE, EASE_OUT), { TextTransparency = isSel and 0 or 1 }):Play()
+        end
+        if enabled then pushGradientColors(false) end
+    end
+
+    for index, preset in ipairs(presets) do
+        local btn = Instance.new("TextButton")
+        btn.Size = UDim2.new(0, 44, 0, 44)
+        btn.BackgroundColor3 = preset[1]
+        btn.Text = ""
+        btn.Parent = gridContainer
+        Utils.AddCorner(btn, UDim.new(0, 10))
+
+        local swatchGrad = Instance.new("UIGradient")
+        swatchGrad.Color = ColorSequence.new(preset[1], preset[2])
+        swatchGrad.Rotation = 45
+        swatchGrad.Parent = btn
+
+        local stroke = Instance.new("UIStroke")
+        stroke.Thickness = 2.5
+        stroke.Color = Color3.fromRGB(255, 255, 255)
+        stroke.Transparency = 1
+        stroke.Parent = btn
+
+        local check = Instance.new("TextLabel")
+        check.Size = UDim2.new(1, 0, 1, 0)
+        check.BackgroundTransparency = 1
+        check.Text = "✓"
+        check.TextColor3 = Color3.fromRGB(255, 255, 255)
+        check.Font = Enum.Font.GothamBold
+        check.TextSize = 20
+        check.TextTransparency = 1
+        check.ZIndex = 2
+        check.Parent = btn
+
+        table.insert(swatches, { check = check, stroke = stroke })
+        Animator.AddThickenStroke(btn, connMgr)
+        connMgr:Track(btn.MouseButton1Click:Connect(function()
+            selectPreset(index)
+            if not enabled then setEnabled(true) end
+        end))
+    end
+
+    setEnabled(false)
+
+    local self = { Instance = toggleFrame, GridInstance = gridContainer }
+    function self:ApplyTheme(color, accent, isInitial)
+        local panelBg = Utils.Brighten(color, 1.2)
+        local textColor = Utils.GetTextColorFor(panelBg, accent)
+        -- Retint the track in both states now — previously this only fired
+        -- when `enabled` was false, so picking a new theme while gradient
+        -- mode was ON left the toggle showing the *old* accent color.
+        local trackColor = enabled and Utils.Brighten(accent, 1.15) or Utils.Darken(color, 0.8)
+        local knobColor = Utils.GetKnobColor(accent)
+        if isInitial then
+            toggleFrame.BackgroundColor3 = panelBg
+            toggleLabel.TextColor3 = textColor
+            track.BackgroundColor3 = trackColor
+            knob.BackgroundColor3 = knobColor
+        else
+            TweenService:Create(toggleFrame, THEME_TWEEN_INFO, { BackgroundColor3 = panelBg }):Play()
+            TweenService:Create(toggleLabel, THEME_TWEEN_INFO, { TextColor3 = textColor }):Play()
+            TweenService:Create(track, THEME_TWEEN_INFO, { BackgroundColor3 = trackColor }):Play()
+            TweenService:Create(knob, THEME_TWEEN_INFO, { BackgroundColor3 = knobColor }):Play()
+        end
+        if enabled and not selectedIndex then
+            pushGradientColors(isInitial)
+        end
+    end
+    theme:Subscribe(function(c, a, initial) self:ApplyTheme(c, a, initial) end)
+    return self
+end
+
+-- ---------- Keybind ----------
+-- opts: {
+--   Text (label), Default (Enum.KeyCode or nil), EmptyText (shown when
+--   unbound), Flag (for SaveConfig/LoadConfig), Callback(keyCode) — fires
+--   when the user finishes (re)binding a key, Pressed() — fires whenever
+--   the currently-bound key is pressed while NOT rebinding.
+-- }
+--
+-- Click the key button to enter "listening" mode (button shows "..." and
+-- turns accent-colored); the next keyboard key pressed becomes the new
+-- bind (Escape cancels without changing anything). Only one Keybind per
+-- window may listen at a time — see keybindListening above — so rebinding
+-- one Keybind can't accidentally trigger another Keybind's Pressed() for
+-- the same keystroke.
+function Components.Keybind(parent, theme, connMgr, opts)
+    local frame = Instance.new("Frame")
+    frame.Size = opts.Size or UDim2.new(1, 0, 0, 40)
+    frame.LayoutOrder = opts.LayoutOrder or 0
+    frame.Parent = parent
+    Utils.AddCorner(frame, UDim.new(0, 8))
+
+    local label = Instance.new("TextLabel")
+    label.Size = UDim2.new(1, -110, 1, 0)
+    label.Position = UDim2.new(0, 10, 0, 0)
+    label.BackgroundTransparency = 1
+    label.Text = opts.Text or "Phím tắt"
+    label.TextColor3 = Color3.fromRGB(255, 255, 255)
+    label.TextXAlignment = Enum.TextXAlignment.Left
+    label.Font = Enum.Font.GothamBold
+    label.TextSize = 16
+    label.Parent = frame
+
+    local keyBtn = Instance.new("TextButton")
+    keyBtn.AnchorPoint = Vector2.new(1, 0.5)
+    keyBtn.Position = UDim2.new(1, -10, 0.5, 0)
+    keyBtn.Size = UDim2.new(0, 90, 0, 28)
+    keyBtn.AutoButtonColor = false
+    keyBtn.Font = Enum.Font.GothamBold
+    keyBtn.TextSize = 13
+    keyBtn.Parent = frame
+    Utils.AddCorner(keyBtn, UDim.new(0, 6))
+    Animator.AddThickenStroke(keyBtn, connMgr)
+
+    local currentKey = opts.Default
+    local listening = false
+
+    local function keyText()
+        if listening then return "..." end
+        if currentKey then return currentKey.Name end
+        return opts.EmptyText or "Chưa đặt"
+    end
+    keyBtn.Text = keyText()
+
+    local function restyleKeyBtn(instant)
+        local darkBg = Utils.Darken(theme.Color, 0.8)
+        local bg = listening and theme.Accent or darkBg
+        local info = TweenInfo.new(instant and 0 or 0.2, EASE, EASE_OUT)
+        TweenService:Create(keyBtn, info, {
+            BackgroundColor3 = bg,
+            TextColor3 = Utils.GetTextColorFor(bg, theme.Accent),
+        }):Play()
+    end
+
+    local function setListening(v)
+        listening = v
+        keybindListening[connMgr] = v or nil -- clear the key entirely when turning off, so the table doesn't grow
+        keyBtn.Text = keyText()
+        restyleKeyBtn(false)
+    end
+
+    connMgr:Track(keyBtn.MouseButton1Click:Connect(function()
+        -- Don't start listening if some OTHER Keybind on this window is
+        -- already mid-rebind — avoids two controls racing to capture the
+        -- same next keystroke.
+        if not listening and not keybindListening[connMgr] then
+            setListening(true)
+        end
+    end))
+
+    -- Single InputBegan handler covers both roles: capturing a new key
+    -- while listening, and firing Pressed() for the already-bound key
+    -- during normal use — avoids registering two overlapping InputBegan
+    -- connections per Keybind.
+    connMgr:Track(UserInputService.InputBegan:Connect(function(input, processed)
+        if input.UserInputType ~= Enum.UserInputType.Keyboard then return end
+
+        if listening then
+            if input.KeyCode == Enum.KeyCode.Escape then
+                setListening(false)
+                return
+            end
+            currentKey = input.KeyCode
+            setListening(false)
+            if opts.Callback then opts.Callback(currentKey) end
+            return
+        end
+
+        -- While ANY Keybind on this window is mid-rebind, every other
+        -- Keybind suppresses its own Pressed() — the key being typed right
+        -- now is meant to set a new bind elsewhere, not to "use" this one.
+        if not processed and currentKey and input.KeyCode == currentKey
+            and not keybindListening[connMgr] then
+            if opts.Pressed then opts.Pressed() end
+        end
+    end))
+
+    local self = { Instance = frame }
+    -- Returns the key's Name (string) rather than the EnumItem, so it
+    -- round-trips through SaveConfig/LoadConfig's JSON encoding (which
+    -- only special-cases Color3) with no extra handling needed.
+    function self:Get() return currentKey and currentKey.Name or nil end
+    -- Programmatically bind a key by name (used by Window:LoadConfig).
+    -- Silently ignores names that aren't valid Enum.KeyCode members.
+    function self:Set(name)
+        if type(name) ~= "string" then return end
+        local key = Enum.KeyCode[name]
+        if not key then return end
+        currentKey = key
+        keyBtn.Text = keyText()
+    end
+    function self:ApplyTheme(color, accent, isInitial)
+        local panelBg = Utils.Brighten(color, 1.2)
+        local textColor = Utils.GetTextColorFor(panelBg, accent)
+        if isInitial then
+            frame.BackgroundColor3 = panelBg
+            label.TextColor3 = textColor
+        else
+            TweenService:Create(frame, THEME_TWEEN_INFO, { BackgroundColor3 = panelBg }):Play()
+            TweenService:Create(label, THEME_TWEEN_INFO, { TextColor3 = textColor }):Play()
+        end
+        restyleKeyBtn(isInitial)
+    end
+    theme:Subscribe(function(c, a, initial) self:ApplyTheme(c, a, initial) end)
+    return self
+end
+
+--============================================================
+-- MODULE: Components (extra controls)
+-- Additional, self-contained controls layered on top of the same
+-- {Instance, ApplyTheme, Get/Set, Destroy} contract used above. Each one
+-- follows the same visual language (panelBg background, darkBg for sunken
+-- inputs, accent for the "active" state) so they drop into any existing
+-- tab without looking out of place next to Toggle/Slider/Dropdown/etc.
+--============================================================
+
+-- ---------- Utils.AddTooltip ----------
+-- Attaches a small floating tooltip to ANY existing GuiObject (typically
+-- someComponent.Instance). Shown on hover after a short delay, hidden
+-- immediately on leave. Parented to the same top-level ScreenGui as the
+-- target so it can float above tab pages/ScrollingFrames without being
+-- clipped by them. Returns a handle with :SetText(text) / :Destroy().
+function Utils.AddTooltip(target, theme, connMgr, text, opts)
+    opts = opts or {}
+    local screenGui = target:FindFirstAncestorOfClass("ScreenGui")
+    if not screenGui then return nil end
+
+    local tip = Instance.new("TextLabel")
+    tip.Name = "Tooltip"
+    tip.Visible = false
+    tip.ZIndex = 200
+    tip.Size = UDim2.new(0, 0, 0, 0)
+    tip.AutomaticSize = Enum.AutomaticSize.XY
+    tip.Text = text or ""
+    tip.TextColor3 = Color3.fromRGB(255, 255, 255)
+    tip.Font = Enum.Font.Gotham
+    tip.TextSize = 13
+    tip.BackgroundTransparency = 0
+    tip.TextTransparency = 1
+    tip.BackgroundTransparency = 1
+    tip.Parent = screenGui
+    Utils.AddCorner(tip, UDim.new(0, 6))
+    Utils.AddPadding(tip, UDim.new(0, 8), UDim.new(0, 8), UDim.new(0, 5), UDim.new(0, 5))
+    local stroke = Instance.new("UIStroke")
+    stroke.Transparency = 1
+    stroke.Thickness = 1
+    stroke.Parent = tip
+
+    local function restyle(isInitial)
+        local bg = Utils.Darken(theme.Color, 0.6)
+        local textColor = Utils.GetTextColorFor(bg, theme.Accent)
+        if isInitial then
+            tip.BackgroundColor3 = bg
+            tip.TextColor3 = textColor
+            stroke.Color = Utils.Brighten(theme.Color, 1.4)
+        else
+            TweenService:Create(tip, THEME_TWEEN_INFO, { BackgroundColor3 = bg, TextColor3 = textColor }):Play()
+        end
+    end
+    theme:Subscribe(function(c, a, initial) restyle(initial) end)
+
+    local hoverToken = 0
+    connMgr:Track(target.MouseEnter:Connect(function()
+        hoverToken = hoverToken + 1
+        local myToken = hoverToken
+        task.delay(opts.Delay or 0.35, function()
+            if myToken ~= hoverToken then return end -- mouse already left before the delay elapsed
+            local mouse = UserInputService:GetMouseLocation()
+            tip.Position = UDim2.new(0, mouse.X + 14, 0, mouse.Y + 18)
+            tip.Visible = true
+            TweenService:Create(tip, TweenInfo.new(0.15, EASE, EASE_OUT), { BackgroundTransparency = 0, TextTransparency = 0 }):Play()
+            TweenService:Create(stroke, TweenInfo.new(0.15, EASE, EASE_OUT), { Transparency = 0.3 }):Play()
+        end)
+    end))
+    connMgr:Track(target.MouseLeave:Connect(function()
+        hoverToken = hoverToken + 1
+        tip.Visible = false
+    end))
+
+    return {
+        SetText = function(_, newText) tip.Text = newText end,
+        Destroy = function() tip:Destroy() end,
+    }
+end
+
+-- ---------- Checkbox ----------
+-- A lighter-weight alternative to Toggle: a small square check box with a
+-- label, instead of a pill switch. Same {Get,Set,Flag} contract.
+function Components.Checkbox(parent, theme, connMgr, opts)
+    local frame = Instance.new("Frame")
+    frame.Size = opts.Size or UDim2.new(1, 0, 0, 40)
+    frame.LayoutOrder = opts.LayoutOrder or 0
+    frame.Parent = parent
+    Utils.AddCorner(frame, UDim.new(0, 8))
+
+    local label = Instance.new("TextLabel")
+    label.Size = UDim2.new(1, -55, 1, 0)
+    label.Position = UDim2.new(0, 10, 0, 0)
+    label.BackgroundTransparency = 1
+    label.Text = opts.Text or "Checkbox"
+    label.TextColor3 = Color3.fromRGB(255, 255, 255)
+    label.TextXAlignment = Enum.TextXAlignment.Left
+    label.Font = Enum.Font.GothamBold
+    label.TextSize = 16
+    label.Parent = frame
+
+    local box = Instance.new("TextButton")
+    box.AnchorPoint = Vector2.new(1, 0.5)
+    box.Position = UDim2.new(1, -10, 0.5, 0)
+    box.Size = UDim2.new(0, 24, 0, 24)
+    box.Text = ""
+    box.AutoButtonColor = false
+    box.Parent = frame
+    Utils.AddCorner(box, UDim.new(0, 6))
+    local boxStroke = Instance.new("UIStroke")
+    boxStroke.Thickness = 1.5
+    boxStroke.Parent = box
+
+    local check = Instance.new("TextLabel")
+    check.Size = UDim2.new(1, 0, 1, 0)
+    check.BackgroundTransparency = 1
+    check.Text = "✓"
+    check.TextColor3 = Color3.fromRGB(255, 255, 255)
+    check.Font = Enum.Font.GothamBold
+    check.TextSize = 16
+    check.Parent = box
+
+    local state = opts.Default or false
+
+    local function restyle(instant)
+        local info = TweenInfo.new(instant and 0 or 0.2, EASE, EASE_OUT)
+        TweenService:Create(box, info, { BackgroundColor3 = state and theme.Accent or Utils.Darken(theme.Color, 0.8) }):Play()
+        TweenService:Create(check, info, { TextTransparency = state and 0 or 1 }):Play()
+    end
+
+    connMgr:Track(box.MouseButton1Click:Connect(function()
+        state = not state
+        restyle(false)
+        if opts.Callback then opts.Callback(state) end
+    end))
+
+    local self = { Instance = frame }
+    function self:Get() return state end
+    function self:Set(v)
+        if v == state then return end
+        state = v
+        restyle(false)
+    end
+    function self:ApplyTheme(color, accent, isInitial)
+        local panelBg = Utils.Brighten(color, 1.2)
+        local textColor = Utils.GetTextColorFor(panelBg, accent)
+        if isInitial then
+            frame.BackgroundColor3 = panelBg
+            label.TextColor3 = textColor
+            boxStroke.Color = Utils.Brighten(color, 1.5)
+        else
+            TweenService:Create(frame, THEME_TWEEN_INFO, { BackgroundColor3 = panelBg }):Play()
+            TweenService:Create(label, THEME_TWEEN_INFO, { TextColor3 = textColor }):Play()
+            TweenService:Create(boxStroke, THEME_TWEEN_INFO, { Color = Utils.Brighten(color, 1.5) }):Play()
+        end
+        restyle(isInitial)
+    end
+    theme:Subscribe(function(c, a, initial) self:ApplyTheme(c, a, initial) end)
+    return self
+end
+
+-- ---------- RadioGroup ----------
+-- opts: { Text (optional header), Options (array), Default, Flag, Callback(value) }
+-- Vertical list of circular radio buttons; exactly one selected at a time.
+function Components.RadioGroup(parent, theme, connMgr, opts)
+    local options = opts.Options or {}
+    local ROW_HEIGHT = 32
+    local hasHeader = opts.Text and opts.Text ~= ""
+    local headerHeight = hasHeader and 26 or 0
+    local totalHeight = headerHeight + (#options * ROW_HEIGHT) + math.max(#options - 1, 0) * 4 + 12
+
+    local frame = Instance.new("Frame")
+    frame.Size = opts.Size or UDim2.new(1, 0, 0, totalHeight)
+    frame.LayoutOrder = opts.LayoutOrder or 0
+    frame.Parent = parent
+    Utils.AddCorner(frame, UDim.new(0, 8))
+
+    local inner = Instance.new("Frame")
+    inner.Size = UDim2.new(1, 0, 1, 0)
+    inner.BackgroundTransparency = 1
+    inner.Parent = frame
+    local layout = Instance.new("UIListLayout")
+    layout.Padding = UDim.new(0, 4)
+    layout.Parent = inner
+    Utils.AddPadding(inner, UDim.new(0, 10), UDim.new(0, 10), UDim.new(0, 6), UDim.new(0, 6))
+
+    local headerLabel
+    if hasHeader then
+        headerLabel = Instance.new("TextLabel")
+        headerLabel.Size = UDim2.new(1, 0, 0, headerHeight - 6)
+        headerLabel.LayoutOrder = 0
+        headerLabel.BackgroundTransparency = 1
+        headerLabel.Text = opts.Text
+        headerLabel.TextXAlignment = Enum.TextXAlignment.Left
+        headerLabel.Font = Enum.Font.GothamBold
+        headerLabel.TextSize = 15
+        headerLabel.Parent = inner
+    end
+
+    local selected = opts.Default or options[1]
+    local rows = {}
+
+    for i, text in ipairs(options) do
+        local row = Instance.new("TextButton")
+        row.Size = UDim2.new(1, 0, 0, ROW_HEIGHT)
+        row.LayoutOrder = i
+        row.Text = ""
+        row.AutoButtonColor = false
+        row.BackgroundTransparency = 1
+        row.Parent = inner
+
+        local dot = Instance.new("Frame")
+        dot.Size = UDim2.new(0, 18, 0, 18)
+        dot.Position = UDim2.new(0, 0, 0.5, -9)
+        dot.BackgroundTransparency = 1
+        dot.Parent = row
+        Utils.AddCorner(dot, UDim.new(1, 0))
+        local dotStroke = Instance.new("UIStroke")
+        dotStroke.Thickness = 1.5
+        dotStroke.Parent = dot
+        local dotFill = Instance.new("Frame")
+        dotFill.AnchorPoint = Vector2.new(0.5, 0.5)
+        dotFill.Position = UDim2.new(0.5, 0, 0.5, 0)
+        dotFill.Size = UDim2.new(0, 0, 0, 0)
+        dotFill.Parent = dot
+        Utils.AddCorner(dotFill, UDim.new(1, 0))
+
+        local rowLabel = Instance.new("TextLabel")
+        rowLabel.Size = UDim2.new(1, -28, 1, 0)
+        rowLabel.Position = UDim2.new(0, 26, 0, 0)
+        rowLabel.BackgroundTransparency = 1
+        rowLabel.Text = text
+        rowLabel.TextXAlignment = Enum.TextXAlignment.Left
+        rowLabel.Font = Enum.Font.Gotham
+        rowLabel.TextSize = 14
+        rowLabel.Parent = row
+
+        table.insert(rows, { row = row, dot = dot, dotStroke = dotStroke, dotFill = dotFill, label = rowLabel, text = text })
+    end
+
+    local function restyleRows(instant)
+        local dotBg = Utils.Darken(theme.Color, 0.75)
+        local panelBg = Utils.Brighten(theme.Color, 1.2)
+        local textColor = Utils.GetTextColorFor(panelBg, theme.Accent)
+        for _, r in ipairs(rows) do
+            local isSel = (r.text == selected)
+            local info = TweenInfo.new(instant and 0 or 0.2, EASE, EASE_OUT)
+            TweenService:Create(r.dot, info, { BackgroundColor3 = dotBg }):Play()
+            TweenService:Create(r.dotStroke, info, { Color = isSel and theme.Accent or Utils.Brighten(theme.Color, 1.5) }):Play()
+            TweenService:Create(r.dotFill, info, { Size = isSel and UDim2.new(0, 10, 0, 10) or UDim2.new(0, 0, 0, 0), BackgroundColor3 = theme.Accent }):Play()
+            TweenService:Create(r.label, info, { TextColor3 = textColor }):Play()
+        end
+    end
+
+    local function select(text)
+        selected = text
+        restyleRows(false)
+        if opts.Callback then opts.Callback(text) end
+    end
+    for _, r in ipairs(rows) do
+        connMgr:Track(r.row.MouseButton1Click:Connect(function() select(r.text) end))
+    end
+
+    local self = { Instance = frame }
+    function self:Get() return selected end
+    function self:Set(v)
+        local found = false
+        for _, t in ipairs(options) do if t == v then found = true break end end
+        if not found then return end
+        selected = v
+        restyleRows(false)
+    end
+    function self:ApplyTheme(color, accent, isInitial)
+        local panelBg = Utils.Brighten(color, 1.2)
+        local textColor = Utils.GetTextColorFor(panelBg, accent)
+        if isInitial then
+            frame.BackgroundColor3 = panelBg
+            if headerLabel then headerLabel.TextColor3 = textColor end
+        else
+            TweenService:Create(frame, THEME_TWEEN_INFO, { BackgroundColor3 = panelBg }):Play()
+            if headerLabel then TweenService:Create(headerLabel, THEME_TWEEN_INFO, { TextColor3 = textColor }):Play() end
+        end
+        restyleRows(isInitial)
+    end
+    theme:Subscribe(function(c, a, initial) self:ApplyTheme(c, a, initial) end)
+    return self
+end
+
+-- ---------- Stepper (numeric +/-) ----------
+-- opts: { Text, Min, Max, Default, Step (default 1), Suffix, Flag, Callback(value) }
+function Components.Stepper(parent, theme, connMgr, opts)
+    local min, max = opts.Min or 0, opts.Max or 100
+    local step = opts.Step or 1
+    local value = math.clamp(opts.Default or min, min, max)
+    local suffix = opts.Suffix or ""
+
+    local frame = Instance.new("Frame")
+    frame.Size = opts.Size or UDim2.new(1, 0, 0, 40)
+    frame.LayoutOrder = opts.LayoutOrder or 0
+    frame.Parent = parent
+    Utils.AddCorner(frame, UDim.new(0, 8))
+
+    local label = Instance.new("TextLabel")
+    label.Size = UDim2.new(1, -140, 1, 0)
+    label.Position = UDim2.new(0, 10, 0, 0)
+    label.BackgroundTransparency = 1
+    label.Text = opts.Text or "Số lượng"
+    label.TextColor3 = Color3.fromRGB(255, 255, 255)
+    label.TextXAlignment = Enum.TextXAlignment.Left
+    label.Font = Enum.Font.GothamBold
+    label.TextSize = 15
+    label.Parent = frame
+
+    local function makeBtn(xOffset, text)
+        local b = Instance.new("TextButton")
+        b.AnchorPoint = Vector2.new(1, 0.5)
+        b.Position = UDim2.new(1, xOffset, 0.5, 0)
+        b.Size = UDim2.new(0, 26, 0, 26)
+        b.Text = text
+        b.TextColor3 = Color3.fromRGB(255, 255, 255)
+        b.Font = Enum.Font.GothamBold
+        b.TextSize = 16
+        b.AutoButtonColor = false
+        b.Parent = frame
+        Utils.AddCorner(b, UDim.new(0, 6))
+        Animator.AddThickenStroke(b, connMgr)
+        return b
+    end
+
+    local minusBtn = makeBtn(-10, "-")
+    local plusBtn = makeBtn(-72, "+")
+
+    local valueLabel = Instance.new("TextLabel")
+    valueLabel.AnchorPoint = Vector2.new(1, 0.5)
+    valueLabel.Position = UDim2.new(1, -46, 0.5, 0)
+    valueLabel.Size = UDim2.new(0, 40, 1, 0)
+    valueLabel.BackgroundTransparency = 1
+    valueLabel.Font = Enum.Font.GothamBold
+    valueLabel.TextSize = 15
+    valueLabel.Parent = frame
+
+    local function fmt(n)
+        if step % 1 == 0 then return tostring(math.floor(n + 0.5)) .. suffix end
+        return string.format("%.2f", n) .. suffix
+    end
+
+    local function refresh()
+        valueLabel.Text = fmt(value)
+    end
+    refresh()
+
+    local function setValue(v, fire)
+        v = math.clamp(v, min, max)
+        if v == value then return end
+        value = v
+        refresh()
+        if fire ~= false and opts.Callback then opts.Callback(value) end
+    end
+
+    connMgr:Track(minusBtn.MouseButton1Click:Connect(function() setValue(value - step) end))
+    connMgr:Track(plusBtn.MouseButton1Click:Connect(function() setValue(value + step) end))
+
+    local self = { Instance = frame }
+    function self:Get() return value end
+    function self:Set(v) setValue(v, false) end
+    function self:ApplyTheme(color, accent, isInitial)
+        local panelBg = Utils.Brighten(color, 1.2)
+        local textColor = Utils.GetTextColorFor(panelBg, accent)
+        local darkBg = Utils.Darken(color, 0.8)
+        if isInitial then
+            frame.BackgroundColor3 = panelBg
+            label.TextColor3 = textColor
+            valueLabel.TextColor3 = textColor
+            minusBtn.BackgroundColor3 = darkBg
+            plusBtn.BackgroundColor3 = darkBg
+        else
+            TweenService:Create(frame, THEME_TWEEN_INFO, { BackgroundColor3 = panelBg }):Play()
+            TweenService:Create(label, THEME_TWEEN_INFO, { TextColor3 = textColor }):Play()
+            TweenService:Create(valueLabel, THEME_TWEEN_INFO, { TextColor3 = textColor }):Play()
+            TweenService:Create(minusBtn, THEME_TWEEN_INFO, { BackgroundColor3 = darkBg }):Play()
+            TweenService:Create(plusBtn, THEME_TWEEN_INFO, { BackgroundColor3 = darkBg }):Play()
+        end
+    end
+    theme:Subscribe(function(c, a, initial) self:ApplyTheme(c, a, initial) end)
+    return self
+end
+
+-- ---------- SearchBox ----------
+-- A standalone search field (visually distinct from Textbox: full-width,
+-- placeholder-first, no side label). Fires opts.Callback(query) on every
+-- text change, debounced one frame the same way ColorPicker's RGB fields
+-- are, so rapid typing collapses into one callback per settled frame
+-- instead of one per keystroke.
+function Components.SearchBox(parent, theme, connMgr, opts)
+    local frame = Instance.new("Frame")
+    frame.Size = opts.Size or UDim2.new(1, 0, 0, 40)
+    frame.LayoutOrder = opts.LayoutOrder or 0
+    frame.Parent = parent
+    Utils.AddCorner(frame, UDim.new(0, 8))
+
+    local icon = Instance.new("TextLabel")
+    icon.Size = UDim2.new(0, 24, 1, 0)
+    icon.Position = UDim2.new(0, 8, 0, 0)
+    icon.BackgroundTransparency = 1
+    icon.Text = "🔍"
+    icon.TextSize = 14
+    icon.Parent = frame
+
+    local box = Instance.new("TextBox")
+    box.Size = UDim2.new(1, -70, 1, -10)
+    box.Position = UDim2.new(0, 32, 0, 5)
+    box.Text = opts.Default or ""
+    box.PlaceholderText = opts.Placeholder or "Tìm kiếm..."
+    box.PlaceholderColor3 = Color3.fromRGB(150, 150, 160)
+    box.Font = Enum.Font.Gotham
+    box.TextSize = 14
+    box.ClearTextOnFocus = false
+    box.TextXAlignment = Enum.TextXAlignment.Left
+    box.BackgroundTransparency = 1
+    box.Parent = frame
+
+    local clearBtn = Instance.new("TextButton")
+    clearBtn.AnchorPoint = Vector2.new(1, 0.5)
+    clearBtn.Position = UDim2.new(1, -8, 0.5, 0)
+    clearBtn.Size = UDim2.new(0, 22, 0, 22)
+    clearBtn.BackgroundTransparency = 1
+    clearBtn.Text = "×"
+    clearBtn.Font = Enum.Font.GothamBold
+    clearBtn.TextSize = 14
+    clearBtn.Visible = box.Text ~= ""
+    clearBtn.Parent = frame
+
+    local pending = false
+    local function fire()
+        if opts.Callback then opts.Callback(box.Text) end
+    end
+    connMgr:Track(box:GetPropertyChangedSignal("Text"):Connect(function()
+        clearBtn.Visible = box.Text ~= ""
+        if pending then return end
+        pending = true
+        task.defer(function() pending = false; fire() end)
+    end))
+    connMgr:Track(clearBtn.MouseButton1Click:Connect(function()
+        box.Text = ""
+        box:CaptureFocus()
+    end))
+
+    local self = { Instance = frame }
+    function self:Get() return box.Text end
+    function self:Set(v) box.Text = tostring(v or "") end
+    function self:ApplyTheme(color, accent, isInitial)
+        local darkBg = Utils.Darken(color, 0.8)
+        local textColor = Utils.GetTextColorFor(darkBg, accent)
+        if isInitial then
+            frame.BackgroundColor3 = darkBg
+            box.TextColor3 = textColor
+            icon.TextColor3 = textColor
+            clearBtn.TextColor3 = textColor
+        else
+            TweenService:Create(frame, THEME_TWEEN_INFO, { BackgroundColor3 = darkBg }):Play()
+            TweenService:Create(box, THEME_TWEEN_INFO, { TextColor3 = textColor }):Play()
+            TweenService:Create(icon, THEME_TWEEN_INFO, { TextColor3 = textColor }):Play()
+            TweenService:Create(clearBtn, THEME_TWEEN_INFO, { TextColor3 = textColor }):Play()
+        end
+    end
+    theme:Subscribe(function(c, a, initial) self:ApplyTheme(c, a, initial) end)
+    return self
+end
+
+-- ---------- Textarea (multi-line text box) ----------
+-- opts: { Text (header label above the box), Default, Placeholder, Height
+-- (default 90), Flag, Callback(text) — fires on FocusLost like Textbox. }
+function Components.Textarea(parent, theme, connMgr, opts)
+    local boxHeight = opts.Height or 90
+    local hasHeader = opts.Text and opts.Text ~= ""
+    local headerHeight = hasHeader and 22 or 0
+
+    local frame = Instance.new("Frame")
+    frame.Size = opts.Size or UDim2.new(1, 0, 0, headerHeight + boxHeight + 16)
+    frame.LayoutOrder = opts.LayoutOrder or 0
+    frame.Parent = parent
+    Utils.AddCorner(frame, UDim.new(0, 8))
+
+    local headerLabel
+    if hasHeader then
+        headerLabel = Instance.new("TextLabel")
+        headerLabel.Size = UDim2.new(1, -20, 0, headerHeight)
+        headerLabel.Position = UDim2.new(0, 10, 0, 6)
+        headerLabel.BackgroundTransparency = 1
+        headerLabel.Text = opts.Text
+        headerLabel.TextXAlignment = Enum.TextXAlignment.Left
+        headerLabel.Font = Enum.Font.GothamBold
+        headerLabel.TextSize = 14
+        headerLabel.Parent = frame
+    end
+
+    local box = Instance.new("TextBox")
+    box.Position = UDim2.new(0, 8, 0, headerHeight + 8)
+    box.Size = UDim2.new(1, -16, 0, boxHeight)
+    box.Text = opts.Default or ""
+    box.PlaceholderText = opts.Placeholder or "Nhập nội dung..."
+    box.PlaceholderColor3 = Color3.fromRGB(150, 150, 160)
+    box.Font = Enum.Font.Gotham
+    box.TextSize = 13
+    box.TextXAlignment = Enum.TextXAlignment.Left
+    box.TextYAlignment = Enum.TextYAlignment.Top
+    box.TextWrapped = true
+    box.MultiLine = true
+    box.ClearTextOnFocus = false
+    box.ClipsDescendants = true
+    box.Parent = frame
+    Utils.AddPadding(box, UDim.new(0, 8), UDim.new(0, 8), UDim.new(0, 6), UDim.new(0, 6))
+    Utils.AddCorner(box, UDim.new(0, 6))
+
+    connMgr:Track(box.FocusLost:Connect(function(enterPressed)
+        if opts.Callback then opts.Callback(box.Text) end
+    end))
+
+    local self = { Instance = frame }
+    function self:Get() return box.Text end
+    function self:Set(v) box.Text = tostring(v or "") end
+    function self:ApplyTheme(color, accent, isInitial)
+        local panelBg = Utils.Brighten(color, 1.2)
+        local darkBg = Utils.Darken(color, 0.8)
+        local headerColor = Utils.GetTextColorFor(panelBg, accent)
+        local boxTextColor = Utils.GetTextColorFor(darkBg, accent)
+        if isInitial then
+            frame.BackgroundColor3 = panelBg
+            if headerLabel then headerLabel.TextColor3 = headerColor end
+            box.BackgroundColor3 = darkBg
+            box.TextColor3 = boxTextColor
+        else
+            TweenService:Create(frame, THEME_TWEEN_INFO, { BackgroundColor3 = panelBg }):Play()
+            if headerLabel then TweenService:Create(headerLabel, THEME_TWEEN_INFO, { TextColor3 = headerColor }):Play() end
+            TweenService:Create(box, THEME_TWEEN_INFO, { BackgroundColor3 = darkBg, TextColor3 = boxTextColor }):Play()
+        end
+    end
+    theme:Subscribe(function(c, a, initial) self:ApplyTheme(c, a, initial) end)
+    return self
+end
+
+-- ---------- ProgressBar ----------
+-- A read/write display bar (0-100), distinct from Slider: not draggable by
+-- the user, meant for showing progress driven by script code (loading a
+-- resource, farm progress, xp, etc) via :Set(percent).
+function Components.ProgressBar(parent, theme, connMgr, opts)
+    local value = math.clamp(opts.Default or 0, 0, 100)
+
+    local frame = Instance.new("Frame")
+    frame.Size = opts.Size or UDim2.new(1, 0, 0, 46)
+    frame.LayoutOrder = opts.LayoutOrder or 0
+    frame.Parent = parent
+    Utils.AddCorner(frame, UDim.new(0, 8))
+
+    local label = Instance.new("TextLabel")
+    label.Size = UDim2.new(1, -70, 0, 18)
+    label.Position = UDim2.new(0, 10, 0, 4)
+    label.BackgroundTransparency = 1
+    label.Text = opts.Text or "Tiến trình"
+    label.TextXAlignment = Enum.TextXAlignment.Left
+    label.Font = Enum.Font.GothamBold
+    label.TextSize = 13
+    label.Parent = frame
+
+    local percentLabel = Instance.new("TextLabel")
+    percentLabel.AnchorPoint = Vector2.new(1, 0)
+    percentLabel.Position = UDim2.new(1, -10, 0, 4)
+    percentLabel.Size = UDim2.new(0, 50, 0, 18)
+    percentLabel.BackgroundTransparency = 1
+    percentLabel.TextXAlignment = Enum.TextXAlignment.Right
+    percentLabel.Font = Enum.Font.Gotham
+    percentLabel.TextSize = 13
+    percentLabel.Parent = frame
+
+    local track = Instance.new("Frame")
+    track.Position = UDim2.new(0, 10, 0, 26)
+    track.Size = UDim2.new(1, -20, 0, 10)
+    track.BorderSizePixel = 0
+    track.Parent = frame
+    Utils.AddCorner(track, UDim.new(1, 0))
+
+    local fill = Instance.new("Frame")
+    fill.Size = UDim2.new(value / 100, 0, 1, 0)
+    fill.BorderSizePixel = 0
+    fill.Parent = track
+    Utils.AddCorner(fill, UDim.new(1, 0))
+
+    local function refresh(instant)
+        percentLabel.Text = tostring(math.floor(value + 0.5)) .. "%"
+        local info = TweenInfo.new(instant and 0 or 0.3, EASE, EASE_OUT)
+        TweenService:Create(fill, info, { Size = UDim2.new(value / 100, 0, 1, 0) }):Play()
+    end
+    refresh(true)
+
+    local self = { Instance = frame }
+    function self:Get() return value end
+    function self:Set(v)
+        value = math.clamp(v, 0, 100)
+        refresh(false)
+    end
+    function self:ApplyTheme(color, accent, isInitial)
+        local panelBg = Utils.Brighten(color, 1.2)
+        local textColor = Utils.GetTextColorFor(panelBg, accent)
+        local darkBg = Utils.Darken(color, 0.8)
+        if isInitial then
+            frame.BackgroundColor3 = panelBg
+            label.TextColor3 = textColor
+            percentLabel.TextColor3 = textColor
+            track.BackgroundColor3 = darkBg
+            fill.BackgroundColor3 = accent
+        else
+            TweenService:Create(frame, THEME_TWEEN_INFO, { BackgroundColor3 = panelBg }):Play()
+            TweenService:Create(label, THEME_TWEEN_INFO, { TextColor3 = textColor }):Play()
+            TweenService:Create(percentLabel, THEME_TWEEN_INFO, { TextColor3 = textColor }):Play()
+            TweenService:Create(track, THEME_TWEEN_INFO, { BackgroundColor3 = darkBg }):Play()
+            TweenService:Create(fill, THEME_TWEEN_INFO, { BackgroundColor3 = accent }):Play()
+        end
+    end
+    theme:Subscribe(function(c, a, initial) self:ApplyTheme(c, a, initial) end)
+    return self
+end
+
+-- ---------- Rating (stars) ----------
+-- opts: { Text, Max (default 5), Default, Flag, Callback(rating) }
+function Components.Rating(parent, theme, connMgr, opts)
+    local maxStars = opts.Max or 5
+    local value = math.clamp(opts.Default or 0, 0, maxStars)
+
+    local frame = Instance.new("Frame")
+    frame.Size = opts.Size or UDim2.new(1, 0, 0, 40)
+    frame.LayoutOrder = opts.LayoutOrder or 0
+    frame.Parent = parent
+    Utils.AddCorner(frame, UDim.new(0, 8))
+
+    local label = Instance.new("TextLabel")
+    label.Size = UDim2.new(0.5, 0, 1, 0)
+    label.Position = UDim2.new(0, 10, 0, 0)
+    label.BackgroundTransparency = 1
+    label.Text = opts.Text or "Đánh giá"
+    label.TextXAlignment = Enum.TextXAlignment.Left
+    label.Font = Enum.Font.GothamBold
+    label.TextSize = 15
+    label.Parent = frame
+
+    local starsHolder = Instance.new("Frame")
+    starsHolder.AnchorPoint = Vector2.new(1, 0.5)
+    starsHolder.Position = UDim2.new(1, -10, 0.5, 0)
+    starsHolder.Size = UDim2.new(0, maxStars * 26, 1, 0)
+    starsHolder.BackgroundTransparency = 1
+    starsHolder.Parent = frame
+    local starsLayout = Instance.new("UIListLayout")
+    starsLayout.FillDirection = Enum.FillDirection.Horizontal
+    starsLayout.VerticalAlignment = Enum.VerticalAlignment.Center
+    starsLayout.Parent = starsHolder
+
+    local stars = {}
+    for i = 1, maxStars do
+        local star = Instance.new("TextButton")
+        star.Size = UDim2.new(0, 26, 1, 0)
+        star.LayoutOrder = i
+        star.Text = "★"
+        star.Font = Enum.Font.GothamBold
+        star.TextSize = 20
+        star.BackgroundTransparency = 1
+        star.AutoButtonColor = false
+        star.Parent = starsHolder
+        table.insert(stars, star)
+    end
+
+    local function restyle(instant)
+        local filled = Utils.GetKnobColor(theme.Accent)
+        local empty = Utils.Darken(theme.Color, 0.75)
+        for i, star in ipairs(stars) do
+            local info = TweenInfo.new(instant and 0 or 0.15, EASE, EASE_OUT)
+            TweenService:Create(star, info, { TextColor3 = (i <= value) and theme.Accent or empty }):Play()
+        end
+    end
+    local function setValue(v, fire)
+        value = math.clamp(v, 0, maxStars)
+        restyle(false)
+        if fire ~= false and opts.Callback then opts.Callback(value) end
+    end
+    for i, star in ipairs(stars) do
+        connMgr:Track(star.MouseButton1Click:Connect(function() setValue(i) end))
+        connMgr:Track(star.MouseEnter:Connect(function()
+            for j, s in ipairs(stars) do
+                s.TextColor3 = (j <= i) and Utils.Brighten(theme.Accent, 1.2) or Utils.Darken(theme.Color, 0.75)
+            end
+        end))
+        connMgr:Track(star.MouseLeave:Connect(function() restyle(true) end))
+    end
+
+    local self = { Instance = frame }
+    function self:Get() return value end
+    function self:Set(v) setValue(v, false) end
+    function self:ApplyTheme(color, accent, isInitial)
+        local panelBg = Utils.Brighten(color, 1.2)
+        local textColor = Utils.GetTextColorFor(panelBg, accent)
+        if isInitial then
+            frame.BackgroundColor3 = panelBg
+            label.TextColor3 = textColor
+        else
+            TweenService:Create(frame, THEME_TWEEN_INFO, { BackgroundColor3 = panelBg }):Play()
+            TweenService:Create(label, THEME_TWEEN_INFO, { TextColor3 = textColor }):Play()
+        end
+        restyle(isInitial)
+    end
+    theme:Subscribe(function(c, a, initial) self:ApplyTheme(c, a, initial) end)
+    return self
+end
+
+-- ---------- Image ----------
+-- opts: { Image (asset id, string or number), Height (default 140), Caption }
+function Components.Image(parent, theme, connMgr, opts)
+    local imgHeight = opts.Height or 140
+    local hasCaption = opts.Caption and opts.Caption ~= ""
+
+    local frame = Instance.new("Frame")
+    frame.Size = opts.Size or UDim2.new(1, 0, 0, imgHeight + (hasCaption and 26 or 10))
+    frame.LayoutOrder = opts.LayoutOrder or 0
+    frame.Parent = parent
+    Utils.AddCorner(frame, UDim.new(0, 8))
+
+    local img = Instance.new("ImageLabel")
+    img.Position = UDim2.new(0, 6, 0, 6)
+    img.Size = UDim2.new(1, -12, 0, imgHeight)
+    img.BackgroundTransparency = 1
+    local imageId = opts.Image
+    if type(imageId) == "number" then imageId = "rbxassetid://" .. tostring(imageId) end
+    img.Image = imageId or ""
+    img.ScaleType = Enum.ScaleType.Crop
+    img.Parent = frame
+    Utils.AddCorner(img, UDim.new(0, 6))
+
+    local caption
+    if hasCaption then
+        caption = Instance.new("TextLabel")
+        caption.Position = UDim2.new(0, 6, 0, imgHeight + 8)
+        caption.Size = UDim2.new(1, -12, 0, 16)
+        caption.BackgroundTransparency = 1
+        caption.Text = opts.Caption
+        caption.Font = Enum.Font.Gotham
+        caption.TextSize = 12
+        caption.TextXAlignment = Enum.TextXAlignment.Center
+        caption.Parent = frame
+    end
+
+    local self = { Instance = frame }
+    function self:SetImage(newImage)
+        if type(newImage) == "number" then newImage = "rbxassetid://" .. tostring(newImage) end
+        img.Image = newImage or ""
+    end
+    function self:ApplyTheme(color, accent, isInitial)
+        local panelBg = Utils.Brighten(color, 1.2)
+        local textColor = Utils.GetTextColorFor(panelBg, accent)
+        if isInitial then
+            frame.BackgroundColor3 = panelBg
+            if caption then caption.TextColor3 = textColor end
+        else
+            TweenService:Create(frame, THEME_TWEEN_INFO, { BackgroundColor3 = panelBg }):Play()
+            if caption then TweenService:Create(caption, THEME_TWEEN_INFO, { TextColor3 = textColor }):Play() end
+        end
+    end
+    theme:Subscribe(function(c, a, initial) self:ApplyTheme(c, a, initial) end)
+    return self
+end
+
+-- ---------- Badge ----------
+-- A tiny inline pill for status/tags, e.g. next to a Label. Not meant to
+-- stand alone in a tab's LayoutOrder chain — construct one and parent it
+-- yourself onto another control's .Instance if you need it inline, or use
+-- it standalone via TabMeta:CreateBadge for a simple status row.
+function Components.Badge(parent, theme, connMgr, opts)
+    local holder = Instance.new("Frame")
+    holder.Size = opts.Size or UDim2.new(1, 0, 0, 30)
+    holder.LayoutOrder = opts.LayoutOrder or 0
+    holder.BackgroundTransparency = 1
+    holder.Parent = parent
+
+    local pill = Instance.new("Frame")
+    pill.Size = UDim2.new(0, 0, 0, 24)
+    pill.AutomaticSize = Enum.AutomaticSize.X
+    pill.Position = UDim2.new(0, 10, 0.5, -12)
+    pill.Parent = holder
+    Utils.AddCorner(pill, UDim.new(1, 0))
+    Utils.AddPadding(pill, UDim.new(0, 12), UDim.new(0, 12))
+
+    local text = Instance.new("TextLabel")
+    text.Size = UDim2.new(0, 0, 1, 0)
+    text.AutomaticSize = Enum.AutomaticSize.X
+    text.BackgroundTransparency = 1
+    text.Text = opts.Text or "Badge"
+    text.Font = Enum.Font.GothamBold
+    text.TextSize = 12
+    text.Parent = pill
+
+    local variantColors = {
+        accent  = function(c, a) return a end,
+        success = function() return Color3.fromRGB(60, 200, 120) end,
+        error   = function() return Color3.fromRGB(220, 70, 70) end,
+        warning = function() return Color3.fromRGB(230, 170, 50) end,
+        info    = function() return Color3.fromRGB(70, 140, 230) end,
+    }
+    local getColor = variantColors[opts.Variant] or variantColors.accent
+
+    local self = { Instance = holder }
+    function self:SetText(t) text.Text = t end
+    function self:ApplyTheme(color, accent, isInitial)
+        local pillColor = getColor(color, accent)
+        local textColor = Utils.GetTextColorFor(pillColor, accent)
+        if isInitial then
+            pill.BackgroundColor3 = pillColor
+            text.TextColor3 = textColor
+        else
+            TweenService:Create(pill, THEME_TWEEN_INFO, { BackgroundColor3 = pillColor }):Play()
+            TweenService:Create(text, THEME_TWEEN_INFO, { TextColor3 = textColor }):Play()
+        end
+    end
+    theme:Subscribe(function(c, a, initial) self:ApplyTheme(c, a, initial) end)
+    return self
+end
+
+-- ---------- Table (read-only data grid) ----------
+-- opts: { Columns (array of header strings), Rows (array of array-of-
+-- strings, one sub-array per row, same length as Columns), RowHeight
+-- (default 30), MaxVisibleRows (default 6, controls the scrolling height) }
+-- Read-only display control — no Get/Set/Flag, just :SetRows(rows) to
+-- replace the data at runtime (e.g. a live player list / leaderboard).
+function Components.Table(parent, theme, connMgr, opts)
+    local columns = opts.Columns or {}
+    local rowHeight = opts.RowHeight or 30
+    local headerHeight = 30
+    local maxVisibleRows = opts.MaxVisibleRows or 6
+    local colCount = math.max(#columns, 1)
+    local colWidth = 1 / colCount
+
+    local frame = Instance.new("Frame")
+    frame.Size = opts.Size or UDim2.new(1, 0, 0, headerHeight + math.min(maxVisibleRows, math.max(#(opts.Rows or {}), 1)) * rowHeight + 8)
+    frame.LayoutOrder = opts.LayoutOrder or 0
+    frame.ClipsDescendants = true
+    frame.Parent = parent
+    Utils.AddCorner(frame, UDim.new(0, 8))
+
+    local header = Instance.new("Frame")
+    header.Size = UDim2.new(1, 0, 0, headerHeight)
+    header.BackgroundTransparency = 1
+    header.Parent = frame
+    local headerLabels = {}
+    for i, colName in ipairs(columns) do
+        local h = Instance.new("TextLabel")
+        h.Size = UDim2.new(colWidth, 0, 1, 0)
+        h.Position = UDim2.new(colWidth * (i - 1), 0, 0, 0)
+        h.BackgroundTransparency = 1
+        h.Text = colName
+        h.Font = Enum.Font.GothamBold
+        h.TextSize = 13
+        h.TextXAlignment = (i == 1) and Enum.TextXAlignment.Left or Enum.TextXAlignment.Center
+        h.Parent = header
+        Utils.AddPadding(h, UDim.new(0, i == 1 and 12 or 4), UDim.new(0, 4))
+        table.insert(headerLabels, h)
+    end
+    local headerLine = Instance.new("Frame")
+    headerLine.Size = UDim2.new(1, 0, 0, 1)
+    headerLine.Position = UDim2.new(0, 0, 1, -1)
+    headerLine.BorderSizePixel = 0
+    headerLine.Parent = header
+
+    local scroller = Instance.new("ScrollingFrame")
+    scroller.Position = UDim2.new(0, 0, 0, headerHeight)
+    scroller.Size = UDim2.new(1, 0, 1, -headerHeight)
+    scroller.BackgroundTransparency = 1
+    scroller.BorderSizePixel = 0
+    scroller.ScrollBarThickness = 4
+    scroller.CanvasSize = UDim2.new(0, 0, 0, 0)
+    scroller.AutomaticCanvasSize = Enum.AutomaticSize.Y
+    scroller.Parent = frame
+    local rowsLayout = Instance.new("UIListLayout")
+    rowsLayout.SortOrder = Enum.SortOrder.LayoutOrder
+    rowsLayout.Parent = scroller
+
+    local rowFrames = {}
+    local function buildRows(rows)
+        for _, rf in ipairs(rowFrames) do rf:Destroy() end
+        table.clear(rowFrames)
+        for ri, rowData in ipairs(rows or {}) do
+            local rf = Instance.new("Frame")
+            rf.Size = UDim2.new(1, 0, 0, rowHeight)
+            rf.LayoutOrder = ri
+            rf.BackgroundTransparency = (ri % 2 == 0) and 1 or 0.6
+            rf.Parent = scroller
+            for ci = 1, colCount do
+                local cell = Instance.new("TextLabel")
+                cell.Size = UDim2.new(colWidth, 0, 1, 0)
+                cell.Position = UDim2.new(colWidth * (ci - 1), 0, 0, 0)
+                cell.BackgroundTransparency = 1
+                cell.Text = tostring(rowData[ci] or "")
+                cell.Font = Enum.Font.Gotham
+                cell.TextSize = 13
+                cell.TextXAlignment = (ci == 1) and Enum.TextXAlignment.Left or Enum.TextXAlignment.Center
+                cell.TextTruncate = Enum.TextTruncate.AtEnd
+                cell.Parent = rf
+                Utils.AddPadding(cell, UDim.new(0, ci == 1 and 12 or 4), UDim.new(0, 4))
+            end
+            table.insert(rowFrames, rf)
+        end
+    end
+    buildRows(opts.Rows)
+
+    local self = { Instance = frame }
+    function self:SetRows(rows) buildRows(rows) end
+    function self:ApplyTheme(color, accent, isInitial)
+        local panelBg = Utils.Brighten(color, 1.2)
+        local darkBg = Utils.Darken(color, 0.85)
+        local textColor = Utils.GetTextColorFor(panelBg, accent)
+        if isInitial then
+            frame.BackgroundColor3 = panelBg
+            headerLine.BackgroundColor3 = darkBg
+            for _, h in ipairs(headerLabels) do h.TextColor3 = textColor end
+            for _, rf in ipairs(rowFrames) do
+                rf.BackgroundColor3 = darkBg
+                for _, cell in ipairs(rf:GetChildren()) do
+                    if cell:IsA("TextLabel") then cell.TextColor3 = textColor end
+                end
+            end
+        else
+            TweenService:Create(frame, THEME_TWEEN_INFO, { BackgroundColor3 = panelBg }):Play()
+            TweenService:Create(headerLine, THEME_TWEEN_INFO, { BackgroundColor3 = darkBg }):Play()
+            for _, h in ipairs(headerLabels) do TweenService:Create(h, THEME_TWEEN_INFO, { TextColor3 = textColor }):Play() end
+            for _, rf in ipairs(rowFrames) do
+                TweenService:Create(rf, THEME_TWEEN_INFO, { BackgroundColor3 = darkBg }):Play()
+                for _, cell in ipairs(rf:GetChildren()) do
+                    if cell:IsA("TextLabel") then TweenService:Create(cell, THEME_TWEEN_INFO, { TextColor3 = textColor }):Play() end
+                end
+            end
+        end
+    end
+    theme:Subscribe(function(c, a, initial) self:ApplyTheme(c, a, initial) end)
+    return self
+end
+
+local NOTIF_TYPES = {
+    success = { Color3.fromRGB(60, 200, 120), "✓" },
+    error   = { Color3.fromRGB(220, 70, 70),  "×" },
+    warning = { Color3.fromRGB(230, 170, 50), "!" },
+    info    = { Color3.fromRGB(70, 140, 230), "i" },
+}
+
+function Components.Notification(parent, theme, connMgr, opts)
+    local typeInfo = NOTIF_TYPES[opts.Type] or NOTIF_TYPES.info
+    local accentColor, iconText = typeInfo[1], typeInfo[2]
+
+    local duration = opts.Duration
+    if duration == nil then duration = 4 end
+    if duration == false then duration = 0 end
+    local isSticky = not (duration and duration > 0)
+
+    -- Notifications are laid out by a UIListLayout on `parent` (the toast
+    -- container). UIListLayout re-applies its own computed Position to every
+    -- direct child whenever it recalculates the stack (new toast added,
+    -- another toast resized/removed, etc), which fights any tween that's
+    -- also driving that child's Position. Fix: give each toast its own
+    -- invisible "slot" that IS the direct list-managed child (reserves the
+    -- correct stacking space via AutomaticSize, never has its Position
+    -- tweened), and make the visible `card` a child of that slot instead of
+    -- of `parent` directly.
+    local slot = Instance.new("Frame")
+    slot.Name = "NotificationSlot"
+    slot.Size = UDim2.new(1, 0, 0, 0)
+    slot.AutomaticSize = Enum.AutomaticSize.Y
+    slot.LayoutOrder = opts.LayoutOrder or 0
+    slot.BackgroundTransparency = 1
+    slot.Parent = parent
+
+    local card = Instance.new("Frame")
+    card.Size = UDim2.new(1, 0, 0, 0)
+    card.AutomaticSize = Enum.AutomaticSize.Y
+    card.BackgroundColor3 = Utils.Brighten(theme.Color, 1.25)
+    card.BorderSizePixel = 0
+    -- Left un-clipped until Dismiss() explicitly turns it on, so the nested
+    -- AutomaticSize convergence (see note above) never gets caught mid-
+    -- computation and visibly cropped.
+    card.ClipsDescendants = false
+    card.Parent = slot
+    Utils.AddCorner(card, UDim.new(0, 10))
+
+    local stroke = Instance.new("UIStroke")
+    stroke.Color = Utils.Brighten(theme.Color, 1.5)
+    stroke.Thickness = 1
+    stroke.Parent = card
+
+    local accentBar = Instance.new("Frame")
+    accentBar.Size = UDim2.new(0, 4, 1, 0)
+    accentBar.BackgroundColor3 = accentColor
+    accentBar.BorderSizePixel = 0
+    accentBar.Parent = card
+    Utils.AddCorner(accentBar, UDim.new(0, 2))
+
+    local contentHolder = Instance.new("Frame")
+    contentHolder.Position = UDim2.new(0, 14, 0, 14)
+    contentHolder.Size = UDim2.new(1, -52, 0, 0)
+    contentHolder.AutomaticSize = Enum.AutomaticSize.Y
+    contentHolder.BackgroundTransparency = 1
+    contentHolder.Parent = card
+    local contentLayout = Instance.new("UIListLayout")
+    contentLayout.Padding = UDim.new(0, 6)
+    contentLayout.Parent = contentHolder
+
+    local headerRow = Instance.new("Frame")
+    headerRow.Size = UDim2.new(1, 0, 0, 0)
+    headerRow.AutomaticSize = Enum.AutomaticSize.Y
+    headerRow.LayoutOrder = 1
+    headerRow.BackgroundTransparency = 1
+    headerRow.Parent = contentHolder
+    local headerLayout = Instance.new("UIListLayout")
+    headerLayout.FillDirection = Enum.FillDirection.Horizontal
+    headerLayout.VerticalAlignment = Enum.VerticalAlignment.Center
+    headerLayout.Padding = UDim.new(0, 12)
+    headerLayout.Parent = headerRow
+
+    local iconHolder = Instance.new("Frame")
+    iconHolder.Size = UDim2.new(0, 26, 0, 26)
+    iconHolder.LayoutOrder = 1
+    iconHolder.BackgroundColor3 = accentColor
+    iconHolder.BackgroundTransparency = 0.8
+    iconHolder.BorderSizePixel = 0
+    iconHolder.Parent = headerRow
+    Utils.AddCorner(iconHolder, UDim.new(1, 0))
+
+    local icon = Instance.new("TextLabel")
+    icon.Size = UDim2.new(1, 0, 1, 0)
+    icon.BackgroundTransparency = 1
+    icon.Text = iconText
+    icon.TextColor3 = accentColor
+    icon.Font = Enum.Font.GothamBold
+    icon.TextSize = 14
+    icon.Parent = iconHolder
+
+    local titleLabel = Instance.new("TextLabel")
+    titleLabel.Size = UDim2.new(1, -38, 0, 0)
+    titleLabel.AutomaticSize = Enum.AutomaticSize.Y
+    titleLabel.LayoutOrder = 2
+    titleLabel.BackgroundTransparency = 1
+    titleLabel.Text = opts.Title or "Thông báo"
+    titleLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
+    titleLabel.TextXAlignment = Enum.TextXAlignment.Left
+    titleLabel.TextYAlignment = Enum.TextYAlignment.Top
+    titleLabel.TextWrapped = true
+    titleLabel.Font = Enum.Font.GothamBold
+    titleLabel.TextSize = 15
+    titleLabel.Parent = headerRow
+
+    -- Body text is padded left by icon-width + row padding (26 + 12 = 38)
+    -- so it lines up under the title instead of under the icon.
+    local bodyLabel = Instance.new("TextLabel")
+    bodyLabel.Size = UDim2.new(1, 0, 0, 0)
+    bodyLabel.AutomaticSize = Enum.AutomaticSize.Y
+    bodyLabel.LayoutOrder = 2
+    bodyLabel.BackgroundTransparency = 1
+    bodyLabel.Text = opts.Text or ""
+    bodyLabel.TextColor3 = Color3.fromRGB(195, 195, 205)
+    bodyLabel.TextXAlignment = Enum.TextXAlignment.Left
+    bodyLabel.TextYAlignment = Enum.TextYAlignment.Top
+    bodyLabel.TextWrapped = true
+    bodyLabel.Font = Enum.Font.Gotham
+    bodyLabel.TextSize = 13
+    bodyLabel.Parent = contentHolder
+    Utils.AddPadding(bodyLabel, UDim.new(0, 38))
+
+    -- Optional inline action button (opts.Button = { Text, Callback, KeepOpen }).
+    -- Created here (for layout order) but its click connection is wired up
+    -- below once `self` / Dismiss() exist.
+    local actionBtn
+    if opts.Button then
+        actionBtn = Instance.new("TextButton")
+        actionBtn.Size = UDim2.new(0, 0, 0, 30)
+        actionBtn.AutomaticSize = Enum.AutomaticSize.X
+        actionBtn.LayoutOrder = 3
+        actionBtn.BackgroundColor3 = accentColor
+        actionBtn.Text = opts.Button.Text or "OK"
+        actionBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
+        actionBtn.Font = Enum.Font.GothamBold
+        actionBtn.TextSize = 13
+        actionBtn.AutoButtonColor = false
+        actionBtn.Parent = contentHolder
+        Utils.AddCorner(actionBtn, UDim.new(0, 6))
+        Utils.AddPadding(actionBtn, UDim.new(0, 14))
+        Animator.AddThickenStroke(actionBtn, connMgr)
+        connMgr:Track(actionBtn.MouseEnter:Connect(function()
+            TweenService:Create(actionBtn, TweenInfo.new(0.2, EASE, EASE_OUT), { BackgroundColor3 = Utils.Brighten(accentColor, 1.2) }):Play()
+        end))
+        connMgr:Track(actionBtn.MouseLeave:Connect(function()
+            TweenService:Create(actionBtn, TweenInfo.new(0.2, EASE, EASE_OUT), { BackgroundColor3 = accentColor }):Play()
+        end))
+    end
+
+    local closeBtn = Instance.new("TextButton")
+    closeBtn.AnchorPoint = Vector2.new(1, 0)
+    closeBtn.Position = UDim2.new(1, -10, 0, 10)
+    closeBtn.Size = UDim2.new(0, 22, 0, 22)
+    closeBtn.BackgroundTransparency = 1
+    closeBtn.Text = "×"
+    closeBtn.TextColor3 = Color3.fromRGB(180, 180, 190)
+    closeBtn.Font = Enum.Font.GothamBold
+    closeBtn.TextSize = 13
+    closeBtn.ZIndex = 2
+    closeBtn.Parent = card
+
+    -- Numeric countdown label replacing the old progress bar. Sits just to
+    -- the left of the × button. Only created for non-sticky notifications;
+    -- driven directly (no Tween) by the Heartbeat countdown below, so it's
+    -- always exactly in sync with the actual time remaining.
+    local timerLabel
+    if not isSticky then
+        timerLabel = Instance.new("TextLabel")
+        timerLabel.AnchorPoint = Vector2.new(1, 0)
+        timerLabel.Position = UDim2.new(1, -38, 0, 10)
+        timerLabel.Size = UDim2.new(0, 24, 0, 22)
+        timerLabel.BackgroundTransparency = 1
+        timerLabel.Text = tostring(math.ceil(duration))
+        timerLabel.TextColor3 = Color3.fromRGB(160, 160, 170)
+        timerLabel.TextXAlignment = Enum.TextXAlignment.Right
+        timerLabel.Font = Enum.Font.GothamBold
+        timerLabel.TextSize = 12
+        timerLabel.ZIndex = 2
+        timerLabel.Parent = card
+    end
+
+    local bottomSpacer = Instance.new("Frame")
+    bottomSpacer.Size = UDim2.new(1, 0, 0, 16)
+    bottomSpacer.LayoutOrder = 4
+    bottomSpacer.BackgroundTransparency = 1
+    bottomSpacer.Parent = contentHolder
+
+    connMgr:Track(closeBtn.MouseEnter:Connect(function()
+        TweenService:Create(closeBtn, TweenInfo.new(0.2, EASE, EASE_OUT), { TextColor3 = Color3.fromRGB(255, 255, 255) }):Play()
+    end))
+    connMgr:Track(closeBtn.MouseLeave:Connect(function()
+        TweenService:Create(closeBtn, TweenInfo.new(0.2, EASE, EASE_OUT), { TextColor3 = Color3.fromRGB(180, 180, 190) }):Play()
+    end))
+
+    -- Whole-card scale for a springy pop on entrance/exit (Size itself is
+    -- driven by AutomaticSize, so scale is layered on top via UIScale instead
+    -- of tweening Size directly).
+    local cardScale = Instance.new("UIScale")
+    cardScale.Scale = 0.9
+    cardScale.Parent = card
+
+    local iconScale = Instance.new("UIScale")
+    iconScale.Scale = 0
+    iconScale.Parent = iconHolder
+
+    local baseCardColor = Utils.Brighten(theme.Color, 1.25)
+    local baseStrokeColor = Utils.Brighten(theme.Color, 1.5)
+    local dismissed = false
+    local remainingTime = duration
+    local countdownConn = nil
+    local self = { Instance = slot }
+
+    card.Active = true -- lets a plain Frame receive MouseEnter/MouseLeave for hover-to-pause
+
+    local function stopCountdown()
+        if countdownConn then
+            countdownConn:Disconnect()
+            countdownConn = nil
+        end
+    end
+
+    -- Single Heartbeat connection drives both the visible timer label and
+    -- the actual auto-dismiss off the same `remainingTime` clock, so the
+    -- displayed number reaching 0 and the dismiss firing can never drift
+    -- apart or get stuck mid-way.
+    local function startCountdown()
+        if isSticky or dismissed then return end
+        stopCountdown()
+        local startClock = os.clock()
+        local startRemaining = remainingTime
+        countdownConn = RunService.Heartbeat:Connect(function()
+            local elapsed = os.clock() - startClock
+            remainingTime = math.max(startRemaining - elapsed, 0)
+            if timerLabel then
+                timerLabel.Text = tostring(math.ceil(remainingTime))
+            end
+            if remainingTime <= 0 then
+                stopCountdown()
+                self:Dismiss()
+            end
+        end)
+        connMgr:Track(countdownConn)
+    end
+
+    function self:Dismiss()
+        if dismissed then return end
+        dismissed = true
+        stopCountdown()
+
+        -- Now that the entrance/hover phase is fully done, clip again for
+        -- the exit — this hides the slide-out overshoot and the height
+        -- collapse in step 2 from spilling outside the card's rounded corners.
+        card.ClipsDescendants = true
+
+        -- Step 1: slide the whole card UP and fade it out, so the exit
+        -- reads as the toast lifting off the stack (matches the vertical
+        -- top-to-bottom layout the toast container uses, instead of the
+        -- old horizontal swipe-right). `card` lives inside `slot` (not
+        -- directly inside the list-managed container), so this Position
+        -- tween is free to run without a UIListLayout recompute snapping
+        -- it back mid-flight.
+        Animator.Tween(cardScale, { Scale = 0.94 }, 0.28, EASE, EASE_IN):Play()
+        Animator.Tween(stroke, { Transparency = 1 }, 0.22, EASE, EASE_IN):Play()
+        Animator.Tween(accentBar, { BackgroundTransparency = 1 }, 0.22, EASE, EASE_IN):Play()
+        Animator.Tween(titleLabel, { TextTransparency = 1 }, 0.18, EASE, EASE_IN):Play()
+        Animator.Tween(bodyLabel, { TextTransparency = 1 }, 0.18, EASE, EASE_IN):Play()
+        Animator.Tween(icon, { TextTransparency = 1 }, 0.18, EASE, EASE_IN):Play()
+        Animator.Tween(iconHolder, { BackgroundTransparency = 1 }, 0.18, EASE, EASE_IN):Play()
+        Animator.Tween(closeBtn, { TextTransparency = 1 }, 0.18, EASE, EASE_IN):Play()
+        if timerLabel then Animator.Tween(timerLabel, { TextTransparency = 1 }, 0.18, EASE, EASE_IN):Play() end
+        if actionBtn then
+            Animator.Tween(actionBtn, { BackgroundTransparency = 1 }, 0.18, EASE, EASE_IN):Play()
+        end
+
+        -- Gated on each tween's own Completed event so the slide-up ->
+        -- collapse -> destroy sequence always lines up with the actual
+        -- on-screen animation instead of guessing via task.delay.
+        local slideOut = Animator.Tween(card, { Position = UDim2.new(0, 0, 0, -40), BackgroundTransparency = 1 }, 0.3, EASE, EASE_IN)
+        slideOut:Play()
+
+        slideOut.Completed:Connect(function()
+            -- Step 2: collapse height smoothly so notifications below slide
+            -- up into place instead of jumping the instant this one is gone.
+            -- Shrinking `card`'s height shrinks `slot`'s AutomaticSize right
+            -- along with it, which is what actually drives the list reflow.
+            card.AutomaticSize = Enum.AutomaticSize.None
+            card.Size = UDim2.new(1, 0, 0, card.AbsoluteSize.Y)
+            local collapse = Animator.Tween(card, { Size = UDim2.new(1, 0, 0, 0) }, 0.22, EASE, EASE_IN)
+            collapse.Completed:Connect(function()
+                if opts.OnDismiss then opts.OnDismiss() end
+                slot:Destroy()
+            end)
+            collapse:Play()
+        end)
+    end
+
+    connMgr:Track(closeBtn.MouseButton1Click:Connect(function() self:Dismiss() end))
+    if actionBtn then
+        connMgr:Track(actionBtn.MouseButton1Click:Connect(function()
+            if opts.Button.Callback then opts.Button.Callback() end
+            if opts.Button.KeepOpen ~= true then self:Dismiss() end
+        end))
+    end
+
+    -- Hovering a notification pauses its countdown (classic toast-UX
+    -- courtesy so it doesn't vanish while you're reading it) and gives a
+    -- subtle highlight so the card reads as interactive.
+    connMgr:Track(card.MouseEnter:Connect(function()
+        if dismissed then return end
+        stopCountdown()
+        TweenService:Create(card, TweenInfo.new(0.2, EASE, EASE_OUT), { BackgroundColor3 = Utils.Brighten(baseCardColor, 1.1) }):Play()
+        TweenService:Create(stroke, TweenInfo.new(0.2, EASE, EASE_OUT), { Color = accentColor, Thickness = 1.5 }):Play()
+    end))
+    connMgr:Track(card.MouseLeave:Connect(function()
+        if dismissed then return end
+        TweenService:Create(card, TweenInfo.new(0.2, EASE, EASE_OUT), { BackgroundColor3 = baseCardColor }):Play()
+        TweenService:Create(stroke, TweenInfo.new(0.2, EASE, EASE_OUT), { Color = baseStrokeColor, Thickness = 1 }):Play()
+        if not isSticky then
+            if remainingTime > 0.05 then
+                startCountdown()
+            else
+                self:Dismiss()
+            end
+        end
+    end))
+
+    -- Entrance: slide DOWN from just above its final spot + fade + a small
+    -- springy scale overshoot (Back easing), with the icon popping in a
+    -- beat later. We wait two Heartbeat frames first so `card`'s
+    -- AutomaticSize has fully converged — this is what fixes both the
+    -- jerky entrance and the text appearing to "land" in the wrong spot.
+    card.Position = UDim2.new(0, 0, 0, -30)
+    card.BackgroundTransparency = 1
+    stroke.Transparency = 1
+    task.defer(function()
+        RunService.Heartbeat:Wait()
+        RunService.Heartbeat:Wait()
+        if dismissed then return end
+        Animator.Tween(card, { Position = UDim2.new(0, 0, 0, 0), BackgroundTransparency = 0 }, 0.4, Enum.EasingStyle.Back, EASE_OUT):Play()
+        Animator.Tween(cardScale, { Scale = 1 }, 0.4, Enum.EasingStyle.Back, EASE_OUT):Play()
+        Animator.Tween(stroke, { Transparency = 0 }, 0.3):Play()
+        task.delay(0.1, function()
+            if dismissed then return end
+            Animator.Tween(iconScale, { Scale = 1 }, 0.35, Enum.EasingStyle.Back, EASE_OUT):Play()
+        end)
+        startCountdown()
+    end)
+
+    function self:ApplyTheme() end -- notifications keep their creation-time look; they're short-lived
+    return self
+end
