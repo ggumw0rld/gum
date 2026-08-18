@@ -1108,6 +1108,12 @@ function Components.Dropdown(parent, theme, connMgr, opts)
         Text = opts.Text or "Chọn mục:",
         LayoutOrder = opts.LayoutOrder,
         BodyHeight = bodyHeightFor(#options),
+        -- Proxy so ExpandableHeader always calls whatever opts.OnToggle
+        -- currently is, looked up at call time — the searchable block below
+        -- reassigns opts.OnToggle *after* this header is built, so without
+        -- this indirection ExpandableHeader would keep calling `nil`
+        -- forever and the "clear filter on close" behavior would never fire.
+        OnToggle = function(isOpen) if opts.OnToggle then opts.OnToggle(isOpen) end end,
     })
 
     local valueLabel = Instance.new("TextLabel")
@@ -1308,15 +1314,20 @@ function Components.MultiDropdown(parent, theme, connMgr, opts)
     local optionHeight = 32
     local searchable = opts.Searchable == true
     local SEARCH_ROW_HEIGHT = 34
-    local bodyHeight = #options * optionHeight + math.max(#options - 1, 0) * 6
-    if searchable then bodyHeight = bodyHeight + SEARCH_ROW_HEIGHT end
     local selectedSet = {}
     for _, v in ipairs(opts.Default or {}) do selectedSet[v] = true end
+
+    local function bodyHeightFor(count)
+        local base = count * optionHeight + math.max(count - 1, 0) * 6
+        return searchable and (base + SEARCH_ROW_HEIGHT) or base
+    end
 
     local exp = Components.ExpandableHeader(parent, theme, connMgr, {
         Text = opts.Text or "Chọn nhiều:",
         LayoutOrder = opts.LayoutOrder,
-        BodyHeight = bodyHeight,
+        BodyHeight = bodyHeightFor(#options),
+        -- Same OnToggle proxy fix as Dropdown above.
+        OnToggle = function(isOpen) if opts.OnToggle then opts.OnToggle(isOpen) end end,
     })
 
     local function summaryText()
@@ -1404,43 +1415,54 @@ function Components.MultiDropdown(parent, theme, connMgr, opts)
         end
     end
 
-    for i, text in ipairs(options) do
-        local btn = Instance.new("TextButton")
-        btn.Size = UDim2.new(1, 0, 0, optionHeight)
-        btn.LayoutOrder = i
-        btn.BackgroundColor3 = baseColorFor(text)
-        btn.Text = "   " .. text
-        btn.TextXAlignment = Enum.TextXAlignment.Left
-        btn.TextColor3 = Color3.fromRGB(255, 255, 255)
-        btn.Font = Enum.Font.Gotham
-        btn.TextSize = 14
-        btn.Parent = list
-        Utils.AddCorner(btn, UDim.new(0, 6))
-        Utils.AddPadding(btn, UDim.new(0, 10))
+    -- Rebuilds the option rows in `list` from the `options` array. Used both
+    -- at creation and by :Refresh() below (mirrors Dropdown:Refresh, which
+    -- MultiDropdown previously had no equivalent of).
+    local function rebuildRows()
+        for _, row in ipairs(rows) do row.btn:Destroy() end
+        table.clear(rows)
 
-        local check = Instance.new("TextLabel")
-        check.AnchorPoint = Vector2.new(1, 0.5)
-        check.Position = UDim2.new(1, -10, 0.5, 0)
-        check.Size = UDim2.new(0, 20, 1, 0)
-        check.BackgroundTransparency = 1
-        check.Text = "✓"
-        check.TextColor3 = Color3.fromRGB(255, 255, 255)
-        check.Font = Enum.Font.GothamBold
-        check.TextSize = 16
-        check.TextTransparency = selectedSet[text] and 0 or 1
-        check.Parent = btn
+        for i, text in ipairs(options) do
+            local btn = Instance.new("TextButton")
+            btn.Size = UDim2.new(1, 0, 0, optionHeight)
+            btn.LayoutOrder = i
+            btn.BackgroundColor3 = baseColorFor(text)
+            btn.Text = "   " .. text
+            btn.TextXAlignment = Enum.TextXAlignment.Left
+            btn.TextColor3 = Color3.fromRGB(255, 255, 255)
+            btn.Font = Enum.Font.Gotham
+            btn.TextSize = 14
+            btn.Parent = list
+            Utils.AddCorner(btn, UDim.new(0, 6))
+            Utils.AddPadding(btn, UDim.new(0, 10))
 
-        Animator.AddThickenStroke(btn, connMgr)
-        connMgr:Track(btn.MouseEnter:Connect(function()
-            TweenService:Create(btn, TweenInfo.new(0.18, EASE, EASE_OUT), { BackgroundColor3 = Utils.Brighten(baseColorFor(text), 1.2) }):Play()
-        end))
-        connMgr:Track(btn.MouseLeave:Connect(function()
-            TweenService:Create(btn, TweenInfo.new(0.18, EASE, EASE_OUT), { BackgroundColor3 = baseColorFor(text) }):Play()
-        end))
-        connMgr:Track(btn.MouseButton1Click:Connect(function() toggle(text) end))
+            local check = Instance.new("TextLabel")
+            check.AnchorPoint = Vector2.new(1, 0.5)
+            check.Position = UDim2.new(1, -10, 0.5, 0)
+            check.Size = UDim2.new(0, 20, 1, 0)
+            check.BackgroundTransparency = 1
+            check.Text = "✓"
+            check.TextColor3 = Color3.fromRGB(255, 255, 255)
+            check.Font = Enum.Font.GothamBold
+            check.TextSize = 16
+            check.TextTransparency = selectedSet[text] and 0 or 1
+            check.Parent = btn
 
-        table.insert(rows, { btn = btn, check = check, text = text })
+            Animator.AddThickenStroke(btn, connMgr)
+            connMgr:Track(btn.MouseEnter:Connect(function()
+                TweenService:Create(btn, TweenInfo.new(0.18, EASE, EASE_OUT), { BackgroundColor3 = Utils.Brighten(baseColorFor(text), 1.2) }):Play()
+            end))
+            connMgr:Track(btn.MouseLeave:Connect(function()
+                TweenService:Create(btn, TweenInfo.new(0.18, EASE, EASE_OUT), { BackgroundColor3 = baseColorFor(text) }):Play()
+            end))
+            connMgr:Track(btn.MouseButton1Click:Connect(function() toggle(text) end))
+
+            table.insert(rows, { btn = btn, check = check, text = text })
+        end
+
+        if searchable then applyFilter(searchBox.Text) end
     end
+    rebuildRows()
 
     if searchable then
         connMgr:Track(searchBox:GetPropertyChangedSignal("Text"):Connect(function()
@@ -1480,6 +1502,24 @@ function Components.MultiDropdown(parent, theme, connMgr, opts)
             for _, t in ipairs(options) do if selectedSet[t] then table.insert(out, t) end end
             opts.Callback(out)
         end
+    end
+    -- Replaces the Options list at runtime, same contract as
+    -- Dropdown:Refresh (keepSelection preserves any still-valid selected
+    -- entries instead of clearing the whole selection).
+    function self:Refresh(newOptions, keepSelection)
+        options = newOptions or {}
+        if keepSelection then
+            local newSet = {}
+            for _, t in ipairs(options) do
+                if selectedSet[t] then newSet[t] = true end
+            end
+            selectedSet = newSet
+        else
+            selectedSet = {}
+        end
+        exp.SetBodyHeight(bodyHeightFor(#options))
+        rebuildRows()
+        valueLabel.Text = summaryText()
     end
     function self:ApplyTheme(color, accent, isInitial)
         local panelBg = Utils.Brighten(color, 1.2)
@@ -1725,6 +1765,13 @@ function Components.ColorPicker(parent, theme, connMgr, opts)
         end)
     end
 
+    -- Labels created for each RGB field (R:/G:/B:), tracked here so
+    -- ApplyTheme can restyle them like every other field label — previously
+    -- they (and the hex/RGB input boxes below) were left at a fixed color
+    -- and never reacted to a theme change at all, unlike the visually
+    -- identical Components.Textbox input.
+    local rgbLabels = {}
+
     local function makeRGBField(labelText, order, onCommit)
         local holder = Instance.new("Frame")
         holder.Size = UDim2.new(1, 0, 0, 32)
@@ -1740,6 +1787,7 @@ function Components.ColorPicker(parent, theme, connMgr, opts)
         lbl.TextSize = 14
         lbl.TextXAlignment = Enum.TextXAlignment.Left
         lbl.Parent = holder
+        table.insert(rgbLabels, lbl)
         local box = Instance.new("TextBox")
         box.Position = UDim2.new(0, 34, 0, 0)
         box.Size = UDim2.new(1, -34, 1, 0)
@@ -1907,14 +1955,37 @@ function Components.ColorPicker(parent, theme, connMgr, opts)
         local panelBg = Utils.Brighten(color, 1.2)
         local headerTextColor = Utils.GetTextColorFor(panelBg, accent)
         local hexTextColor = (Utils.GetLuminance(panelBg) > 0.55) and Color3.fromRGB(90, 90, 100) or Color3.fromRGB(190, 190, 200)
+        -- The RGB/HEX numeric input boxes previously stayed a fixed dark
+        -- gray no matter the theme (unlike Components.Textbox's identical-
+        -- purpose input, which always tracks Utils.Darken(color, 0.8)) — now
+        -- themed the same way, for consistency with every other input field
+        -- in the library.
+        local darkBg = Utils.Darken(color, 0.8)
+        local boxTextColor = Utils.GetTextColorFor(darkBg, accent)
         if isInitial then
             exp.Header.BackgroundColor3 = panelBg
             exp.TitleLabel.TextColor3 = headerTextColor
             hexLabel.TextColor3 = hexTextColor
+            hexRowLabel.TextColor3 = headerTextColor
+            hexBox.BackgroundColor3 = darkBg
+            hexBox.TextColor3 = boxTextColor
+            for _, lbl in ipairs(rgbLabels) do lbl.TextColor3 = headerTextColor end
+            for _, box in ipairs({ rBox, gBox, bBox }) do
+                box.BackgroundColor3 = darkBg
+                box.TextColor3 = boxTextColor
+            end
         else
             TweenService:Create(exp.Header, THEME_TWEEN_INFO, { BackgroundColor3 = panelBg }):Play()
             TweenService:Create(exp.TitleLabel, THEME_TWEEN_INFO, { TextColor3 = headerTextColor }):Play()
             TweenService:Create(hexLabel, THEME_TWEEN_INFO, { TextColor3 = hexTextColor }):Play()
+            TweenService:Create(hexRowLabel, THEME_TWEEN_INFO, { TextColor3 = headerTextColor }):Play()
+            TweenService:Create(hexBox, THEME_TWEEN_INFO, { BackgroundColor3 = darkBg, TextColor3 = boxTextColor }):Play()
+            for _, lbl in ipairs(rgbLabels) do
+                TweenService:Create(lbl, THEME_TWEEN_INFO, { TextColor3 = headerTextColor }):Play()
+            end
+            for _, box in ipairs({ rBox, gBox, bBox }) do
+                TweenService:Create(box, THEME_TWEEN_INFO, { BackgroundColor3 = darkBg, TextColor3 = boxTextColor }):Play()
+            end
         end
     end
     theme:Subscribe(function(c, a, initial) self:ApplyTheme(c, a, initial) end)
@@ -2562,7 +2633,14 @@ end
 -- clipped. Used both for the initial Size and for re-fitting on a
 -- ViewportSize change (device rotation, window resize, etc).
 local VIEWPORT_MARGIN = 40
-local MIN_FIT_W, MIN_FIT_H = 300, 220
+-- Shared with _setupResize's resize-drag clamp below so a window can never
+-- be fit smaller than the size the resize handle itself allows shrinking
+-- to. Previously these were two separate, out-of-sync constants (300x220
+-- here vs 340x260 in _setupResize), so a window fit to the smaller floor
+-- on a tiny viewport would visibly snap larger the first time it was
+-- resized by hand.
+local MIN_WINDOW_W, MIN_WINDOW_H = 340, 260
+local MIN_FIT_W, MIN_FIT_H = MIN_WINDOW_W, MIN_WINDOW_H
 local function fitToViewport(size)
     local viewport = workspace.CurrentCamera.ViewportSize
     local maxW = math.max(viewport.X - VIEWPORT_MARGIN, MIN_FIT_W)
@@ -2570,6 +2648,30 @@ local function fitToViewport(size)
     local w = math.min(size.X.Offset, maxW)
     local h = math.min(size.Y.Offset, maxH)
     return UDim2.new(0, w, 0, h)
+end
+
+-- Clamps a frame's Position so it stays fully on-screen for the given
+-- Size/AnchorPoint. Shared by the titlebar drag handler and the viewport
+-- refit handler below — previously only drag clamped position, so a
+-- window sitting near a screen edge whose viewport then shrank (rotation,
+-- resizing the game window) could end up stuck partly off-screen with no
+-- way to recover short of dragging it back manually.
+local function clampFramePosition(pos, size, anchor)
+    local viewport = workspace.CurrentCamera.ViewportSize
+    local w, h = size.X.Offset, size.Y.Offset
+
+    local scaleX = pos.X.Scale * viewport.X
+    local scaleY = pos.Y.Scale * viewport.Y
+
+    local minX, maxX = anchor.X * w - scaleX, viewport.X - (1 - anchor.X) * w - scaleX
+    local minY, maxY = anchor.Y * h - scaleY, viewport.Y - (1 - anchor.Y) * h - scaleY
+
+    if minX > maxX then minX, maxX = maxX, minX end
+    if minY > maxY then minY, maxY = maxY, minY end
+
+    local x = math.clamp(pos.X.Offset, minX, maxX)
+    local y = math.clamp(pos.Y.Offset, minY, maxY)
+    return UDim2.new(pos.X.Scale, x, pos.Y.Scale, y)
 end
 
 function Window.new(config)
@@ -2788,11 +2890,32 @@ end
 function Window:_setupViewportRefit(mainFrame)
     local connMgr = self._connMgr
     connMgr:Track(workspace.CurrentCamera:GetPropertyChangedSignal("ViewportSize"):Connect(function()
-        if self._minimized or self._resizing or self._animating or self._titleDragging then return end
+        if self._resizing or self._animating or self._titleDragging then return end
+
+        if self._minimized then
+            -- mainFrame's current Size is the minimized bar, not the real
+            -- window size, so don't touch it — just keep _currentTargetSize
+            -- in sync with the new viewport so restoring later can't pop
+            -- back to a size larger than the (possibly now-smaller) screen.
+            self._currentTargetSize = fitToViewport(self._currentTargetSize)
+            return
+        end
+
         local fitted = fitToViewport(mainFrame.Size)
-        if fitted ~= mainFrame.Size then
+        local sizeChanged = fitted ~= mainFrame.Size
+        if sizeChanged then
             Animator.Tween(mainFrame, { Size = fitted }, 0.25):Play()
             self._currentTargetSize = fitted
+        end
+
+        -- Also re-clamp Position: a window parked near a screen edge can
+        -- end up partly (or entirely) off-screen once the viewport shrinks
+        -- (device rotation, resizing the game window), with nothing else
+        -- to pull it back — dragging clamps position, but a passive
+        -- viewport change previously didn't.
+        local clampedPos = clampFramePosition(mainFrame.Position, sizeChanged and fitted or mainFrame.Size, mainFrame.AnchorPoint)
+        if clampedPos ~= mainFrame.Position then
+            Animator.Tween(mainFrame, { Position = clampedPos }, 0.25):Play()
         end
     end))
 end
@@ -2936,24 +3059,6 @@ function Window:_setupDrag(titleBar, mainFrame)
     self._titleDragging = false
     local activeInput, dragStart, startPos
 
-    local function clampPosition(pos, size, anchor)
-        local viewport = workspace.CurrentCamera.ViewportSize
-        local w, h = size.X.Offset, size.Y.Offset
-
-        local scaleX = pos.X.Scale * viewport.X
-        local scaleY = pos.Y.Scale * viewport.Y
-
-        local minX, maxX = anchor.X * w - scaleX, viewport.X - (1 - anchor.X) * w - scaleX
-        local minY, maxY = anchor.Y * h - scaleY, viewport.Y - (1 - anchor.Y) * h - scaleY
-
-        if minX > maxX then minX, maxX = maxX, minX end
-        if minY > maxY then minY, maxY = maxY, minY end
-
-        local x = math.clamp(pos.X.Offset, minX, maxX)
-        local y = math.clamp(pos.Y.Offset, minY, maxY)
-        return UDim2.new(pos.X.Scale, x, pos.Y.Scale, y)
-    end
-
     connMgr:Track(titleBar.InputBegan:Connect(function(input)
         if self._titleDragging or self._resizing or self._animating then return end
         if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
@@ -2971,7 +3076,7 @@ function Window:_setupDrag(titleBar, mainFrame)
                 startPos.X.Scale, startPos.X.Offset + delta.X,
                 startPos.Y.Scale, startPos.Y.Offset + delta.Y
             )
-            mainFrame.Position = clampPosition(newPos, mainFrame.Size, mainFrame.AnchorPoint)
+            mainFrame.Position = clampFramePosition(newPos, mainFrame.Size, mainFrame.AnchorPoint)
         end
     end))
     connMgr:Track(UserInputService.InputEnded:Connect(function(input)
@@ -2984,14 +3089,13 @@ end
 
 function Window:_setupResize(mainFrame, originalSize)
     local connMgr = self._connMgr
-    local MIN_W, MIN_H = 340, 260
     self._currentTargetSize = originalSize
     self._resizing = false
 
     local function maxSize()
         local viewport = workspace.CurrentCamera.ViewportSize
-        return math.max(viewport.X - VIEWPORT_MARGIN, MIN_W),
-               math.max(viewport.Y - VIEWPORT_MARGIN, MIN_H)
+        return math.max(viewport.X - VIEWPORT_MARGIN, MIN_WINDOW_W),
+               math.max(viewport.Y - VIEWPORT_MARGIN, MIN_WINDOW_H)
     end
 
     local handle = Instance.new("TextButton")
@@ -3044,8 +3148,8 @@ function Window:_setupResize(mainFrame, originalSize)
             and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
             local delta = input.Position - dragStart
             local MAX_W, MAX_H = maxSize()
-            local w = math.clamp(startSize.X.Offset + delta.X, MIN_W, MAX_W)
-            local h = math.clamp(startSize.Y.Offset + delta.Y, MIN_H, MAX_H)
+            local w = math.clamp(startSize.X.Offset + delta.X, MIN_WINDOW_W, MAX_W)
+            local h = math.clamp(startSize.Y.Offset + delta.Y, MIN_WINDOW_H, MAX_H)
             mainFrame.Size = UDim2.new(0, w, 0, h)
         end
     end))
@@ -3279,6 +3383,12 @@ function Window:_registerFlag(flag, obj)
 end
 
 local CONFIG_FOLDER = "Selenix/Config"
+-- Marker file recording the name of the most recently *saved* config, kept
+-- outside the .json namespace (ListConfigs' pattern only matches "*.json")
+-- so it never shows up as a fake config entry. This is what
+-- Window:GetLastConfig() / CreateConfigList's AutoLoadLast read from.
+local LAST_CONFIG_MARKER = CONFIG_FOLDER .. "/_last.txt"
+
 local function configFolder()
     if not (isfolder and makefolder) then return nil end
     if not isfolder(CONFIG_FOLDER) then makefolder(CONFIG_FOLDER) end
@@ -3314,6 +3424,12 @@ function Window:SaveConfig(name)
     if not okEncode then return false, "JSONEncode failed" end
     local okWrite = pcall(writefile, path, encoded)
     if not okWrite then return false, "writefile failed" end
+
+    -- Record this as the most recently saved config. Best-effort: a failure
+    -- here shouldn't turn a successful SaveConfig into a reported failure,
+    -- it just means AutoLoadLast/GetLastConfig won't pick this one up.
+    pcall(writefile, LAST_CONFIG_MARKER, name)
+
     return true
 end
 
@@ -3355,6 +3471,22 @@ function Window:ListConfigs()
     end
     table.sort(names)
     return names
+end
+
+-- Returns the name of the most recently *saved* config (via the marker
+-- file SaveConfig writes), or nil if none is recorded / the executor
+-- doesn't support readfile. Unlike ListConfigs()[#ListConfigs()] (what
+-- CreateConfigList's AutoLoadLast used to fall back on), this reflects
+-- actual save recency instead of alphabetical order — "abc" saved after
+-- "main" no longer gets skipped in favor of "main" just because it sorts
+-- earlier.
+function Window:GetLastConfig()
+    if not (readfile and isfile) then return nil end
+    if not isfile(LAST_CONFIG_MARKER) then return nil end
+    local okRead, name = pcall(readfile, LAST_CONFIG_MARKER)
+    if not okRead or not name or name == "" then return nil end
+    if not isfile(configPath(name)) then return nil end
+    return name
 end
 
 function Window:DeleteConfig(name)
@@ -3574,8 +3706,12 @@ function TabMeta:CreateConfigList(opts)
     })
 
     if opts.AutoLoadLast then
-        local existing = window:ListConfigs()
-        local last = existing[#existing]
+        -- Uses the actual last-*saved* config (see Window:GetLastConfig),
+        -- not ListConfigs()[#ListConfigs()] — that list is alphabetically
+        -- sorted, so it previously picked whichever name sorted last
+        -- ("main") instead of whichever was actually saved most recently
+        -- ("abc" saved afterwards).
+        local last = window:GetLastConfig()
         if last then
             nameBox:Set(last)
             window:LoadConfig(last)
@@ -3587,19 +3723,25 @@ end
 
 local Library = {}
 
-Library._activeWindow = nil
+-- All windows created via Library:CreateWindow this session — not just the
+-- most recent one. Library:Destroy() tears down every one of them.
+-- Previously only a single _activeWindow was tracked, so creating a second
+-- window with a different Title silently orphaned the first one's
+-- ScreenGui + every connection it held (drag, resize, hover, gradient/
+-- notification Heartbeat loops) instead of cleaning it up.
+Library._windows = {}
 
 function Library:CreateWindow(config)
     local window = Window.new(config)
-    Library._activeWindow = window
+    table.insert(Library._windows, window)
     return window
 end
 
 function Library:Destroy()
-    if Library._activeWindow then
-        Library._activeWindow:Destroy()
-        Library._activeWindow = nil
+    for _, window in ipairs(Library._windows) do
+        window:Destroy()
     end
+    table.clear(Library._windows)
 end
 
 return Library
