@@ -30,158 +30,6 @@
     The window has no in-UI close button / close-confirm dialog — it is
     closed programmatically instead, via `Selenix:Destroy()`.
     ============================================================
-
-    PATCH NOTES (this copy — Config system + auto-fit viewport):
-
-    NEW — Config (Flags + Save/Load):
-      Any control created via Tab:CreateXxx({..., Flag = "uniqueName"})
-      is now registered into Window._flags[flag]. Window:SaveConfig(name)
-      and Window:LoadConfig(name) serialize/restore every registered
-      control's value via :Get()/:Set(), through writefile/readfile
-      (wrapped in pcall since not every executor exposes them). Color3
-      values are encoded as {__color3=true, r,g,b} since JSONEncode can't
-      handle Color3 directly. Added :Set() to Slider/Textbox/Dropdown/
-      MultiDropdown/ColorPicker so LoadConfig can restore every control
-      type, not just Toggle (which already had :Set()).
-
-    NEW — Auto-fit UI to current screen size:
-      mainFrame's initial Size is now clamped to the current
-      workspace.CurrentCamera.ViewportSize (minus a margin) via
-      fitToViewport(), so a window configured larger than the screen
-      never spawns off-screen or clipped. A ViewportSize-changed listener
-      re-fits the window (tweened) whenever the viewport changes (e.g.
-      device rotation, window resize), as long as the user isn't actively
-      dragging/resizing/minimizing it. _setupResize's MAX_W/MAX_H are also
-      now computed from the live viewport instead of fixed constants, so
-      manual resize can't drag the window bigger than the screen either.
-    ============================================================
-
-    PATCH NOTES (carried over — real loading screen):
-
-    The loading screen no longer fakes progress on a fixed clock
-    (previously: tween the bar to 100% over 1.35s, then task.delay(1.6)
-    and close regardless of what had actually happened). It's now driven
-    by real conditions:
-      - Auto stage: waits for game:IsLoaded()/game.Loaded if the place
-        hasn't finished loading yet, and preloads the titlebar icon asset
-        via ContentProvider:PreloadAsync if one was given. The bar only
-        advances as each of these actually completes.
-      - Manual stage (opt-in via CreateWindow{ Loading = { Manual = true } }):
-        once the auto stage is done, the bar holds below 100% and the
-        screen stays open until the consumer script calls
-        Window:SetLoadingProgress(alpha, statusText) or
-        Window:FinishLoading(text) itself — e.g. after fetching remote
-        data, waiting on a RemoteFunction, or loading saved settings.
-      Config.Loading also accepts WaitForGameLoaded (default true) and
-      PreloadIcon (default true when an Icon is set) to turn either auto
-      step off individually.
-    ============================================================
-
-    PATCH NOTES (carried over — 3 fixes):
-
-    FIX 1 — Duplicate theme subscription in CreateTab (perf bug):
-      Window:_buildChrome already subscribes once to the theme and calls
-      self:_restyleTabButtons(...) on every change, which loops over ALL
-      tab buttons. CreateTab was ALSO calling theme:Subscribe(...) with the
-      same callback for every single tab created — so with N tabs, a theme
-      change fired _restyleTabButtons N+1 times, each looping over N
-      buttons and re-tweening all of them (~N² tweens instead of N).
-      Removed the redundant theme:Subscribe(...) call at the end of
-      CreateTab; the chrome-level subscription already covers every tab.
-
-    FIX 2 — Titlebar couldn't be dragged while the window was minimized:
-      _setupDrag's InputBegan guard included `self._minimized`, blocking
-      any drag start whenever the window was in its minimized state (even
-      though the titlebar — the only thing left visible while minimized —
-      is exactly what you'd want to still be able to drag). Removed
-      `self._minimized` from the guard; dragging is still correctly
-      blocked during an active resize or an in-progress minimize/restore
-      animation (`self._resizing` / `self._animating`).
-
-    FIX 3 — Window could be dragged off-screen entirely:
-      Added a clampPosition() helper inside _setupDrag that clamps
-      mainFrame's Position (in Offset units) to keep the window fully
-      inside the current viewport bounds during a drag. It accounts for
-      mainFrame's current AnchorPoint (which this library temporarily
-      changes to top-center during minimize/restore and top-left during
-      resize), so the clamp math stays correct no matter which anchor mode
-      is active at the time of the drag. If the window is ever wider/taller
-      than the viewport itself, the clamp falls back to centering it rather
-      than producing an invalid (min > max) range.
-    ============================================================
-
-    PATCH NOTES (carried over from the previous revision):
-    Titlebar corner fix (per-corner rounding):
-      titleBar previously used Utils.AddCorner (bo cả 4 góc), which rounded
-      its bottom-left/bottom-right corners even though it sits flush on top
-      of contentGroup below it — the rounded bottom edge showed as a small
-      visual notch where the titlebar met the content area. Fixed with the
-      new Utils.AddCornerEx helper (built on Roblox's per-corner UICorner
-      properties — TopLeftRadius/TopRightRadius/BottomLeftRadius/
-      BottomRightRadius, fully released June 23, 2026) so titleBar only
-      rounds its two TOP corners and stays square on the bottom, matching
-      up cleanly with contentGroup's flat top edge.
-
-      This introduced a follow-up issue: when the window is minimized,
-      mainFrame's Size shrinks down to exactly titleBar's height (see
-      _setupMinimize / MINIMIZED_HEIGHT), so titleBar becomes the *entire*
-      visible window. At that point mainFrame is still rounded on all 4
-      corners (Utils.AddCorner, unchanged), but titleBar only rounds its
-      top 2 — so its square bottom corners poked out past mainFrame's
-      rounded bottom corners ("lồi ra"). Fixed by keeping a handle to the
-      titlebar's UICorner (self._titleBarCorner) and tweening its
-      BottomLeftRadius/BottomRightRadius up to match mainFrame's radius
-      (12px) in lockstep with the minimize shrink-tween, and back down to
-      0 in lockstep with the restore grow-tween — so the corners visually
-      "grow in" as the frame shrinks and "flatten back out" as it expands,
-      instead of snapping instantly.
-
-    Fixed minimize animation (jitter + missing fade):
-      1. mainFrame was anchored at true center (0.5, 0.5) with a hand-computed
-         Position delta applied alongside every minimize/resize Size change so
-         the titlebar edge wouldn't drift. In practice the Size tween and the
-         Position tween never landed on exactly the same pixel every frame
-         (independent TweenService interpolations), which read as jitter.
-         Fixed by switching mainFrame to a *temporary* top-center anchor
-         (0.5, 0) for the duration of the minimize/restore animation only:
-         with that anchor, only Size needs to be tweened (the top edge is
-         naturally fixed), so there's no second Position tween to drift out
-         of sync with. anchorTopCenter()/anchorCenter() convert between the
-         two anchor modes by adjusting Position so the frame doesn't visibly
-         jump when the anchor itself changes. AnchorPoint is restored to true
-         center after the animation completes so dragging (_setupDrag) and
-         resizing (_setupResize) keep behaving exactly as before.
-      2. Content fade (CanvasGroup.GroupTransparency) was being driven by a
-         normal TweenService tween. On some executors, CanvasGroup's offscreen
-         composite buffer doesn't get re-composited in sync with a
-         TweenService-interpolated GroupTransparency — the property value
-         tweens correctly in memory, but visually the content just pops
-         instead of fading. Fixed with fadeCanvasGroup(): a small manual
-         Heartbeat-driven loop that writes GroupTransparency explicitly every
-         frame, forcing a real redraw each step instead of relying on
-         TweenService's internal (and here, unreliable) interpolation.
-      3. Minimize/restore sequencing is now strictly staged and gated on real
-         completion at every step, using the fixes above:
-         minimize:  fade content out (fadeCanvasGroup) -> hide tab/pages ->
-                    anchor top-center -> shrink Size (tween) -> done
-         restore:   show tab/pages -> grow Size (tween) -> anchor back to
-                    center -> fade content in (fadeCanvasGroup) -> done
-         Each step only starts once the previous one has actually finished
-         (Completed / manual completion callback), instead of guessing
-         durations or running fade and resize in parallel.
-    ============================================================
-
-    PATCH NOTES (this copy — Additions merged in):
-      Merged in the "ADDITIONS" drop-in patch:
-        - Components.Divider    (section header / separator line)
-        - Components.Paragraph  (title + wrapped body text, optional collapse)
-        - Components.Dropdown / Components.MultiDropdown now support
-          opts.Searchable = true (adds a filter textbox above the option
-          list; rows are filtered via Visible so filtering stays cheap,
-          and the filter clears whenever the dropdown closes).
-        - TabMeta:CreateDivider / TabMeta:CreateParagraph wrappers added
-          alongside the other TabMeta:CreateXxx methods.
-    ============================================================
 ]]
 
 local TweenService = game:GetService("TweenService")
@@ -237,6 +85,19 @@ function Utils.GetTextColorFor(bg, tint)
             math.min(0.82 + tint.B * 0.18, 1)
         )
     end
+end
+
+-- Near-white color, lightly tinted by `tint` (usually the accent), regardless
+-- of what it will sit on top of. Used for control knobs (Toggle,
+-- GradientPicker's toggle) that should always read as "white" at a glance
+-- but still pick up a touch of the current theme's accent so they don't look
+-- totally disconnected from it.
+function Utils.GetKnobColor(tint)
+    return Color3.new(
+        math.min(0.88 + tint.R * 0.12, 1),
+        math.min(0.88 + tint.G * 0.12, 1),
+        math.min(0.88 + tint.B * 0.12, 1)
+    )
 end
 
 function Utils.AddCorner(parent, radius)
@@ -652,12 +513,10 @@ function Components.Toggle(parent, theme, connMgr, opts)
     local function restyle(instant)
         local darkBg = Utils.Darken(theme.Color, 0.8)
         local trackColor = state and Utils.Brighten(theme.Accent, 1.15) or darkBg
-        -- Knob color is computed for contrast against its own track color
-        -- (not a fixed light gray) so it stays visible whether the track is
-        -- currently the dark "off" background or the brightened accent
-        -- "on" color, and on light themes where a fixed light knob would
-        -- otherwise wash out against a light track.
-        local knobColor = Utils.GetTextColorFor(trackColor, theme.Accent)
+        -- Knob stays near-white at all times (readable/consistent regardless
+        -- of on/off track color) but is still lightly tinted by the live
+        -- accent so it doesn't look totally disconnected from the theme.
+        local knobColor = Utils.GetKnobColor(theme.Accent)
         local knobX = state and (52 - 22 - 3) or 3
         local info = TweenInfo.new(instant and 0 or 0.3, EASE, EASE_OUT)
         TweenService:Create(track, info, { BackgroundColor3 = trackColor }):Play()
@@ -875,16 +734,7 @@ function Components.Textbox(parent, theme, connMgr, opts)
     Utils.AddPadding(box, UDim.new(0, 10), UDim.new(0, 10))
     Utils.AddCorner(box, UDim.new(0, 6))
 
-    local stroke = Instance.new("UIStroke")
-    stroke.Thickness = 1.5
-    stroke.Transparency = 1
-    stroke.Parent = box
-
-    connMgr:Track(box.Focused:Connect(function()
-        TweenService:Create(stroke, TweenInfo.new(0.25, EASE, EASE_OUT), { Transparency = 0 }):Play()
-    end))
     connMgr:Track(box.FocusLost:Connect(function(enterPressed)
-        TweenService:Create(stroke, TweenInfo.new(0.25, EASE, EASE_OUT), { Transparency = 1 }):Play()
         if enterPressed and opts.Callback then opts.Callback(box.Text) end
     end))
 
@@ -906,7 +756,6 @@ function Components.Textbox(parent, theme, connMgr, opts)
             label.TextColor3 = labelTextColor
             box.BackgroundColor3 = darkBg
             box.TextColor3 = boxTextColor
-            stroke.Color = accent
         else
             TweenService:Create(frame, THEME_TWEEN_INFO, { BackgroundColor3 = panelBg }):Play()
             TweenService:Create(label, THEME_TWEEN_INFO, { TextColor3 = labelTextColor }):Play()
@@ -914,7 +763,6 @@ function Components.Textbox(parent, theme, connMgr, opts)
                 BackgroundColor3 = darkBg,
                 TextColor3 = boxTextColor,
             }):Play()
-            TweenService:Create(stroke, THEME_TWEEN_INFO, { Color = accent }):Play()
         end
     end
     theme:Subscribe(function(c, a, initial) self:ApplyTheme(c, a, initial) end)
@@ -987,6 +835,11 @@ end
 -- a themed panel background of its own — it sits directly on the tab page
 -- like Components.Label does.
 --
+-- The collapse/expand itself is animated: the body sits inside a clipped
+-- "bodyClip" frame whose height is tweened between 0 and the body's
+-- natural (AutomaticSize-computed) height, with the body's text fading in
+-- lockstep, instead of the old instant Visible-toggle snap.
+--
 -- opts: { Title, Text, Collapsible (default false), DefaultOpen (default false) }
 function Components.Paragraph(parent, theme, connMgr, opts)
     opts = opts or {}
@@ -1043,10 +896,23 @@ function Components.Paragraph(parent, theme, connMgr, opts)
         arrow.Parent = titleRow
     end
 
+    -- bodyClip: the actual LayoutOrder=2 child of `inner`. Its height is
+    -- what gets tweened between 0 and the body's natural height, and its
+    -- ClipsDescendants=true crops the body text during that tween instead
+    -- of it just snapping visible/invisible. `body` itself always keeps
+    -- AutomaticSize = Y and stays parented (and un-hidden) inside it, so
+    -- its natural height can be measured/re-measured at any time via
+    -- body.AbsoluteSize.Y regardless of the clip's current height.
+    local bodyClip = Instance.new("Frame")
+    bodyClip.Size = UDim2.new(1, 0, 0, 0)
+    bodyClip.LayoutOrder = 2
+    bodyClip.BackgroundTransparency = 1
+    bodyClip.ClipsDescendants = true
+    bodyClip.Parent = inner
+
     local body = Instance.new("TextLabel")
     body.Size = UDim2.new(1, 0, 0, 0)
     body.AutomaticSize = Enum.AutomaticSize.Y
-    body.LayoutOrder = 2
     body.BackgroundTransparency = 1
     body.Text = opts.Text or ""
     body.TextWrapped = true
@@ -1054,15 +920,46 @@ function Components.Paragraph(parent, theme, connMgr, opts)
     body.TextYAlignment = Enum.TextYAlignment.Top
     body.Font = Enum.Font.Gotham
     body.TextSize = 13
-    body.Visible = open
-    body.Parent = inner
+    body.TextTransparency = open and 0 or 1
+    body.Parent = bodyClip
+
+    local COLLAPSE_DURATION = 0.3
+
+    -- Sets bodyClip's height instantly to match the body's current natural
+    -- height (used for the initial paint, so a DefaultOpen=true paragraph
+    -- doesn't play an opening animation the moment it's created).
+    local function snapToNatural(isOpen)
+        bodyClip.Size = UDim2.new(1, 0, 0, isOpen and body.AbsoluteSize.Y or 0)
+    end
 
     if collapsible then
+        -- Body text needs one render step before AbsoluteSize.Y reflects the
+        -- actual wrapped height, so the very first paint is deferred a frame
+        -- (matches the pattern used elsewhere in this library for
+        -- AutomaticSize convergence, e.g. Components.Notification).
+        task.defer(function()
+            RunService.Heartbeat:Wait()
+            snapToNatural(open)
+        end)
+
         connMgr:Track(holder.MouseButton1Click:Connect(function()
             open = not open
-            body.Visible = open
             TweenService:Create(arrow, TweenInfo.new(0.25, EASE, EASE_OUT), { Rotation = open and 180 or 0 }):Play()
+            local targetHeight = open and body.AbsoluteSize.Y or 0
+            TweenService:Create(bodyClip, TweenInfo.new(COLLAPSE_DURATION, EASE, EASE_OUT), {
+                Size = UDim2.new(1, 0, 0, targetHeight),
+            }):Play()
+            TweenService:Create(body, TweenInfo.new(open and COLLAPSE_DURATION * 0.8 or COLLAPSE_DURATION * 0.5, EASE, EASE_OUT), {
+                TextTransparency = open and 0 or 1,
+            }):Play()
         end))
+    else
+        -- Not collapsible: always fully open, same one-frame defer so the
+        -- clip's height matches the text's real wrapped height immediately.
+        task.defer(function()
+            RunService.Heartbeat:Wait()
+            snapToNatural(true)
+        end)
     end
 
     local self = { Instance = holder }
@@ -1249,19 +1146,7 @@ function Components.Dropdown(parent, theme, connMgr, opts)
         Utils.AddPadding(searchBox, UDim.new(0, 10))
         Utils.AddCorner(searchBox, UDim.new(0, 6))
 
-        local searchStroke = Instance.new("UIStroke")
-        searchStroke.Thickness = 1.5
-        searchStroke.Transparency = 1
-        searchStroke.Parent = searchBox
-        connMgr:Track(searchBox.Focused:Connect(function()
-            TweenService:Create(searchStroke, TweenInfo.new(0.25, EASE, EASE_OUT), { Transparency = 0 }):Play()
-        end))
-        connMgr:Track(searchBox.FocusLost:Connect(function()
-            TweenService:Create(searchStroke, TweenInfo.new(0.25, EASE, EASE_OUT), { Transparency = 1 }):Play()
-        end))
-
         exp._searchHolder = searchHolder
-        exp._searchStroke = searchStroke
     end
 
     local list = Instance.new("Frame")
@@ -1396,7 +1281,6 @@ function Components.Dropdown(parent, theme, connMgr, opts)
             if searchable then
                 searchBox.BackgroundColor3 = darkBg
                 searchBox.TextColor3 = Utils.GetTextColorFor(darkBg, accent)
-                exp._searchStroke.Color = accent
             end
         else
             TweenService:Create(exp.Header, THEME_TWEEN_INFO, { BackgroundColor3 = panelBg }):Play()
@@ -1410,7 +1294,6 @@ function Components.Dropdown(parent, theme, connMgr, opts)
                     BackgroundColor3 = darkBg,
                     TextColor3 = Utils.GetTextColorFor(darkBg, accent),
                 }):Play()
-                TweenService:Create(exp._searchStroke, THEME_TWEEN_INFO, { Color = accent }):Play()
             end
         end
     end
@@ -1480,19 +1363,6 @@ function Components.MultiDropdown(parent, theme, connMgr, opts)
         searchBox.Parent = searchHolder
         Utils.AddPadding(searchBox, UDim.new(0, 10))
         Utils.AddCorner(searchBox, UDim.new(0, 6))
-
-        local searchStroke = Instance.new("UIStroke")
-        searchStroke.Thickness = 1.5
-        searchStroke.Transparency = 1
-        searchStroke.Parent = searchBox
-        connMgr:Track(searchBox.Focused:Connect(function()
-            TweenService:Create(searchStroke, TweenInfo.new(0.25, EASE, EASE_OUT), { Transparency = 0 }):Play()
-        end))
-        connMgr:Track(searchBox.FocusLost:Connect(function()
-            TweenService:Create(searchStroke, TweenInfo.new(0.25, EASE, EASE_OUT), { Transparency = 1 }):Play()
-        end))
-
-        exp._searchStroke = searchStroke
     end
 
     local list = Instance.new("Frame")
@@ -1624,7 +1494,6 @@ function Components.MultiDropdown(parent, theme, connMgr, opts)
             if searchable then
                 searchBox.BackgroundColor3 = darkBg
                 searchBox.TextColor3 = Utils.GetTextColorFor(darkBg, accent)
-                exp._searchStroke.Color = accent
             end
         else
             TweenService:Create(exp.Header, THEME_TWEEN_INFO, { BackgroundColor3 = panelBg }):Play()
@@ -1638,7 +1507,6 @@ function Components.MultiDropdown(parent, theme, connMgr, opts)
                     BackgroundColor3 = darkBg,
                     TextColor3 = Utils.GetTextColorFor(darkBg, accent),
                 }):Play()
-                TweenService:Create(exp._searchStroke, THEME_TWEEN_INFO, { Color = accent }):Play()
             end
         end
     end
@@ -2206,10 +2074,9 @@ function Components.GradientPicker(parent, theme, connMgr, opts)
         toggleLabel.Text = (opts.Text or "Chế độ Gradient") .. ": " .. (enabled and "Bật" or "Tắt")
         local darkBg = Utils.Darken(theme.Color, 0.8)
         local trackColor = enabled and Utils.Brighten(theme.Accent, 1.15) or darkBg
-        -- Same contrast-against-track logic as Components.Toggle's knob —
-        -- this toggle used to hardcode a fixed light-gray knob that never
-        -- got retinted here or in ApplyTheme below.
-        local knobColor = Utils.GetTextColorFor(trackColor, theme.Accent)
+        -- Same near-white-but-tinted knob treatment as Components.Toggle —
+        -- always reads as white, still tinted lightly by the live accent.
+        local knobColor = Utils.GetKnobColor(theme.Accent)
         local knobX = enabled and (52 - 22 - 3) or 3
         TweenService:Create(track, TweenInfo.new(0.3, EASE, EASE_OUT), { BackgroundColor3 = trackColor }):Play()
         TweenService:Create(knob, TweenInfo.new(0.3, EASE, EASE_OUT), { Position = UDim2.new(0, knobX, 0.5, 0), BackgroundColor3 = knobColor }):Play()
@@ -2277,7 +2144,7 @@ function Components.GradientPicker(parent, theme, connMgr, opts)
         -- when `enabled` was false, so picking a new theme while gradient
         -- mode was ON left the toggle showing the *old* accent color.
         local trackColor = enabled and Utils.Brighten(accent, 1.15) or Utils.Darken(color, 0.8)
-        local knobColor = Utils.GetTextColorFor(trackColor, accent)
+        local knobColor = Utils.GetKnobColor(accent)
         if isInitial then
             toggleFrame.BackgroundColor3 = panelBg
             toggleLabel.TextColor3 = textColor
@@ -2757,12 +2624,6 @@ function Window:_buildChrome(title, originalSize)
 
     -- Main frame
     local mainFrame = Instance.new("Frame")
-    -- Anchored at true center (not top-center) so UIScale-driven zoom
-    -- (loading-screen reveal, Window:Destroy() teardown) scales symmetrically
-    -- around the window's actual center. During minimize/restore, the
-    -- window is temporarily switched to a top-center anchor and back (see
-    -- _setupMinimize) so that phase only needs to tween Size, not Size +
-    -- Position together.
     mainFrame.AnchorPoint = Vector2.new(0.5, 0.5)
     mainFrame.Size = originalSize
     mainFrame.Position = UDim2.new(0.5, 0, 0.5, 0)
@@ -2801,23 +2662,10 @@ function Window:_buildChrome(title, originalSize)
     titleBar.BorderSizePixel = 0
     titleBar.Active = true
     titleBar.Parent = mainFrame
-    -- Only round the TOP two corners here — titleBar sits flush against
-    -- contentGroup below it, so a uniform 4-corner UICorner used to leave a
-    -- small visible notch where the rounded bottom edge met the flat
-    -- content area. Per-corner rounding (TopLeftRadius/TopRightRadius/
-    -- BottomLeftRadius/BottomRightRadius) is used instead so the bottom
-    -- stays perfectly square while normal (non-minimized) — see
-    -- _setupMinimize below for why the bottom corners get tweened back on
-    -- while the window is minimized.
     local titleBarCorner = Utils.AddCornerEx(titleBar, UDim.new(0, 12), UDim.new(0, 12), UDim.new(0, 0), UDim.new(0, 0))
     self._titleBar = titleBar
     self._titleBarCorner = titleBarCorner
 
-    -- Icon is only created when one was provided in CreateWindow's config;
-    -- without it there's nothing reserving that left-hand space, so the
-    -- title label starts further left (15px, matching the titlebar's other
-    -- edge paddings) and claims the width the icon would have used instead
-    -- of leaving a blank gap.
     local hasIcon = self._icon ~= nil
     local titleIcon
     if hasIcon then
@@ -2852,41 +2700,24 @@ function Window:_buildChrome(title, originalSize)
         b.AnchorPoint = Vector2.new(0.5, 0.5)
         b.Position = UDim2.new(1, xOffset + 15, 0, 5 + 15)
         b.BackgroundColor3 = bgColor
-        b.BackgroundTransparency = 1 -- fully invisible background; only the glyph shows
+        b.BackgroundTransparency = 1
         b.Text = text
         b.TextColor3 = Color3.fromRGB(255, 255, 255)
         b.TextSize = 18
         b.Font = Enum.Font.GothamBold
         b.Parent = titleBar
         Utils.AddCorner(b, UDim.new(0, 6))
-        Animator.AddHoverEffect(b, connMgr, bgColor, hoverColor, true) -- skipStroke: no hover-outline frame on chrome buttons
+        Animator.AddHoverEffect(b, connMgr, bgColor, hoverColor, true)
         return b
     end
 
     local minimizeBtn = chromeButton(-40, "—", Color3.fromRGB(60, 60, 70), Color3.fromRGB(80, 80, 95))
-    -- (close button removed — the window is closed programmatically via
-    -- Selenix:Destroy(); the resize/expand titlebar button was removed
-    -- earlier too — resizing is still available via the drag handle in the
-    -- window's bottom-right corner)
 
     self:_setupDrag(titleBar, mainFrame)
 
-    -- Theme-driven gradients (used by GradientPicker component)
     local mainGradient = Instance.new("UIGradient"); mainGradient.Rotation = 45; mainGradient.Enabled = false; mainGradient.Parent = mainFrame
     local titleGradient = Instance.new("UIGradient"); titleGradient.Rotation = 45; titleGradient.Enabled = false; titleGradient.Parent = titleBar
 
-    -- Content group: everything below the titlebar (tab strip + all tab
-    -- pages/controls) lives inside this CanvasGroup instead of directly
-    -- inside mainFrame. CanvasGroup.GroupTransparency fades the *entire*
-    -- subtree — every button/toggle/slider/textbox/dropdown/colorpicker,
-    -- regardless of type — with a single tween, instead of needing custom
-    -- fade logic inside every Components.* factory. Used by minimize/
-    -- restore below (see _setupMinimize; fade is driven manually via
-    -- Animator.FadeCanvasGroup rather than TweenService — see that function's
-    -- comment for why). The titlebar and resize handle stay outside it on
-    -- purpose so they never fade, and the notification layer is parented
-    -- directly to screenGui (see _buildNotificationLayer) so toasts keep
-    -- showing while minimized.
     local contentGroup = Instance.new("CanvasGroup")
     contentGroup.Name = "Content"
     contentGroup.Size = UDim2.new(1, 0, 1, 0)
@@ -2904,7 +2735,7 @@ function Window:_buildChrome(title, originalSize)
     tabContainer.CanvasSize = UDim2.new(0, 0, 0, 0)
     tabContainer.AutomaticCanvasSize = Enum.AutomaticSize.X
     tabContainer.ElasticBehavior = Enum.ElasticBehavior.WhenScrollable
-    tabContainer.BackgroundTransparency = 1 -- hidden; blends straight into mainFrame
+    tabContainer.BackgroundTransparency = 1
     tabContainer.Parent = contentGroup
     local tabContainerGradient = Instance.new("UIGradient"); tabContainerGradient.Rotation = 45; tabContainerGradient.Enabled = false; tabContainerGradient.Parent = tabContainer
     local tabLayout = Instance.new("UIListLayout")
@@ -2916,9 +2747,6 @@ function Window:_buildChrome(title, originalSize)
     Utils.AddPadding(tabContainer, UDim.new(0, 10), UDim.new(0, 10))
     self._tabContainer = tabContainer
 
-    -- Still used as the horizontal offset new pages slide in from during a
-    -- tab switch (see CreateTab's switchTo) — kept even though the cover
-    -- overlay that used to size itself off of it is gone.
     local SLIDE_OFFSET = 26
     self._slideOffset = SLIDE_OFFSET
 
@@ -2932,10 +2760,6 @@ function Window:_buildChrome(title, originalSize)
     self:_setupMinimize(mainFrame, minimizeBtn)
     self:_setupViewportRefit(mainFrame)
 
-    -- Theme subscription for chrome pieces. isInitial=true on the first
-    -- (synchronous) call snaps every color instantly; every call after that
-    -- is a real theme change from ThemeGrid, so it animates like every other
-    -- component instead of the old hand-rolled `chromeThemeInitialized` flag.
     theme:Subscribe(function(color, accent, isInitial)
         local darkTitle = Utils.Darken(color, 0.7)
         local darkTab = Utils.Darken(color, 0.85)
@@ -2961,13 +2785,6 @@ function Window:_buildChrome(title, originalSize)
     end)
 end
 
--- Re-fits mainFrame whenever the viewport changes (device rotation, window
--- resize on PC, etc), as long as the user isn't actively dragging/resizing/
--- minimizing it (those all manage mainFrame.Size/Position themselves and
--- would fight this). Uses the same fitToViewport() clamp as the initial
--- Size, and keeps self._currentTargetSize (used by _setupMinimize's
--- restore step) in sync so restoring from minimized doesn't snap back to a
--- stale pre-refit size.
 function Window:_setupViewportRefit(mainFrame)
     local connMgr = self._connMgr
     connMgr:Track(workspace.CurrentCamera:GetPropertyChangedSignal("ViewportSize"):Connect(function()
@@ -2980,29 +2797,13 @@ function Window:_setupViewportRefit(mainFrame)
     end))
 end
 
--- The loading screen's progress bar now reflects REAL work instead of a
--- fixed cosmetic timer:
---   1. Auto stage (runs unconditionally unless disabled in config.Loading):
---        - waits for game:IsLoaded() / game.Loaded if the place isn't fully
---          loaded yet
---        - preloads the titlebar icon asset via ContentProvider, if one was
---          given
---      Each finished step advances the bar by its real share of progress —
---      nothing is tweened toward a number that doesn't mean anything.
---   2. Manual stage (opt-in via config.Loading.Manual = true): once the
---      auto stage is done, the bar holds (capped below 100%) and the
---      loading screen stays open until the CONSUMER script calls
---      Window:SetLoadingProgress(alpha, text) / Window:FinishLoading() to
---      report its own real setup work (fetching data, waiting on a
---      RemoteFunction, etc). This is what lets the screen only disappear
---      once things are actually ready, instead of after a guessed delay.
 function Window:_buildLoadingScreen(title, mainFrame, mainScale, mainShadow)
     local screenGui = self._screenGui
     local theme = self._theme
     local loadingCfg = self._loadingConfig or {}
     local manual = loadingCfg.Manual == true
-    local waitForGameLoaded = (loadingCfg.WaitForGameLoaded ~= false) -- default true
-    local preloadIcon = (loadingCfg.PreloadIcon ~= false) and (self._icon ~= nil) -- default true if an Icon was given
+    local waitForGameLoaded = (loadingCfg.WaitForGameLoaded ~= false)
+    local preloadIcon = (loadingCfg.PreloadIcon ~= false) and (self._icon ~= nil)
 
     local loading = Instance.new("Frame")
     loading.AnchorPoint = Vector2.new(0.5, 0.5)
@@ -3061,18 +2862,11 @@ function Window:_buildLoadingScreen(title, mainFrame, mainScale, mainShadow)
 
     Animator.Tween(loadingScale, { Scale = 1 }, 0.35):Play()
     Animator.Tween(loading, { BackgroundTransparency = 0 }, 0.35):Play()
-    -- barFill is no longer tweened to 100% on a fixed clock — its Size is
-    -- now driven exclusively by SetLoadingProgress() below, in lockstep
-    -- with real completed work.
 
     local connMgr = self._connMgr
     self._loadingDone = false
     self._loadingAlpha = 0
 
-    -- Runs the fade-out -> reveal mainFrame sequence exactly once. Gated on
-    -- each tween's own Completed event (not a guessed delay) so mainFrame
-    -- is revealed exactly when the loading screen has actually finished
-    -- fading out, even under lag/frame drops.
     local function finishLoading()
         if self._loadingDone then return end
         self._loadingDone = true
@@ -3089,8 +2883,6 @@ function Window:_buildLoadingScreen(title, mainFrame, mainScale, mainShadow)
     end
     self._finishLoading = finishLoading
 
-    -- Public: report real loading progress (0-1) and optionally update the
-    -- status line. Calling with alpha >= 1 closes the loading screen.
     function self:SetLoadingProgress(alpha, text)
         if self._loadingDone then return end
         alpha = math.clamp(alpha or 0, 0, 1)
@@ -3100,18 +2892,10 @@ function Window:_buildLoadingScreen(title, mainFrame, mainScale, mainShadow)
         if alpha >= 1 then finishLoading() end
     end
 
-    -- Public: convenience for SetLoadingProgress(1, text).
     function self:FinishLoading(text)
         self:SetLoadingProgress(1, text)
     end
 
-    -- Real auto stage: only advances the bar as each condition is actually
-    -- satisfied (game finished loading, icon asset actually preloaded).
-    -- If config.Loading.Manual is true, this stage caps its own progress at
-    -- 90% and leaves the screen open — the consumer script is expected to
-    -- call SetLoadingProgress/FinishLoading itself once its own real setup
-    -- (data fetch, RemoteFunction call, etc) is done. Otherwise the screen
-    -- closes automatically the moment this real work is complete.
     task.spawn(function()
         local steps = {}
         if waitForGameLoaded and not game:IsLoaded() then table.insert(steps, "game") end
@@ -3147,49 +2931,30 @@ function Window:_buildLoadingScreen(title, mainFrame, mainScale, mainShadow)
     end)
 end
 
--- FIX 2 + FIX 3 applied here:
---   FIX 2: removed `self._minimized` from the InputBegan guard, so the
---          titlebar can be dragged while the window is minimized (it's the
---          only thing visible at that point, so this is the useful case).
---   FIX 3: added clampPosition() and used it in InputChanged, so the
---          window can never be dragged fully off-screen ("giống có bức
---          tượng chặn lại ở rìa màn hình").
 function Window:_setupDrag(titleBar, mainFrame)
     local connMgr = self._connMgr
     self._titleDragging = false
     local activeInput, dragStart, startPos
 
-    -- Giữ cửa sổ luôn nằm trong viewport khi kéo, bất kể AnchorPoint đang
-    -- là center (bình thường) hay top-center/top-left (lúc minimize/resize).
-    -- Tính min/max cho Offset theo đúng AnchorPoint hiện tại của mainFrame,
-    -- vì lib này đổi anchor liên tục (center <-> top-center khi minimize,
-    -- top-left khi resize) nên biên phải tính lại theo anchor mới mỗi lần.
     local function clampPosition(pos, size, anchor)
-    local viewport = workspace.CurrentCamera.ViewportSize
-    local w, h = size.X.Offset, size.Y.Offset
+        local viewport = workspace.CurrentCamera.ViewportSize
+        local w, h = size.X.Offset, size.Y.Offset
 
-    -- Quy Scale về pixel tuyệt đối để cộng vào cùng hệ với Offset,
-    -- vì lúc kéo bình thường mainFrame đang neo center (Scale = 0.5),
-    -- không phải 0 như code cũ giả định.
-    local scaleX = pos.X.Scale * viewport.X
-    local scaleY = pos.Y.Scale * viewport.Y
+        local scaleX = pos.X.Scale * viewport.X
+        local scaleY = pos.Y.Scale * viewport.Y
 
-    local minX, maxX = anchor.X * w - scaleX, viewport.X - (1 - anchor.X) * w - scaleX
-    local minY, maxY = anchor.Y * h - scaleY, viewport.Y - (1 - anchor.Y) * h - scaleY
+        local minX, maxX = anchor.X * w - scaleX, viewport.X - (1 - anchor.X) * w - scaleX
+        local minY, maxY = anchor.Y * h - scaleY, viewport.Y - (1 - anchor.Y) * h - scaleY
 
-    if minX > maxX then minX, maxX = maxX, minX end
-    if minY > maxY then minY, maxY = maxY, minY end
+        if minX > maxX then minX, maxX = maxX, minX end
+        if minY > maxY then minY, maxY = maxY, minY end
 
-    local x = math.clamp(pos.X.Offset, minX, maxX)
-    local y = math.clamp(pos.Y.Offset, minY, maxY)
-    return UDim2.new(pos.X.Scale, x, pos.Y.Scale, y)
-end
+        local x = math.clamp(pos.X.Offset, minX, maxX)
+        local y = math.clamp(pos.Y.Offset, minY, maxY)
+        return UDim2.new(pos.X.Scale, x, pos.Y.Scale, y)
+    end
 
     connMgr:Track(titleBar.InputBegan:Connect(function(input)
-        -- Re-entry guard: ignore a repeat InputBegan firing mid-hold, and
-        -- refuse to start a titlebar drag while a resize or an in-progress
-        -- minimize/restore animation is happening. (FIX 2: `self._minimized`
-        -- removed — dragging a minimized window is fine and expected.)
         if self._titleDragging or self._resizing or self._animating then return end
         if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
             self._titleDragging = true
@@ -3206,8 +2971,6 @@ end
                 startPos.X.Scale, startPos.X.Offset + delta.X,
                 startPos.Y.Scale, startPos.Y.Offset + delta.Y
             )
-            -- FIX 3: clamp before applying, so the window can never be
-            -- dragged fully (or partially) off the edge of the screen.
             mainFrame.Position = clampPosition(newPos, mainFrame.Size, mainFrame.AnchorPoint)
         end
     end))
@@ -3225,10 +2988,6 @@ function Window:_setupResize(mainFrame, originalSize)
     self._currentTargetSize = originalSize
     self._resizing = false
 
-    -- MAX_W/MAX_H are now computed from the live viewport (minus the same
-    -- margin fitToViewport uses) instead of fixed 700/650 constants, so a
-    -- manual resize-drag can't grow the window past the edges of a small
-    -- screen either.
     local function maxSize()
         local viewport = workspace.CurrentCamera.ViewportSize
         return math.max(viewport.X - VIEWPORT_MARGIN, MIN_W),
@@ -3249,11 +3008,6 @@ function Window:_setupResize(mainFrame, originalSize)
     handle.Parent = mainFrame
     self._resizeHandle = handle
 
-    -- mainFrame is anchored at its true center while idle. The resize
-    -- handle sits in the bottom-right corner, so we want the TOP-LEFT
-    -- corner fixed while dragging and only Size to grow/shrink — swap to a
-    -- top-left anchor for the duration of the drag so Position never needs
-    -- to be touched at all (same trick used for minimize/restore).
     local function anchorTopLeftForResize()
         local size, pos = mainFrame.Size, mainFrame.Position
         mainFrame.AnchorPoint = Vector2.new(0, 0)
@@ -3271,20 +3025,10 @@ function Window:_setupResize(mainFrame, originalSize)
         )
     end
 
-    -- Hides the CanvasGroup content for the duration of the drag so it
-    -- doesn't have to recomposite its offscreen buffer every resize frame
-    -- (expensive on weaker/mobile GPUs, reads as stutter).
     local contentGroup = self._contentGroup
 
     local activeInput, dragStart, startSize
     connMgr:Track(handle.InputBegan:Connect(function(input)
-        -- Re-entry guard: on the Delta executor, Touch InputBegan can fire
-        -- again mid-hold for the same finger — without this check, each
-        -- repeat firing re-ran anchorTopLeftForResize() on top of an
-        -- already-top-left-anchored frame, subtracting another half-size
-        -- from Position every time and causing repeated visible jumps
-        -- during the drag. Also refuses to start while a titlebar drag is
-        -- already in progress.
         if self._resizing or self._titleDragging or self._minimized or self._animating then return end
         if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
             self._resizing = true
@@ -3302,8 +3046,6 @@ function Window:_setupResize(mainFrame, originalSize)
             local MAX_W, MAX_H = maxSize()
             local w = math.clamp(startSize.X.Offset + delta.X, MIN_W, MAX_W)
             local h = math.clamp(startSize.Y.Offset + delta.Y, MIN_H, MAX_H)
-            -- Position untouched: with the top-left anchor set above, the
-            -- top-left corner is already fixed, so Size alone is enough.
             mainFrame.Size = UDim2.new(0, w, 0, h)
         end
     end))
@@ -3334,23 +3076,12 @@ function Window:_setupMinimize(mainFrame, minimizeBtn)
     local CONTENT_FADE_OUT_TIME = 0.22
     local CONTENT_FADE_IN_TIME = 0.28
 
-    -- Switches mainFrame to a top-center anchor for the duration of the
-    -- minimize/restore Size tween. With this anchor, only Size needs to be
-    -- tweened (the top edge is naturally fixed), removing the need for a
-    -- second, independently-interpolated Position tween — which is what
-    -- caused the visible jitter in the old center-anchored version. Position
-    -- is adjusted here so the on-screen frame doesn't jump the instant the
-    -- anchor itself changes.
     local function anchorTopCenter()
         local size, pos = mainFrame.Size, mainFrame.Position
         local topY = pos.Y.Offset - size.Y.Offset / 2
         mainFrame.AnchorPoint = Vector2.new(0.5, 0)
         mainFrame.Position = UDim2.new(pos.X.Scale, pos.X.Offset, pos.Y.Scale, topY)
     end
-    -- Converts back to true-center anchoring once the minimize/restore
-    -- animation is fully done, so dragging (_setupDrag) and resizing
-    -- (_setupResize) — both of which assume a center anchor — keep working
-    -- exactly as they did before minimize was ever triggered.
     local function anchorCenter()
         local size, pos = mainFrame.Size, mainFrame.Position
         local centerY = pos.Y.Offset + size.Y.Offset / 2
@@ -3371,37 +3102,18 @@ function Window:_setupMinimize(mainFrame, minimizeBtn)
             minimizeBtn.Text = "▢"
             self._resizeHandle.Visible = false
 
-            -- Blur any active textbox first so a control mid-fade doesn't
-            -- keep the keyboard/cursor focused on something disappearing.
             local focused = UserInputService:GetFocusedTextBox()
             if focused then focused:ReleaseFocus() end
 
-            -- Stage 1: fade content out (manually driven — see
-            -- Animator.FadeCanvasGroup — so it actually renders on every
-            -- executor instead of possibly popping). Only once this is
-            -- fully done do we touch Size/AnchorPoint, so the fade is never
-            -- competing with the resize for the same frame budget.
             Animator.FadeCanvasGroup(contentGroup, 1, CONTENT_FADE_OUT_TIME, connMgr, function()
                 self._tabContainer.Visible = false
                 for _, p in ipairs(self._pages) do p.Visible = false end
 
-                -- Stage 2: switch to top-center anchoring, then shrink
-                -- Size only (no Position tween needed — see anchorTopCenter
-                -- comment above for why this eliminates the jitter).
                 anchorTopCenter()
                 local currentW = mainFrame.Size.X.Offset
                 local shrink = Animator.Tween(mainFrame, {
                     Size = UDim2.new(0, currentW, 0, MINIMIZED_HEIGHT)
                 }, SIZE_TWEEN_TIME)
-                -- While minimized, titleBar IS the entire window (its
-                -- height equals MINIMIZED_HEIGHT, matching mainFrame's
-                -- shrunk Size). mainFrame still rounds all 4 corners, but
-                -- titleBar only rounds its top 2 — so its square bottom
-                -- corners would otherwise poke out past mainFrame's rounded
-                -- bottom corners. Tweening the bottom corners open in
-                -- lockstep with the shrink makes them round in smoothly
-                -- instead of snapping, and keeps them visually inside
-                -- mainFrame's rounded silhouette the whole time.
                 Animator.Tween(titleBarCorner, {
                     BottomLeftRadius = mainFrameRadius,
                     BottomRightRadius = mainFrameRadius,
@@ -3420,27 +3132,16 @@ function Window:_setupMinimize(mainFrame, minimizeBtn)
             self._resizeHandle.Visible = true
             contentGroup.GroupTransparency = 1
 
-            -- Stage 1: mainFrame is already top-center-anchored from the
-            -- last minimize, so grow Size only, straight back to its full
-            -- pre-minimize size.
             local targetSize = self._currentTargetSize
             local grow = Animator.Tween(mainFrame, { Size = targetSize }, SIZE_TWEEN_TIME)
-            -- Flatten titleBar's bottom corners back to square in lockstep
-            -- with the grow, since titleBar no longer spans the full window
-            -- height once restored (contentGroup is visible again below it).
             Animator.Tween(titleBarCorner, {
                 BottomLeftRadius = UDim.new(0, 0),
                 BottomRightRadius = UDim.new(0, 0),
             }, SIZE_TWEEN_TIME):Play()
             grow.Completed:Connect(function()
-                -- Stage 2: restore true-center anchoring now that the frame
-                -- is back to full size, so drag/resize behave normally again.
                 anchorCenter()
-                if self._minimized then self._animating = false; return end -- re-minimized before this fired
+                if self._minimized then self._animating = false; return end
 
-                -- Stage 3: fade content back in (manually driven, same as
-                -- the fade-out above) only after the frame has fully grown,
-                -- so it never looks like it's "popping in" mid-expand.
                 Animator.FadeCanvasGroup(contentGroup, 0, CONTENT_FADE_IN_TIME, connMgr, function()
                     self._animating = false
                 end)
@@ -3450,10 +3151,6 @@ function Window:_setupMinimize(mainFrame, minimizeBtn)
     end))
 end
 
--- Tab text colors are theme-driven: active tab uses a contrast-safe color
--- computed against the accent (like Button/Toggle do), inactive tabs use
--- contrast-safe color against the dark inactive background, instead of the
--- old hardcoded white/gray pair that never adapted to the live theme.
 function Window:_restyleTabButtons(color, accent)
     local inactiveBg = Utils.Darken(color, 0.82)
     for i, btn in ipairs(self._tabButtons) do
@@ -3477,8 +3174,6 @@ function Window:CreateTab(name)
     btn.Text = name
     btn.Font = Enum.Font.GothamBold
     btn.TextSize = 15
-    -- Without this, Roblox's own built-in button-hover recolor runs on top
-    -- of BackgroundColor3 alongside our tween below, fighting it every frame.
     btn.AutoButtonColor = false
     btn.Parent = self._tabContainer
     Utils.AddCorner(btn, UDim.new(0, 6))
@@ -3486,9 +3181,6 @@ function Window:CreateTab(name)
     local function tabBaseColor()
         return (index == self._activeTabIndex) and theme.Accent or Utils.Darken(theme.Color, 0.82)
     end
-    -- Text color is now computed for contrast against the live theme instead
-    -- of a hardcoded white/gray pair, so it stays readable (and tweens
-    -- correctly) on any theme, including light ones.
     local function tabTextColor()
         return Utils.GetTextColorFor(tabBaseColor(), theme.Accent)
     end
@@ -3496,7 +3188,7 @@ function Window:CreateTab(name)
         return Utils.GetTextColorFor(Utils.Brighten(tabBaseColor(), 1.2), theme.Accent)
     end
 
-    btn.TextColor3 = tabTextColor() -- initial paint, matches the theme active at creation time
+    btn.TextColor3 = tabTextColor()
 
     connMgr:Track(btn.MouseEnter:Connect(function()
         local hoverBg = Utils.Brighten(tabBaseColor(), 1.2)
@@ -3521,13 +3213,6 @@ function Window:CreateTab(name)
     page.ScrollBarThickness = 0
     page.CanvasSize = UDim2.new(0, 0, 0, 0)
     page.AutomaticCanvasSize = Enum.AutomaticSize.Y
-    -- Parented to the CanvasGroup (not mainFrame directly) so this page's
-    -- controls — buttons, toggles, sliders, textboxes, dropdowns, etc. —
-    -- fade as one unit whenever contentGroup.GroupTransparency is driven
-    -- (see _setupMinimize / Animator.FadeCanvasGroup). Positions below are
-    -- unchanged: contentGroup is the same size as mainFrame, so relative
-    -- coordinates line up exactly as they did when parented straight to
-    -- mainFrame.
     page.Parent = self._contentGroup
     page.Visible = (index == 1)
     local layout = Instance.new("UIListLayout")
@@ -3554,30 +3239,18 @@ function Window:CreateTab(name)
         newPage.Position = UDim2.new(0, 10 + direction * self._slideOffset, 0, 95)
         newPage.Visible = true
 
-        -- Gated on the slide tween's own Completed event so `switching`
-        -- clears exactly when the page has actually finished sliding into
-        -- place, instead of a fixed task.delay guess.
         local slide = Animator.Tween(newPage, { Position = PAGE_BASE_POS }, 0.35)
         slide.Completed:Connect(function() switching = false end)
         slide:Play()
     end
     connMgr:Track(btn.MouseButton1Click:Connect(switchTo))
 
-    -- FIX 1: removed the redundant `theme:Subscribe(...)` call that used to
-    -- be here. Window:_buildChrome already subscribes ONCE to the theme and
-    -- calls self:_restyleTabButtons(...) (which loops over every tab
-    -- button) on every change. Re-subscribing the same callback here for
-    -- every single tab meant N tabs produced N+1 calls to
-    -- _restyleTabButtons per theme change, each looping over all N buttons
-    -- — effectively O(N^2) tweens instead of O(N). The chrome-level
-    -- subscription already covers every tab created here.
-
     local tab = setmetatable({
         _page = page,
         _button = btn,
         _theme = theme,
         _connMgr = connMgr,
-        _window = self, -- lets TabMeta:CreateXxx register Flags on Window:_flags
+        _window = self,
         _order = 0,
     }, TabMeta)
     table.insert(self._tabs, tab)
@@ -3600,20 +3273,6 @@ end
 function Window:GetTheme() return self._theme end
 function Window:GetGradients() return self._gradients end
 
---============================================================
--- MODULE: Config (Flags + Save/Load/List)
--- Any control created via Tab:CreateXxx({..., Flag = "uniqueName"}) is
--- registered here (see TabMeta:CreateXxx below). SaveConfig(name) reads
--- every registered control's current value via :Get() and writes it to
--- a JSON file; LoadConfig(name) reads that file back and calls :Set() on
--- each matching control; ListConfigs() enumerates the saved config names
--- so a consumer script can build a "load one of my saved configs" picker
--- (e.g. TabMeta:CreateConfigList below). All three are wrapped in pcall
--- and check for the executor globals (writefile/readfile/isfile/
--- listfiles/makefolder/isfolder) since not every executor exposes them —
--- callers should check the returned boolean/table rather than assume
--- success.
---============================================================
 function Window:_registerFlag(flag, obj)
     if not flag then return end
     self._flags[flag] = obj
@@ -3630,10 +3289,6 @@ local function configPath(name)
     return CONFIG_FOLDER .. "/" .. (name or "default") .. ".json"
 end
 
--- Serializes every registered flag's current value to
--- Selenix/Config/<name>.json. Color3 values can't be JSON-encoded
--- directly, so they're wrapped as {__color3=true, r,g,b} and unwrapped
--- again in LoadConfig.
 function Window:SaveConfig(name)
     if not writefile then return false, "executor has no writefile" end
     if not (name and name ~= "") then return false, "config name is empty" end
@@ -3662,10 +3317,6 @@ function Window:SaveConfig(name)
     return true
 end
 
--- Reads Selenix/Config/<name>.json (if present) and calls :Set(value) on
--- every registered flag whose name appears in the saved data. Controls
--- without a :Set() method (older custom components, etc) are silently
--- skipped rather than erroring the whole load.
 function Window:LoadConfig(name)
     if not (readfile and isfile) then return false, "executor has no readfile/isfile" end
 
@@ -3689,13 +3340,6 @@ function Window:LoadConfig(name)
     return true
 end
 
--- Lists every saved config name (without the .json extension) found in
--- Selenix/Config, sorted alphabetically. This was the missing piece for
--- a "config list" UI: SaveConfig/LoadConfig work by name, but nothing
--- could previously discover which names actually exist on disk. Always
--- returns a table (never nil), even when the executor lacks listfiles or
--- the folder doesn't exist yet, so callers can iterate the result
--- directly without their own pcall.
 function Window:ListConfigs()
     if not listfiles then return {} end
     local folder = configFolder()
@@ -3713,10 +3357,6 @@ function Window:ListConfigs()
     return names
 end
 
--- Deletes Selenix/Config/<name>.json. Wrapped in pcall since not every
--- executor exposes delfile; returns false with a reason string (not an
--- error) when the config doesn't exist or the executor can't delete
--- files, so callers can surface it via Notify() the same way Save/Load do.
 function Window:DeleteConfig(name)
     if not delfile then return false, "executor has no delfile" end
     if not (name and name ~= "") then return false, "config name is empty" end
@@ -3729,12 +3369,6 @@ function Window:DeleteConfig(name)
     return true
 end
 
---============================================================
--- Notification layer
--- Independent of mainFrame (parented directly to the ScreenGui) so
--- toasts keep showing even while the window is minimized, and stay
--- visible above the rest of the chrome via ZIndex.
---============================================================
 function Window:_buildNotificationLayer()
     local screenGui = self._screenGui
 
@@ -3746,9 +3380,6 @@ function Window:_buildNotificationLayer()
     container.ZIndex = 100
     container.Parent = screenGui
 
-    -- Width caps at 300px but shrinks on narrow/mobile screens, always
-    -- keeping a 20px margin on both sides so the rounded card never clips
-    -- off the left edge of the viewport.
     local MAX_WIDTH = 300
     local MIN_MARGIN = 20
     local function updateContainerSize()
@@ -3768,15 +3399,10 @@ function Window:_buildNotificationLayer()
     self._notifContainer = container
     self._notifOrder = 0
 
-    -- Caps the number of simultaneous toasts so a spammy Notify() loop can't
-    -- flood the whole viewport; oldest visible toast is dismissed to make
-    -- room for a new one instead of growing the stack unbounded.
     self._activeNotifs = {}
     self._maxNotifs = 5
 end
 
--- opts: { Title, Text, Type = "success"|"error"|"warning"|"info",
---         Duration (seconds; default 4, pass 0 or false for sticky/no auto-dismiss) }
 function Window:Notify(opts)
     opts = opts or {}
     self._notifOrder = self._notifOrder + 1
@@ -3799,12 +3425,6 @@ function Window:Notify(opts)
     return notif
 end
 
---============================================================
--- Tab methods
--- Thin wrappers that assign a LayoutOrder and forward to Components.*.
--- Every control-creating method also registers opts.Flag (if given) into
--- Window._flags so SaveConfig/LoadConfig can find it.
---============================================================
 local function nextOrder(tab)
     tab._order = tab._order + 1
     return tab._order
@@ -3870,7 +3490,7 @@ end
 function TabMeta:CreateGradientPicker(opts)
     opts = opts or {}
     opts.LayoutOrder = nextOrder(self)
-    nextOrder(self) -- GradientPicker also creates the grid one order below
+    nextOrder(self)
     return Components.GradientPicker(self._page, self._theme, self._connMgr, opts)
 end
 function TabMeta:CreateDivider(opts)
@@ -3884,24 +3504,6 @@ function TabMeta:CreateParagraph(opts)
     return Components.Paragraph(self._page, self._theme, self._connMgr, opts)
 end
 
--- ---------- CreateConfigList ----------
--- Ready-made "Config List" section: a Dropdown listing every config
--- already saved on disk (Window:ListConfigs()), a Textbox to name a new
--- (or existing) config, and Save/Load/Delete buttons. This is the piece
--- that was actually missing before — SaveConfig/LoadConfig only worked if
--- the consumer script already knew a config's name, and the Dropdown
--- component had no way to repopulate its options after a new file was
--- saved or an old one deleted (fixed above via Components.Dropdown:Refresh).
---
--- opts (all optional):
---   Text          -- dropdown label, default "Config đã lưu:"
---   NameText      -- textbox label, default "Tên config:"
---   SaveText      -- save button text, default "Lưu Config"
---   LoadText      -- load button text, default "Tải Config"
---   DeleteText    -- delete button text, default "Xoá Config"
---   AutoLoadLast  -- if true, immediately loads the most recent (last in
---                    the sorted list) saved config, if any, right after
---                    building this section
 function TabMeta:CreateConfigList(opts)
     opts = opts or {}
     local window = self._window
@@ -3959,10 +3561,6 @@ function TabMeta:CreateConfigList(opts)
         Callback = function()
             local name = nameBox:Get()
             local ok, err = window:DeleteConfig(name)
-            -- Don't keep the current dropdown selection here (unlike Save)
-            -- — the entry that was just selected/typed is the one that no
-            -- longer exists on disk, so falling back to whatever's first
-            -- in the refreshed list is the correct behavior.
             refreshList(false)
             if ok then nameBox:Set("") end
             if window.Notify then
@@ -3987,14 +3585,8 @@ function TabMeta:CreateConfigList(opts)
     return { Dropdown = dropdown, NameBox = nameBox, Refresh = refreshList }
 end
 
---============================================================
--- Public Library API
---============================================================
 local Library = {}
 
--- Tracks the most recently created window so Library:Destroy() (i.e.
--- `Selenix:Destroy()`) has something to close without the caller needing
--- to hold onto the Window object themselves.
 Library._activeWindow = nil
 
 function Library:CreateWindow(config)
@@ -4003,9 +3595,6 @@ function Library:CreateWindow(config)
     return window
 end
 
--- Closes the UI programmatically — e.g. `Selenix:Destroy()` — running the
--- same fade/scale-down teardown as Window:Destroy(). No-op if there is no
--- active window (already destroyed, or never created).
 function Library:Destroy()
     if Library._activeWindow then
         Library._activeWindow:Destroy()
