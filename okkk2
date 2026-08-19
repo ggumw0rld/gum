@@ -964,23 +964,21 @@ function Components.RadioGroup(parent, theme, connMgr, opts)
     end
 
     -- THÊM: đọc AllowDeselect, mặc định false (không cho bỏ chọn)
-    local allowDeselect = opts.AllowDeselect == true
+    local allowDeselect = opts.AllowDeselect == true   -- mặc định false
 
-    local function select(text)
-        -- Nếu bấm vào option đang chọn
-        if text == selected then
-            if allowDeselect then
-                selected = nil
-                restyleRows()
-                if opts.Callback then opts.Callback(nil) end
-            end
-            return -- không làm gì thêm
+local function select(text)
+    if text == selected then
+        if allowDeselect then
+            selected = nil
+            restyleRows()
+            if opts.Callback then opts.Callback(nil) end
         end
-        -- Chọn option khác
-        selected = text
-        restyleRows()
-        if opts.Callback then opts.Callback(text) end
+        return
     end
+    selected = text
+    restyleRows()
+    if opts.Callback then opts.Callback(text) end
+end
 
     for i, text in ipairs(options) do
         local row = Instance.new("TextButton")
@@ -1566,12 +1564,17 @@ function Components.Dropdown(parent, theme, connMgr, opts)
     end
 
     -- THÊM: đọc option AllowDeselect, mặc định true (giống hành vi cũ)
-    local allowDeselect = opts.AllowDeselect ~= false
+    -- Trong Components.Dropdown, sau dòng local options, selected, ...
+local allowDeselect = opts.AllowDeselect ~= false   -- mặc định true
 
-    local function rebuildOptions()
-        rowConnMgr:DisconnectAll()
-        for _, row in ipairs(optionButtons) do row.btn:Destroy() end
-        table.clear(optionButtons)
+-- Trong rebuildOptions, sự kiện click:
+rowConnMgr:Track(btn.MouseButton1Click:Connect(function()
+    if allowDeselect then
+        select(text == selected and nil or text)   -- deselect nếu bấm lại
+    else
+        if text ~= selected then select(text) end  -- không deselect
+    end
+end))
 
         for i, text in ipairs(options) do
             local btn = Instance.new("TextButton")
