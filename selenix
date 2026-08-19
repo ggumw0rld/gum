@@ -195,6 +195,57 @@ function Utils.PanelColors(color, accent)
         Utils.GetTextColorFor(darkBg, accent)
 end
 
+-- "Secondary"/dimmed variant of a contrast-safe text color, used by every
+-- component that shows a de-emphasized label next to a primary one
+-- (Label's opts.Muted, Divider's title, Paragraph's body). Previously each
+-- of those three re-typed the identical "is this a light or dark theme"
+-- branch by hand; centralized here so there's exactly one definition of
+-- what "muted" means. `amount` (default 0.3) is how much of the base
+-- textColor's tint survives on a dark theme / how much it's dimmed by on a
+-- light theme — same knob every call site used with a slightly different
+-- literal (0.3 for Label/Paragraph, 0.25 for Divider), now explicit.
+function Utils.MutedTextColor(color, accent, amount)
+    amount = amount or 0.3
+    local textColor = Utils.GetTextColorFor(color, accent)
+    if Utils.GetLuminance(color) > 0.55 then
+        local keep = 1 - amount
+        return Color3.new(textColor.R * keep, textColor.G * keep, textColor.B * keep)
+    else
+        local base = 1 - amount
+        return Color3.new(base + textColor.R * amount, base + textColor.G * amount, base + textColor.B * amount)
+    end
+end
+
+-- Swaps min/max if given in the wrong order, and returns a safe non-zero
+-- range alongside them. Every ranged numeric control (Slider, NumberStepper,
+-- ProgressBar) divides by (max - min) for its alpha math, so a caller
+-- passing Min > Max — or Min == Max — used to either crash (math.clamp
+-- requires min <= max) or divide by zero. Centralizing this means the fix
+-- only has to happen (and be tested) once.
+function Utils.ClampRange(min, max)
+    if min > max then min, max = max, min end
+    local range = (max > min) and (max - min) or 1
+    return min, max, range
+end
+
+-- Returns a {roundTo, fmt} pair of functions for a given decimal precision,
+-- identical logic previously hand-duplicated inside both Components.Slider
+-- and Components.NumberStepper. `decimals` is clamped to a non-negative
+-- integer. roundTo(n) snaps a raw number to that precision; fmt(n) renders
+-- it as a display string (no trailing ".0" for whole numbers).
+function Utils.MakeRounder(decimals)
+    decimals = math.max(math.floor(decimals or 0), 0)
+    local mult = 10 ^ decimals
+    local function roundTo(n)
+        return math.round(n * mult) / mult
+    end
+    local function fmt(n)
+        if decimals <= 0 then return tostring(math.floor(n + 0.5)) end
+        return string.format("%." .. decimals .. "f", n)
+    end
+    return roundTo, fmt
+end
+
 function Utils.AddCorner(parent, radius)
     local c = Instance.new("UICorner")
     c.CornerRadius = radius or UDim.new(0, 8)
@@ -533,12 +584,7 @@ function Components.Label(parent, theme, connMgr, opts)
     -- use. opts.Muted dims that same contrast-safe color instead of using a
     -- fixed gray, so muted labels stay readable on both dark and light themes.
     function self:ApplyTheme(color, accent, isInitial)
-        local textColor = Utils.GetTextColorFor(color, accent)
-        if opts.Muted then
-            textColor = (Utils.GetLuminance(color) > 0.55)
-                and Color3.new(textColor.R * 0.7, textColor.G * 0.7, textColor.B * 0.7)
-                or Color3.new(0.7 + textColor.R * 0.3, 0.7 + textColor.G * 0.3, 0.7 + textColor.B * 0.3)
-        end
+        local textColor = opts.Muted and Utils.MutedTextColor(color, accent) or Utils.GetTextColorFor(color, accent)
         Animator.ApplyTheme(isInitial, { { label, { TextColor3 = textColor } } })
     end
     theme:Subscribe(function(c, a, initial) self:ApplyTheme(c, a, initial) end)
@@ -672,23 +718,12 @@ end
 -- numbers — previously `value = math.round(...)` made it impossible to
 -- drive a 0-1 float parameter from this control at all.
 function Components.Slider(parent, theme, connMgr, opts)
-    local min, max = opts.Min or 0, opts.Max or 100
-    -- Guard against a misconfigured Min == Max, or Min > Max: every alpha
-    -- calculation below divides by (max - min) and Roblox's math.clamp
-    -- requires min <= max, so swap them first instead of erroring out /
-    -- producing NaN positions, sizes, and drag values.
-    if min > max then min, max = max, min end
-    local range = (max > min) and (max - min) or 1
-    local decimals = math.max(math.floor(opts.Decimals or 0), 0)
-
-    local function roundTo(n)
-        local mult = 10 ^ decimals
-        return math.round(n * mult) / mult
-    end
-    local function fmt(n)
-        if decimals <= 0 then return tostring(math.floor(n + 0.5)) end
-        return string.format("%." .. decimals .. "f", n)
-    end
+    -- Utils.ClampRange swaps a misconfigured Min > Max instead of erroring
+    -- out / producing NaN positions, sizes, and drag values; Utils.MakeRounder
+    -- replaces the roundTo/fmt pair that used to be hand-written here (and,
+    -- identically, inside NumberStepper below).
+    local min, max, range = Utils.ClampRange(opts.Min or 0, opts.Max or 100)
+    local roundTo, fmt = Utils.MakeRounder(opts.Decimals)
 
     local value = roundTo(math.clamp(opts.Default or min, min, max))
     local suffix = opts.Suffix or "%"
@@ -809,24 +844,15 @@ end
 -- Android hơn Slider (kéo tay chính xác khó), phù hợp cho giá trị rời rạc
 -- (số lượng, index, iteration count...).
 function Components.NumberStepper(parent, theme, connMgr, opts)
-    local min, max = opts.Min or 0, opts.Max or 100
-    if min > max then min, max = max, min end
+    local min, max = Utils.ClampRange(opts.Min or 0, opts.Max or 100)
     local step = opts.Step or 1
-    local decimals = math.max(math.floor(opts.Decimals or 0), 0)
     local suffix = opts.Suffix or ""
     local function escapePattern(s)
         return (s:gsub("[%(%)%.%%%+%-%*%?%[%]%^%$]", "%%%1"))
     end
     local suffixPattern = escapePattern(suffix) .. "$"
 
-    local function roundTo(n)
-        local mult = 10 ^ decimals
-        return math.round(n * mult) / mult
-    end
-    local function fmt(n)
-        if decimals <= 0 then return tostring(math.floor(n + 0.5)) end
-        return string.format("%." .. decimals .. "f", n)
-    end
+    local roundTo, fmt = Utils.MakeRounder(opts.Decimals)
 
     local value = roundTo(math.clamp(opts.Default or min, min, max))
 
@@ -1164,14 +1190,11 @@ function Components.Divider(parent, theme, connMgr, opts)
     local self = { Instance = holder }
     function self:ApplyTheme(color, accent, isInitial)
         local darkBg = Utils.Darken(color, 0.8)
-        local textColor = Utils.GetTextColorFor(color, accent)
-        -- Muted the same way Components.Label does for opts.Muted, since a
-        -- section title should read as secondary, not primary, text.
-        local mutedText = (Utils.GetLuminance(color) > 0.55)
-            and Color3.new(textColor.R * 0.6, textColor.G * 0.6, textColor.B * 0.6)
-            or Color3.new(0.55 + textColor.R * 0.25, 0.55 + textColor.G * 0.25, 0.55 + textColor.B * 0.25)
+        -- Section title reads as secondary, not primary, text — same
+        -- muted-color helper Label(opts.Muted)/Paragraph's body use, with
+        -- the slightly stronger 0.25 dim this control always used.
         local entries = { { line, { BackgroundColor3 = darkBg } } }
-        if label then table.insert(entries, { label, { TextColor3 = mutedText } }) end
+        if label then table.insert(entries, { label, { TextColor3 = Utils.MutedTextColor(color, accent, 0.25) } }) end
         Animator.ApplyTheme(isInitial, entries)
     end
     theme:Subscribe(function(c, a, initial) self:ApplyTheme(c, a, initial) end)
@@ -1322,9 +1345,7 @@ function Components.Paragraph(parent, theme, connMgr, opts)
     local self = { Instance = holder }
     function self:ApplyTheme(color, accent, isInitial)
         local titleColor = Utils.GetTextColorFor(color, accent)
-        local bodyColor = (Utils.GetLuminance(color) > 0.55)
-            and Color3.new(titleColor.R * 0.7, titleColor.G * 0.7, titleColor.B * 0.7)
-            or Color3.new(0.7 + titleColor.R * 0.3, 0.7 + titleColor.G * 0.3, 0.7 + titleColor.B * 0.3)
+        local bodyColor = Utils.MutedTextColor(color, accent)
         local entries = {
             { titleLabel, { TextColor3 = titleColor } },
             { body, { TextColor3 = bodyColor } },
@@ -3019,9 +3040,7 @@ end
 -- opts: { Text, Min (0), Max (100), Default (Min), ShowLabel (true),
 --         Suffix (nil -> hiện %, hoặc vd " coins" để hiện số thô), Flag }
 function Components.ProgressBar(parent, theme, connMgr, opts)
-    local min, max = opts.Min or 0, opts.Max or 100
-    if min > max then min, max = max, min end
-    local range = (max > min) and (max - min) or 1
+    local min, max, range = Utils.ClampRange(opts.Min or 0, opts.Max or 100)
     local value = math.clamp(opts.Default or min, min, max)
     local showLabel = opts.ShowLabel ~= false
 
@@ -4283,6 +4302,11 @@ function Window:_setupResize(mainFrame, originalSize)
     local contentGroup = self._contentGroup
 
     local activeInput, dragStart, startSize
+    -- Cached at drag-start instead of recomputed on every InputChanged —
+    -- ViewportSize only actually changes on rotation/window-resize (already
+    -- covered separately by _setupViewportRefit), not on every mouse-move
+    -- frame, so recomputing it per-pixel-dragged was pure waste.
+    local cachedMaxW, cachedMaxH
     connMgr:Track(handle.InputBegan:Connect(function(input)
         if self._resizing or self._titleDragging or self._minimized or self._animating then return end
         if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
@@ -4291,6 +4315,7 @@ function Window:_setupResize(mainFrame, originalSize)
             dragStart = input.Position
             anchorTopLeftForResize()
             startSize = mainFrame.Size
+            cachedMaxW, cachedMaxH = maxSize()
             contentGroup.Visible = false
         end
     end))
@@ -4298,9 +4323,8 @@ function Window:_setupResize(mainFrame, originalSize)
         if self._resizing and input == activeInput
             and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
             local delta = input.Position - dragStart
-            local MAX_W, MAX_H = maxSize()
-            local w = math.clamp(startSize.X.Offset + delta.X, MIN_WINDOW_W, MAX_W)
-            local h = math.clamp(startSize.Y.Offset + delta.Y, MIN_WINDOW_H, MAX_H)
+            local w = math.clamp(startSize.X.Offset + delta.X, MIN_WINDOW_W, cachedMaxW)
+            local h = math.clamp(startSize.Y.Offset + delta.Y, MIN_WINDOW_H, cachedMaxH)
             mainFrame.Size = UDim2.new(0, w, 0, h)
         end
     end))
@@ -4716,100 +4740,59 @@ local function nextOrder(tab)
     return tab._order
 end
 
-function TabMeta:CreateLabel(opts)
-    opts = opts or {}
-    opts.LayoutOrder = nextOrder(self)
-    return Components.Label(self._page, self._theme, self._connMgr, opts)
+-- Generates the bulk of TabMeta:CreateXxx by table-driven dispatch instead
+-- of ~20 hand-written, nearly-identical wrapper functions (each was just
+-- "bump LayoutOrder, call the matching Components.* factory, optionally
+-- register the Flag, return"). This mirrors the ACCORDION_FACTORY_MAP
+-- pattern above — same shape of duplication, same fix. Any TabMeta:CreateXxx
+-- with genuinely different logic (CreateAccordion needs to stamp _window/
+-- _tab onto the returned object; CreateGradientPicker reserves two
+-- LayoutOrder slots; CreateConfigList/CreateSearchBar/AddTooltip compose
+-- several controls or don't create a page-level control at all) stays
+-- hand-written below this table instead of being forced into the map.
+local TAB_FACTORY_MAP = {
+    CreateLabel = { fn = "Label" },
+    CreateButton = { fn = "Button" },
+    CreateToggle = { fn = "Toggle", flag = true },
+    CreateSlider = { fn = "Slider", flag = true },
+    CreateTextbox = { fn = "Textbox", flag = true },
+    CreateDropdown = { fn = "Dropdown", flag = true },
+    CreateMultiDropdown = { fn = "MultiDropdown", flag = true },
+    CreateColorPicker = { fn = "ColorPicker", flag = true },
+    CreateThemeGrid = { fn = "ThemeGrid" },
+    CreateDivider = { fn = "Divider" },
+    CreateParagraph = { fn = "Paragraph" },
+    CreateKeybind = { fn = "Keybind", flag = true },
+    CreateNumberStepper = { fn = "NumberStepper", flag = true },
+    CreateRadioGroup = { fn = "RadioGroup", flag = true },
+    CreateTableList = { fn = "TableList" },
+    CreateProgressBar = { fn = "ProgressBar", flag = true },
+    CreateSegmentedControl = { fn = "SegmentedControl", flag = true },
+    CreateLogPanel = { fn = "LogPanel" },
+}
+for methodName, info in pairs(TAB_FACTORY_MAP) do
+    TabMeta[methodName] = function(self, opts)
+        opts = opts or {}
+        opts.LayoutOrder = nextOrder(self)
+        local obj = Components[info.fn](self._page, self._theme, self._connMgr, opts)
+        if info.flag then self._window:_registerFlag(opts.Flag, obj) end
+        return obj
+    end
 end
-function TabMeta:CreateButton(opts)
-    opts = opts or {}
-    opts.LayoutOrder = nextOrder(self)
-    return Components.Button(self._page, self._theme, self._connMgr, opts)
-end
-function TabMeta:CreateToggle(opts)
-    opts = opts or {}
-    opts.LayoutOrder = nextOrder(self)
-    local obj = Components.Toggle(self._page, self._theme, self._connMgr, opts)
-    self._window:_registerFlag(opts.Flag, obj)
-    return obj
-end
-function TabMeta:CreateSlider(opts)
-    opts = opts or {}
-    opts.LayoutOrder = nextOrder(self)
-    local obj = Components.Slider(self._page, self._theme, self._connMgr, opts)
-    self._window:_registerFlag(opts.Flag, obj)
-    return obj
-end
-function TabMeta:CreateTextbox(opts)
-    opts = opts or {}
-    opts.LayoutOrder = nextOrder(self)
-    local obj = Components.Textbox(self._page, self._theme, self._connMgr, opts)
-    self._window:_registerFlag(opts.Flag, obj)
-    return obj
-end
-function TabMeta:CreateDropdown(opts)
-    opts = opts or {}
-    opts.LayoutOrder = nextOrder(self)
-    local obj = Components.Dropdown(self._page, self._theme, self._connMgr, opts)
-    self._window:_registerFlag(opts.Flag, obj)
-    return obj
-end
-function TabMeta:CreateMultiDropdown(opts)
-    opts = opts or {}
-    opts.LayoutOrder = nextOrder(self)
-    local obj = Components.MultiDropdown(self._page, self._theme, self._connMgr, opts)
-    self._window:_registerFlag(opts.Flag, obj)
-    return obj
-end
-function TabMeta:CreateColorPicker(opts)
-    opts = opts or {}
-    opts.LayoutOrder = nextOrder(self)
-    local obj = Components.ColorPicker(self._page, self._theme, self._connMgr, opts)
-    self._window:_registerFlag(opts.Flag, obj)
-    return obj
-end
-function TabMeta:CreateThemeGrid(opts)
-    opts = opts or {}
-    opts.LayoutOrder = nextOrder(self)
-    return Components.ThemeGrid(self._page, self._theme, self._connMgr, opts)
-end
+
+-- CreateGradientPicker reserves TWO LayoutOrder slots (the toggle row plus
+-- its separately-parented preset grid, see Components.GradientPicker),
+-- so it can't go through the one-slot TAB_FACTORY_MAP above.
 function TabMeta:CreateGradientPicker(opts)
     opts = opts or {}
     opts.LayoutOrder = nextOrder(self)
     nextOrder(self)
     return Components.GradientPicker(self._page, self._theme, self._connMgr, opts)
 end
-function TabMeta:CreateDivider(opts)
-    opts = opts or {}
-    opts.LayoutOrder = nextOrder(self)
-    return Components.Divider(self._page, self._theme, self._connMgr, opts)
-end
-function TabMeta:CreateParagraph(opts)
-    opts = opts or {}
-    opts.LayoutOrder = nextOrder(self)
-    return Components.Paragraph(self._page, self._theme, self._connMgr, opts)
-end
-function TabMeta:CreateKeybind(opts)
-    opts = opts or {}
-    opts.LayoutOrder = nextOrder(self)
-    local obj = Components.Keybind(self._page, self._theme, self._connMgr, opts)
-    self._window:_registerFlag(opts.Flag, obj)
-    return obj
-end
-function TabMeta:CreateNumberStepper(opts)
-    opts = opts or {}
-    opts.LayoutOrder = nextOrder(self)
-    local obj = Components.NumberStepper(self._page, self._theme, self._connMgr, opts)
-    self._window:_registerFlag(opts.Flag, obj)
-    return obj
-end
-function TabMeta:CreateRadioGroup(opts)
-    opts = opts or {}
-    opts.LayoutOrder = nextOrder(self)
-    local obj = Components.RadioGroup(self._page, self._theme, self._connMgr, opts)
-    self._window:_registerFlag(opts.Flag, obj)
-    return obj
-end
+
+-- CreateAccordion stamps _window/_tab onto the returned object (needed by
+-- AccordionMeta:CreateXxx for Flag registration and search-index
+-- registration of nested controls), which no other Create method needs.
 function TabMeta:CreateAccordion(opts)
     opts = opts or {}
     opts.LayoutOrder = nextOrder(self)
@@ -4817,33 +4800,6 @@ function TabMeta:CreateAccordion(opts)
     acc._window = self._window
     acc._tab = self -- lets AccordionMeta:CreateXxx register children into this tab's search index
     return acc
-end
-function TabMeta:CreateTableList(opts)
-    opts = opts or {}
-    opts.LayoutOrder = nextOrder(self)
-    return Components.TableList(self._page, self._theme, self._connMgr, opts)
-end
-
-function TabMeta:CreateProgressBar(opts)
-    opts = opts or {}
-    opts.LayoutOrder = nextOrder(self)
-    local obj = Components.ProgressBar(self._page, self._theme, self._connMgr, opts)
-    self._window:_registerFlag(opts.Flag, obj)
-    return obj
-end
-
-function TabMeta:CreateSegmentedControl(opts)
-    opts = opts or {}
-    opts.LayoutOrder = nextOrder(self)
-    local obj = Components.SegmentedControl(self._page, self._theme, self._connMgr, opts)
-    self._window:_registerFlag(opts.Flag, obj)
-    return obj
-end
-
-function TabMeta:CreateLogPanel(opts)
-    opts = opts or {}
-    opts.LayoutOrder = nextOrder(self)
-    return Components.LogPanel(self._page, self._theme, self._connMgr, opts)
 end
 
 -- Gắn tooltip lên MỘT control đã tạo trước đó — KHÔNG tạo dòng mới trong
