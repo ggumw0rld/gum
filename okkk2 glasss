@@ -3533,11 +3533,22 @@ function Components.Notification(parent, theme, connMgr, opts)
     -- computation and visibly cropped.
     card.ClipsDescendants = false
     card.Parent = slot
-    Utils.AddCorner(card, UDim.new(0, 10))
+    Utils.AddCorner(card, UDim.new(0, 12))
+
+    local glassOverlay = Instance.new("Frame")
+    glassOverlay.Name = "GlassOverlay"
+    glassOverlay.Size = UDim2.new(1, 0, 1, 0)
+    glassOverlay.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+    glassOverlay.BackgroundTransparency = 0.94
+    glassOverlay.BorderSizePixel = 0
+    glassOverlay.ZIndex = 0
+    glassOverlay.Parent = card
+    Utils.AddCorner(glassOverlay, UDim.new(0, 12))
+
 
     local stroke = Instance.new("UIStroke")
     stroke.Color = Utils.Brighten(theme.Color, 1.5)
-    stroke.Thickness = 1
+    stroke.Thickness = 1.2
     stroke.Parent = card
 
     local accentBar = Instance.new("Frame")
@@ -3996,7 +4007,7 @@ function Window:_buildChrome(title, originalSize)
     self._mainFrameRadius = MAIN_FRAME_RADIUS
 
     local stroke = Instance.new("UIStroke")
-    stroke.Thickness = 1
+    stroke.Thickness = 1.2
     stroke.Parent = mainFrame
 
     local shadow = Instance.new("UIShadow")
