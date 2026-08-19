@@ -962,12 +962,21 @@ function Components.RadioGroup(parent, theme, connMgr, opts)
             }):Play()
         end
     end
+
+    -- THÊM: đọc AllowDeselect, mặc định false (không cho bỏ chọn)
+    local allowDeselect = opts.AllowDeselect == true
+
     local function select(text)
-        -- No-op re-select guard: clicking the already-selected row must
-        -- not clear the selection (unlike Dropdown). Only a genuinely
-        -- different option — or an explicit programmatic self:Set(nil) —
-        -- changes `selected`.
-        if text == selected then return end
+        -- Nếu bấm vào option đang chọn
+        if text == selected then
+            if allowDeselect then
+                selected = nil
+                restyleRows()
+                if opts.Callback then opts.Callback(nil) end
+            end
+            return -- không làm gì thêm
+        end
+        -- Chọn option khác
         selected = text
         restyleRows()
         if opts.Callback then opts.Callback(text) end
@@ -1019,10 +1028,6 @@ function Components.RadioGroup(parent, theme, connMgr, opts)
 
     local self = { Instance = container }
     function self:Get() return selected end
-    -- Programmatically select an option (used by Window:LoadConfig).
-    -- Passing nil explicitly still clears the selection (e.g. to restore a
-    -- config that recorded "nothing selected" before this fix existed);
-    -- everyday user interaction can only move between real options.
     function self:Set(v)
         if v == nil then
             if selected == nil then return end
@@ -1467,13 +1472,6 @@ function Components.Dropdown(parent, theme, connMgr, opts)
     local optionButtons = {}
     local options, selected
 
-    -- FIX: rows are rebuilt on every :Refresh() call (e.g. every Save/Delete
-    -- via CreateConfigList). Previously every row's connections were tracked
-    -- directly on the shared `connMgr`, so destroying+recreating rows left
-    -- the dead connections from the old rows sitting in connMgr forever —
-    -- a slow leak that grows every refresh. rowConnMgr is disconnected in
-    -- full at the top of every rebuild, right before the old buttons are
-    -- destroyed, so only the CURRENT rows' connections are ever alive.
     local rowConnMgr = ConnectionManager.new()
 
     local function bodyHeightFor(count)
@@ -1484,10 +1482,6 @@ function Components.Dropdown(parent, theme, connMgr, opts)
     options = opts.Options or {}
     selected = opts.Default or options[1]
 
-    -- Robustness: don't mutate the caller's own opts.OnToggle in place.
-    -- Read it once into a local and build a small wrapper around it, so the
-    -- `opts` table the caller passed in is left exactly as they gave it —
-    -- relevant if they keep a reference to it or reuse it elsewhere.
     local userOnToggle = opts.OnToggle
     local function fireOnToggle(isOpen)
         if userOnToggle then userOnToggle(isOpen) end
@@ -1497,12 +1491,6 @@ function Components.Dropdown(parent, theme, connMgr, opts)
         Text = opts.Text or "Chọn mục:",
         LayoutOrder = opts.LayoutOrder,
         BodyHeight = bodyHeightFor(#options),
-        -- Proxy so ExpandableHeader always calls whatever the current
-        -- toggle handler is (fireOnToggle indirects through userOnToggle,
-        -- which the searchable block below reassigns) — without this
-        -- indirection ExpandableHeader would keep calling the ORIGINAL
-        -- handler only, and the "clear filter on close" wrapper added
-        -- below would never run.
         OnToggle = function(isOpen) fireOnToggle(isOpen) end,
     })
 
@@ -1519,7 +1507,6 @@ function Components.Dropdown(parent, theme, connMgr, opts)
     valueLabel.TextTruncate = Enum.TextTruncate.AtEnd
     valueLabel.Parent = exp.Header
 
-    -- Search row (only built when Searchable is true)
     local searchBox
     if searchable then
         local searchHolder = Instance.new("Frame")
@@ -1571,10 +1558,6 @@ function Components.Dropdown(parent, theme, connMgr, opts)
         if opts.Callback then opts.Callback(text) end
     end
 
-    -- Filters existing rows by Visible instead of destroying/rebuilding
-    -- them, so filtering while typing stays cheap (no Instance churn per
-    -- keystroke). UIListLayout automatically skips invisible children, so
-    -- the visible rows reflow with no gaps.
     local function applyFilter(query)
         query = (query or ""):lower()
         for _, row in ipairs(optionButtons) do
@@ -1582,12 +1565,11 @@ function Components.Dropdown(parent, theme, connMgr, opts)
         end
     end
 
-    -- Rebuilds the option rows in `list` from the `options` array. Used both
-    -- at creation and by :Refresh() below, so a Dropdown's Options can be
-    -- repopulated at runtime (e.g. a "saved configs" list that changes as
-    -- the user saves new ones) instead of being frozen at creation time.
+    -- THÊM: đọc option AllowDeselect, mặc định true (giống hành vi cũ)
+    local allowDeselect = opts.AllowDeselect ~= false
+
     local function rebuildOptions()
-        rowConnMgr:DisconnectAll() -- drop connections belonging to the OLD rows first
+        rowConnMgr:DisconnectAll()
         for _, row in ipairs(optionButtons) do row.btn:Destroy() end
         table.clear(optionButtons)
 
@@ -1612,10 +1594,14 @@ function Components.Dropdown(parent, theme, connMgr, opts)
             rowConnMgr:Track(btn.MouseLeave:Connect(function()
                 TweenService:Create(btn, TweenInfo.new(0.18, EASE, EASE_OUT), { BackgroundColor3 = baseColorFor(text) }):Play()
             end))
+
+            -- SỬA: logic click có điều kiện AllowDeselect
             rowConnMgr:Track(btn.MouseButton1Click:Connect(function()
-                -- Deselect-on-reclick kept for Dropdown by design (see note
-                -- above the factory function).
-                select(text == selected and nil or text)
+                if allowDeselect then
+                    select(text == selected and nil or text)
+                else
+                    if text ~= selected then select(text) end
+                end
             end))
 
             table.insert(optionButtons, { btn = btn, text = text })
@@ -1629,12 +1615,6 @@ function Components.Dropdown(parent, theme, connMgr, opts)
         connMgr:Track(searchBox:GetPropertyChangedSignal("Text"):Connect(function()
             applyFilter(searchBox.Text)
         end))
-        -- Clear the filter (and refocus the list) whenever the dropdown
-        -- closes, so reopening it always starts from the full list. Wraps
-        -- the ORIGINAL caller-provided callback (captured above as
-        -- userOnToggle) into a new function and reassigns the local
-        -- `userOnToggle` — not opts.OnToggle — so the caller's own opts
-        -- table is never touched.
         local originalOnToggle = userOnToggle
         userOnToggle = function(isOpen)
             if not isOpen then
@@ -1647,8 +1627,6 @@ function Components.Dropdown(parent, theme, connMgr, opts)
 
     local self = { Instance = exp.Container }
     function self:Get() return selected end
-    -- Programmatically select an option (used by Window:LoadConfig).
-    -- Silently ignores values that aren't in the current Options list.
     function self:Set(v)
         if v == nil then
             select(nil)
@@ -1659,11 +1637,6 @@ function Components.Dropdown(parent, theme, connMgr, opts)
         if not found then return end
         select(v)
     end
-    -- Replaces the Options list at runtime and rebuilds the option rows +
-    -- the expand/collapse body height to match. If keepSelection is false
-    -- (default), selection falls back to the first new option (or nil if
-    -- newOptions is empty); if true, the current selection is kept when it
-    -- still exists in newOptions, otherwise it also falls back.
     function self:Refresh(newOptions, keepSelection)
         options = newOptions or {}
         if keepSelection then
@@ -1677,11 +1650,6 @@ function Components.Dropdown(parent, theme, connMgr, opts)
         rebuildOptions()
         valueLabel.Text = selected or ""
     end
-    -- Drops the row-level connections. Not called automatically (the
-    -- Container is normally torn down with the rest of the window via
-    -- connMgr:DisconnectAll()), but exposed for symmetry with the
-    -- {Instance, ApplyTheme, Destroy} component contract and for anyone
-    -- who wants to discard a Dropdown independently of its window.
     function self:Destroy()
         rowConnMgr:DisconnectAll()
     end
@@ -3124,6 +3092,404 @@ function Components.TableList(parent, theme, connMgr, opts)
     return self
 end
 
+
+-- ---------- ProgressBar ----------
+-- Thanh tiến trình CHỈ ĐỌC (khác Slider — không kéo được), dùng cho loading
+-- task, thanh XP, cooldown hiển thị, v.v. Điều khiển bằng obj:Set(v).
+--
+-- opts: { Text, Min (0), Max (100), Default (Min), ShowLabel (true),
+--         Suffix (nil -> hiện %, hoặc vd " coins" để hiện số thô), Flag }
+function Components.ProgressBar(parent, theme, connMgr, opts)
+    local min, max = opts.Min or 0, opts.Max or 100
+    if min > max then min, max = max, min end
+    local range = (max > min) and (max - min) or 1
+    local value = math.clamp(opts.Default or min, min, max)
+    local showLabel = opts.ShowLabel ~= false
+
+    local frame = Instance.new("Frame")
+    frame.Size = opts.Size or UDim2.new(1, 0, 0, showLabel and 40 or 14)
+    frame.LayoutOrder = opts.LayoutOrder or 0
+    frame.Parent = parent
+    Utils.AddCorner(frame, UDim.new(0, 8))
+
+    local label
+    if showLabel then
+        label = Instance.new("TextLabel")
+        label.Size = UDim2.new(1, -20, 0, 20)
+        label.Position = UDim2.new(0, 10, 0, 4)
+        label.BackgroundTransparency = 1
+        label.TextXAlignment = Enum.TextXAlignment.Left
+        label.Font = Enum.Font.GothamBold
+        label.TextSize = 14
+        label.Parent = frame
+    end
+
+    local track = Instance.new("Frame")
+    track.Size = UDim2.new(1, -20, 0, 8)
+    track.Position = UDim2.new(0, 10, 0, showLabel and 28 or 4)
+    track.BorderSizePixel = 0
+    track.Parent = frame
+    Utils.AddCorner(track, UDim.new(1, 0))
+
+    local fill = Instance.new("Frame")
+    fill.Size = UDim2.new((value - min) / range, 0, 1, 0)
+    fill.BorderSizePixel = 0
+    fill.Parent = track
+    Utils.AddCorner(fill, UDim.new(1, 0))
+
+    local function labelText()
+        if opts.Suffix then
+            return (opts.Text or "Tiến trình") .. ": " .. tostring(value) .. opts.Suffix
+        end
+        local pct = math.floor(((value - min) / range) * 100 + 0.5)
+        return (opts.Text or "Tiến trình") .. ": " .. pct .. "%"
+    end
+    if label then label.Text = labelText() end
+
+    local self = { Instance = frame }
+    function self:Get() return value end
+    -- instant (optional bool): skip the fill tween, e.g. for the very
+    -- first paint or a hard reset.
+    function self:Set(v, instant)
+        v = math.clamp(v, min, max)
+        value = v
+        if label then label.Text = labelText() end
+        local alpha = (value - min) / range
+        local info = TweenInfo.new(instant and 0 or 0.25, EASE, EASE_OUT)
+        TweenService:Create(fill, info, { Size = UDim2.new(alpha, 0, 1, 0) }):Play()
+    end
+    function self:ApplyTheme(color, accent, isInitial)
+        local panelBg = Utils.Brighten(color, 1.2)
+        local textColor = Utils.GetTextColorFor(panelBg, accent)
+        local darkBg = Utils.Darken(color, 0.8)
+        if isInitial then
+            frame.BackgroundColor3 = panelBg
+            if label then label.TextColor3 = textColor end
+            track.BackgroundColor3 = darkBg
+            fill.BackgroundColor3 = accent
+        else
+            TweenService:Create(frame, THEME_TWEEN_INFO, { BackgroundColor3 = panelBg }):Play()
+            if label then TweenService:Create(label, THEME_TWEEN_INFO, { TextColor3 = textColor }):Play() end
+            TweenService:Create(track, THEME_TWEEN_INFO, { BackgroundColor3 = darkBg }):Play()
+            TweenService:Create(fill, THEME_TWEEN_INFO, { BackgroundColor3 = accent }):Play()
+        end
+    end
+    theme:Subscribe(function(c, a, initial) self:ApplyTheme(c, a, initial) end)
+    return self
+end
+
+-- ---------- Tooltip ----------
+-- Gắn thêm lên MỘT control đã tồn tại (không tạo dòng mới trong tab).
+-- Desktop: hiện khi MouseEnter/MouseLeave. Android/touch (môi trường
+-- chính của Khôi): hiện sau khi giữ (long-press) target quá `Delay` giây,
+-- ẩn ngay khi nhả tay — dùng token đếm giống pattern debounce của
+-- Components.Keybind/Notification để tránh hiện tooltip trễ sau khi đã
+-- nhả tay (vuốt lướt qua nhanh sẽ không kích hoạt).
+--
+-- target PHẢI là GuiButton (hoặc Frame có Active=true) để nhận
+-- MouseEnter/InputBegan/InputEnded.
+--
+-- opts: { Text, Delay (0.45s), Position ("top"|"bottom", default "top") }
+function Components.Tooltip(target, theme, connMgr, opts)
+    opts = opts or {}
+    local delay = opts.Delay or 0.45
+    local above = (opts.Position ~= "bottom")
+
+    local bubble = Instance.new("TextLabel")
+    bubble.AnchorPoint = above and Vector2.new(0.5, 1) or Vector2.new(0.5, 0)
+    bubble.Position = above and UDim2.new(0.5, 0, 0, -8) or UDim2.new(0.5, 0, 1, 8)
+    bubble.Size = UDim2.new(0, 0, 0, 26)
+    bubble.AutomaticSize = Enum.AutomaticSize.X
+    bubble.Text = opts.Text or ""
+    bubble.Font = Enum.Font.Gotham
+    bubble.TextSize = 12
+    bubble.TextColor3 = Color3.fromRGB(255, 255, 255)
+    bubble.BackgroundTransparency = 1
+    bubble.TextTransparency = 1
+    bubble.ZIndex = 50
+    bubble.Visible = false
+    bubble.Parent = target
+    Utils.AddCorner(bubble, UDim.new(0, 6))
+    Utils.AddPadding(bubble, UDim.new(0, 8), UDim.new(0, 8))
+
+    local stroke = Instance.new("UIStroke")
+    stroke.Transparency = 1
+    stroke.Thickness = 1
+    stroke.Parent = bubble
+
+    local shown = false
+    local token = 0
+
+    local function fadeTo(visible)
+        shown = visible
+        if visible then bubble.Visible = true end
+        local info = TweenInfo.new(0.18, EASE, EASE_OUT)
+        TweenService:Create(bubble, info, {
+            TextTransparency = visible and 0 or 1,
+            BackgroundTransparency = visible and 0.05 or 1,
+        }):Play()
+        TweenService:Create(stroke, info, { Transparency = visible and 0.6 or 1 }):Play()
+        if not visible then
+            task.delay(0.2, function() if not shown then bubble.Visible = false end end)
+        end
+    end
+
+    connMgr:Track(target.MouseEnter:Connect(function() fadeTo(true) end))
+    connMgr:Track(target.MouseLeave:Connect(function() fadeTo(false) end))
+
+    connMgr:Track(target.InputBegan:Connect(function(input)
+        if input.UserInputType ~= Enum.UserInputType.Touch then return end
+        token = token + 1
+        local myToken = token
+        task.delay(delay, function()
+            if myToken == token then fadeTo(true) end
+        end)
+    end))
+    connMgr:Track(target.InputEnded:Connect(function(input)
+        if input.UserInputType ~= Enum.UserInputType.Touch then return end
+        token = token + 1 -- invalidates any pending show from InputBegan above
+        if shown then fadeTo(false) end
+    end))
+
+    local self = { Instance = bubble }
+    function self:SetText(text) bubble.Text = text end
+    function self:ApplyTheme(color, accent, isInitial)
+        local bg = Utils.Darken(color, 0.6)
+        local border = Utils.Brighten(color, 1.6)
+        if isInitial then
+            bubble.BackgroundColor3 = bg
+            stroke.Color = border
+        else
+            TweenService:Create(bubble, THEME_TWEEN_INFO, { BackgroundColor3 = bg }):Play()
+            TweenService:Create(stroke, THEME_TWEEN_INFO, { Color = border }):Play()
+        end
+    end
+    theme:Subscribe(function(c, a, initial) self:ApplyTheme(c, a, initial) end)
+    return self
+end
+
+-- ---------- SegmentedControl ----------
+-- Pill ngang chọn-1 kiểu iOS, gọn hơn RadioGroup (dạng list dọc) cho
+-- 2-4 lựa chọn ngắn. Highlight trượt bằng UDim2 Scale (mọi ô rộng bằng
+-- nhau = 1/N) nên không cần đo AbsoluteSize/Heartbeat như các control
+-- tự-đo khác trong file (Accordion, Paragraph).
+--
+-- opts: { Text (không hiện, chỉ để search-index bắt được), Options,
+--         Default, Callback(text), Flag }
+function Components.SegmentedControl(parent, theme, connMgr, opts)
+    local options = opts.Options or {}
+    local n = math.max(#options, 1)
+    local selectedIndex = 1
+    if opts.Default then
+        for i, t in ipairs(options) do if t == opts.Default then selectedIndex = i; break end end
+    end
+
+    local outer = Instance.new("Frame")
+    outer.Size = opts.Size or UDim2.new(1, 0, 0, 38)
+    outer.LayoutOrder = opts.LayoutOrder or 0
+    outer.ClipsDescendants = true
+    outer.Parent = parent
+    Utils.AddCorner(outer, UDim.new(0, 8))
+    Utils.AddPadding(outer, UDim.new(0, 3), UDim.new(0, 3), UDim.new(0, 3), UDim.new(0, 3))
+
+    local highlight = Instance.new("Frame")
+    highlight.Size = UDim2.new(1 / n, 0, 1, 0)
+    highlight.Position = UDim2.new((selectedIndex - 1) / n, 0, 0, 0)
+    highlight.BorderSizePixel = 0
+    highlight.ZIndex = 1
+    highlight.Parent = outer
+    Utils.AddCorner(highlight, UDim.new(0, 6))
+
+    local row = Instance.new("Frame")
+    row.Size = UDim2.new(1, 0, 1, 0)
+    row.BackgroundTransparency = 1
+    row.ZIndex = 2
+    row.Parent = outer
+    local layout = Instance.new("UIListLayout")
+    layout.FillDirection = Enum.FillDirection.Horizontal
+    layout.SortOrder = Enum.SortOrder.LayoutOrder
+    layout.Parent = row
+
+    local buttons = {}
+    local function restyle()
+        for i, b in ipairs(buttons) do
+            local isSel = (i == selectedIndex)
+            local target = isSel
+                and Utils.GetTextColorFor(theme.Accent, theme.Accent)
+                or Utils.GetTextColorFor(Utils.Brighten(theme.Color, 1.2), theme.Accent)
+            TweenService:Create(b, TweenInfo.new(0.2, EASE, EASE_OUT), { TextColor3 = target }):Play()
+        end
+        TweenService:Create(highlight, TweenInfo.new(0.25, EASE, EASE_OUT), {
+            Position = UDim2.new((selectedIndex - 1) / n, 0, 0, 0)
+        }):Play()
+    end
+
+    for i, text in ipairs(options) do
+        local b = Instance.new("TextButton")
+        b.Size = UDim2.new(1 / n, 0, 1, 0)
+        b.LayoutOrder = i
+        b.BackgroundTransparency = 1
+        b.Text = text
+        b.Font = Enum.Font.GothamBold
+        b.TextSize = 13
+        b.AutoButtonColor = false
+        b.Parent = row
+        connMgr:Track(b.MouseButton1Click:Connect(function()
+            if i == selectedIndex then return end
+            selectedIndex = i
+            restyle()
+            if opts.Callback then opts.Callback(text) end
+        end))
+        table.insert(buttons, b)
+    end
+
+    local self = { Instance = outer }
+    function self:Get() return options[selectedIndex] end
+    function self:Set(v)
+        for i, t in ipairs(options) do
+            if t == v and i ~= selectedIndex then
+                selectedIndex = i
+                restyle()
+                if opts.Callback then opts.Callback(v) end
+                return
+            end
+        end
+    end
+    function self:ApplyTheme(color, accent, isInitial)
+        local outerBg = Utils.Darken(color, 0.85)
+        if isInitial then
+            outer.BackgroundColor3 = outerBg
+            highlight.BackgroundColor3 = accent
+        else
+            TweenService:Create(outer, THEME_TWEEN_INFO, { BackgroundColor3 = outerBg }):Play()
+            TweenService:Create(highlight, THEME_TWEEN_INFO, { BackgroundColor3 = accent }):Play()
+        end
+        restyle()
+    end
+    theme:Subscribe(function(c, a, initial) self:ApplyTheme(c, a, initial) end)
+    return self
+end
+
+-- ---------- LogPanel (Console) ----------
+-- Khung cuộn hiện log runtime trong UI thay vì print() ra console
+-- executor (tiện khi test trên điện thoại, không có console riêng để
+-- xem). obj:Log(text, level) thêm 1 dòng; vượt quá MaxLines thì dòng cũ
+-- nhất bị xoá (giống pattern rowConnMgr-less trim của Notification's
+-- max-visible-toasts, chỉ đơn giản hơn vì mỗi dòng không có connection
+-- riêng cần disconnect).
+--
+-- opts: { Text (tiêu đề, optional), MaxLines (100), ShowTimestamp (true),
+--         AutoScroll (true), Height (160, chiều cao vùng cuộn) }
+function Components.LogPanel(parent, theme, connMgr, opts)
+    local maxLines = opts.MaxLines or 100
+    local showTimestamp = opts.ShowTimestamp ~= false
+    local autoScroll = opts.AutoScroll ~= false
+    local visibleHeight = opts.Height or 160
+    local hasHeader = opts.Text and opts.Text ~= ""
+    local headerHeight = hasHeader and 26 or 0
+
+    local LEVEL_COLORS = {
+        info = Color3.fromRGB(190, 190, 200),
+        success = Color3.fromRGB(90, 210, 130),
+        warning = Color3.fromRGB(230, 170, 50),
+        error = Color3.fromRGB(230, 90, 90),
+    }
+
+    local container = Instance.new("Frame")
+    container.Size = opts.Size or UDim2.new(1, 0, 0, headerHeight + visibleHeight + 10)
+    container.LayoutOrder = opts.LayoutOrder or 0
+    container.Parent = parent
+    Utils.AddCorner(container, UDim.new(0, 8))
+
+    local headerLabel
+    if hasHeader then
+        headerLabel = Instance.new("TextLabel")
+        headerLabel.Size = UDim2.new(1, -20, 0, headerHeight)
+        headerLabel.Position = UDim2.new(0, 10, 0, 4)
+        headerLabel.BackgroundTransparency = 1
+        headerLabel.Text = opts.Text
+        headerLabel.TextXAlignment = Enum.TextXAlignment.Left
+        headerLabel.Font = Enum.Font.GothamBold
+        headerLabel.TextSize = 13
+        headerLabel.Parent = container
+    end
+
+    local scroller = Instance.new("ScrollingFrame")
+    scroller.Position = UDim2.new(0, 6, 0, headerHeight + 4)
+    scroller.Size = UDim2.new(1, -12, 0, visibleHeight)
+    scroller.BorderSizePixel = 0
+    scroller.ScrollBarThickness = 4
+    scroller.CanvasSize = UDim2.new(0, 0, 0, 0)
+    scroller.AutomaticCanvasSize = Enum.AutomaticSize.Y
+    scroller.Parent = container
+    Utils.AddCorner(scroller, UDim.new(0, 6))
+    local listLayout = Instance.new("UIListLayout")
+    listLayout.Padding = UDim.new(0, 2)
+    listLayout.Parent = scroller
+    Utils.AddPadding(scroller, UDim.new(0, 6), UDim.new(0, 6), UDim.new(0, 4), UDim.new(0, 4))
+
+    local lines = {}
+    local self = { Instance = container }
+
+    function self:Log(text, level)
+        level = level or "info"
+        local row = Instance.new("TextLabel")
+        row.Size = UDim2.new(1, 0, 0, 0)
+        row.AutomaticSize = Enum.AutomaticSize.Y
+        row.LayoutOrder = #lines + 1
+        row.BackgroundTransparency = 1
+        row.TextWrapped = true
+        row.TextXAlignment = Enum.TextXAlignment.Left
+        row.TextYAlignment = Enum.TextYAlignment.Top
+        row.Font = Enum.Font.Code
+        row.TextSize = 12
+        row.TextColor3 = LEVEL_COLORS[level] or LEVEL_COLORS.info
+        local prefix = showTimestamp and ("[" .. os.date("%H:%M:%S") .. "] ") or ""
+        row.Text = prefix .. tostring(text)
+        row.Parent = scroller
+
+        table.insert(lines, row)
+        if #lines > maxLines then
+            local oldest = table.remove(lines, 1)
+            oldest:Destroy()
+        end
+
+        if autoScroll then
+            -- Same "wait a Heartbeat for AutomaticSize/AutomaticCanvasSize
+            -- to converge" pattern used elsewhere (Notification, Paragraph)
+            -- before trusting AbsoluteCanvasSize/AbsoluteWindowSize.
+            task.defer(function()
+                RunService.Heartbeat:Wait()
+                scroller.CanvasPosition = Vector2.new(
+                    0, math.max(scroller.AbsoluteCanvasSize.Y - scroller.AbsoluteWindowSize.Y, 0)
+                )
+            end)
+        end
+    end
+
+    function self:Clear()
+        for _, row in ipairs(lines) do row:Destroy() end
+        table.clear(lines)
+    end
+
+    function self:ApplyTheme(color, accent, isInitial)
+        local panelBg = Utils.Brighten(color, 1.2)
+        local textColor = Utils.GetTextColorFor(panelBg, accent)
+        local darkBg = Utils.Darken(color, 0.85)
+        if isInitial then
+            container.BackgroundColor3 = panelBg
+            if headerLabel then headerLabel.TextColor3 = textColor end
+            scroller.BackgroundColor3 = darkBg
+        else
+            TweenService:Create(container, THEME_TWEEN_INFO, { BackgroundColor3 = panelBg }):Play()
+            if headerLabel then TweenService:Create(headerLabel, THEME_TWEEN_INFO, { TextColor3 = textColor }):Play() end
+            TweenService:Create(scroller, THEME_TWEEN_INFO, { BackgroundColor3 = darkBg }):Play()
+        end
+    end
+    theme:Subscribe(function(c, a, initial) self:ApplyTheme(c, a, initial) end)
+    return self
+end
+
 local NOTIF_TYPES = {
     success = { Color3.fromRGB(60, 200, 120), "✓" },
     error   = { Color3.fromRGB(220, 70, 70),  "×" },
@@ -4560,6 +4926,36 @@ function TabMeta:CreateTableList(opts)
     opts = opts or {}
     opts.LayoutOrder = nextOrder(self)
     return Components.TableList(self._page, self._theme, self._connMgr, opts)
+end
+
+function TabMeta:CreateProgressBar(opts)
+    opts = opts or {}
+    opts.LayoutOrder = nextOrder(self)
+    local obj = Components.ProgressBar(self._page, self._theme, self._connMgr, opts)
+    self._window:_registerFlag(opts.Flag, obj)
+    return obj
+end
+
+function TabMeta:CreateSegmentedControl(opts)
+    opts = opts or {}
+    opts.LayoutOrder = nextOrder(self)
+    local obj = Components.SegmentedControl(self._page, self._theme, self._connMgr, opts)
+    self._window:_registerFlag(opts.Flag, obj)
+    return obj
+end
+
+function TabMeta:CreateLogPanel(opts)
+    opts = opts or {}
+    opts.LayoutOrder = nextOrder(self)
+    return Components.LogPanel(self._page, self._theme, self._connMgr, opts)
+end
+
+-- Gắn tooltip lên MỘT control đã tạo trước đó — KHÔNG tạo dòng mới trong
+-- tab (không gọi nextOrder, không cần LayoutOrder). Ví dụ:
+--   local btn = tab:CreateButton({ Text = "Chạy" })
+--   tab:AddTooltip(btn.Instance, { Text = "Chạy script chính" })
+function TabMeta:AddTooltip(targetInstance, opts)
+    return Components.Tooltip(targetInstance, self._theme, self._connMgr, opts)
 end
 
 function TabMeta:CreateConfigList(opts)
