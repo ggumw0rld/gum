@@ -59,7 +59,7 @@
         child controls can be nested inside and it still expands/collapses
         to the right size.
       * New: Components.TableList — scrollable row list with an optional
-        per-row toggle (checkbox) or click callback, for ESP-style
+        per-row toggle (checkbox) or click callback, for ???-style
         per-entity lists. :Refresh(newItems) rebuilds cheaply via its own
         rowConnMgr (same leak-avoidance pattern as Dropdown/MultiDropdown).
       * New: TabMeta:CreateSearchBar — filters every control created in
@@ -175,6 +175,24 @@ function Utils.GetKnobColor(tint)
         math.min(0.88 + tint.G * 0.12, 1),
         math.min(0.88 + tint.B * 0.12, 1)
     )
+end
+
+-- Standard "panel on top of the theme background" color set: a slightly
+-- brightened panel background plus a slightly darkened "recessed" background
+-- (used for inputs/tracks/bars sitting inside a panel), each paired with a
+-- contrast-safe text color. This is the exact {panelBg, textFor(panelBg)} /
+-- {darkBg, textFor(darkBg)} computation that used to be re-typed by hand at
+-- the top of nearly every component's ApplyTheme — centralized here so
+-- there's one place that defines "what a themed panel/input looks like".
+-- Free function (not a Theme method) because ApplyTheme(color, accent,
+-- isInitial) callbacks receive raw color/accent values, not the Theme
+-- object itself.
+function Utils.PanelColors(color, accent)
+    local panelBg = Utils.Brighten(color, 1.2)
+    local darkBg = Utils.Darken(color, 0.8)
+    return panelBg, darkBg,
+        Utils.GetTextColorFor(panelBg, accent),
+        Utils.GetTextColorFor(darkBg, accent)
 end
 
 function Utils.AddCorner(parent, radius)
@@ -346,6 +364,32 @@ function Animator.Tween(obj, props, duration, style, dir)
     return TweenService:Create(obj, TweenInfo.new(duration or 0.3, style or EASE, dir or EASE_OUT), props)
 end
 
+-- Shared "snap on first paint, tween on every theme change afterwards"
+-- dispatcher. `entries` is an array of { instance, props } pairs, where
+-- `props` is a table of {PropertyName = value} to apply to that instance.
+--
+-- This collapses the near-identical
+--     if isInitial then
+--         inst.Prop = value
+--     else
+--         TweenService:Create(inst, THEME_TWEEN_INFO, { Prop = value }):Play()
+--     end
+-- block that used to be hand-written, once per instance, inside every
+-- single component's ApplyTheme(color, accent, isInitial) — component code
+-- now only needs to compute the target colors and hand them to this.
+function Animator.ApplyTheme(isInitial, entries)
+    for _, entry in ipairs(entries) do
+        local inst, props = entry[1], entry[2]
+        if isInitial then
+            for prop, value in pairs(props) do
+                inst[prop] = value
+            end
+        else
+            TweenService:Create(inst, THEME_TWEEN_INFO, props):Play()
+        end
+    end
+end
+
 -- TweenService cannot tween ColorSequence, so gradient recoloring is done with a
 -- manual per-frame lerp between two flat colors (start/end keypoints).
 local activeGradientLerps = setmetatable({}, { __mode = "k" }) -- weak keys: entries self-clean if `grad` is GC'd/destroyed mid-lerp
@@ -453,11 +497,7 @@ function Theme:Apply(color, accent)
 end
 
 function Theme:PanelColors()
-    local panelBg = Utils.Brighten(self.Color, 1.2)
-    local darkBg = Utils.Darken(self.Color, 0.8)
-    return panelBg, darkBg,
-        Utils.GetTextColorFor(panelBg, self.Accent),
-        Utils.GetTextColorFor(darkBg, self.Accent)
+    return Utils.PanelColors(self.Color, self.Accent)
 end
 
 --============================================================
@@ -499,11 +539,7 @@ function Components.Label(parent, theme, connMgr, opts)
                 and Color3.new(textColor.R * 0.7, textColor.G * 0.7, textColor.B * 0.7)
                 or Color3.new(0.7 + textColor.R * 0.3, 0.7 + textColor.G * 0.3, 0.7 + textColor.B * 0.3)
         end
-        if isInitial then
-            label.TextColor3 = textColor
-        else
-            TweenService:Create(label, THEME_TWEEN_INFO, { TextColor3 = textColor }):Play()
-        end
+        Animator.ApplyTheme(isInitial, { { label, { TextColor3 = textColor } } })
     end
     theme:Subscribe(function(c, a, initial) self:ApplyTheme(c, a, initial) end)
     return self
@@ -538,17 +574,10 @@ function Components.Button(parent, theme, connMgr, opts)
 
     local self = { Instance = holder }
     function self:ApplyTheme(color, accent, isInitial)
-        local panelBg = Utils.Brighten(color, 1.2)
-        local textColor = Utils.GetTextColorFor(panelBg, accent)
-        if isInitial then
-            btn.BackgroundColor3 = panelBg
-            btn.TextColor3 = textColor
-        else
-            TweenService:Create(btn, THEME_TWEEN_INFO, {
-                BackgroundColor3 = panelBg,
-                TextColor3 = textColor,
-            }):Play()
-        end
+        local panelBg, _, textColor = Utils.PanelColors(color, accent)
+        Animator.ApplyTheme(isInitial, {
+            { btn, { BackgroundColor3 = panelBg, TextColor3 = textColor } },
+        })
     end
     theme:Subscribe(function(c, a, initial) self:ApplyTheme(c, a, initial) end)
     return self
@@ -626,15 +655,11 @@ function Components.Toggle(parent, theme, connMgr, opts)
         if opts.Callback then opts.Callback(state) end
     end
     function self:ApplyTheme(color, accent, isInitial)
-        local panelBg = Utils.Brighten(color, 1.2)
-        local textColor = Utils.GetTextColorFor(panelBg, accent)
-        if isInitial then
-            frame.BackgroundColor3 = panelBg
-            label.TextColor3 = textColor
-        else
-            TweenService:Create(frame, THEME_TWEEN_INFO, { BackgroundColor3 = panelBg }):Play()
-            TweenService:Create(label, THEME_TWEEN_INFO, { TextColor3 = textColor }):Play()
-        end
+        local panelBg, _, textColor = Utils.PanelColors(color, accent)
+        Animator.ApplyTheme(isInitial, {
+            { frame, { BackgroundColor3 = panelBg } },
+            { label, { TextColor3 = textColor } },
+        })
         restyle(isInitial)
     end
     theme:Subscribe(function(c, a, initial) self:ApplyTheme(c, a, initial) end)
@@ -761,27 +786,19 @@ function Components.Slider(parent, theme, connMgr, opts)
         if opts.Callback then opts.Callback(value) end
     end
     function self:ApplyTheme(color, accent, isInitial)
-        local panelBg = Utils.Brighten(color, 1.2)
-        local textColor = Utils.GetTextColorFor(panelBg, accent)
-        local darkBg = Utils.Darken(color, 0.8)
+        local panelBg, darkBg, textColor = Utils.PanelColors(color, accent)
         -- The drag handle is 20px tall against a 4px bar, so most of its
         -- visible area actually sits over the panel background rather than
         -- the thin track/fill strip beneath it — same contrast-safe color
         -- as the label, reusing `textColor`, keeps it themed instead of a
         -- fixed white that used to wash out on light themes.
-        if isInitial then
-            frame.BackgroundColor3 = panelBg
-            label.TextColor3 = textColor
-            bar.BackgroundColor3 = darkBg
-            fill.BackgroundColor3 = accent
-            drag.BackgroundColor3 = textColor
-        else
-            TweenService:Create(frame, THEME_TWEEN_INFO, { BackgroundColor3 = panelBg }):Play()
-            TweenService:Create(label, THEME_TWEEN_INFO, { TextColor3 = textColor }):Play()
-            TweenService:Create(bar, THEME_TWEEN_INFO, { BackgroundColor3 = darkBg }):Play()
-            TweenService:Create(fill, THEME_TWEEN_INFO, { BackgroundColor3 = accent }):Play()
-            TweenService:Create(drag, THEME_TWEEN_INFO, { BackgroundColor3 = textColor }):Play()
-        end
+        Animator.ApplyTheme(isInitial, {
+            { frame, { BackgroundColor3 = panelBg } },
+            { label, { TextColor3 = textColor } },
+            { bar, { BackgroundColor3 = darkBg } },
+            { fill, { BackgroundColor3 = accent } },
+            { drag, { BackgroundColor3 = textColor } },
+        })
     end
     theme:Subscribe(function(c, a, initial) self:ApplyTheme(c, a, initial) end)
     return self
@@ -880,24 +897,14 @@ function Components.NumberStepper(parent, theme, connMgr, opts)
     -- Programmatically set the value (used by Window:LoadConfig).
     function self:Set(v) setValue(v) end
     function self:ApplyTheme(color, accent, isInitial)
-        local panelBg = Utils.Brighten(color, 1.2)
-        local textColor = Utils.GetTextColorFor(panelBg, accent)
-        local darkBg = Utils.Darken(color, 0.8)
-        local boxTextColor = Utils.GetTextColorFor(darkBg, accent)
-        if isInitial then
-            frame.BackgroundColor3 = panelBg
-            label.TextColor3 = textColor
-            box.BackgroundColor3 = darkBg
-            box.TextColor3 = boxTextColor
-            minusBtn.BackgroundColor3 = darkBg
-            plusBtn.BackgroundColor3 = darkBg
-        else
-            TweenService:Create(frame, THEME_TWEEN_INFO, { BackgroundColor3 = panelBg }):Play()
-            TweenService:Create(label, THEME_TWEEN_INFO, { TextColor3 = textColor }):Play()
-            TweenService:Create(box, THEME_TWEEN_INFO, { BackgroundColor3 = darkBg, TextColor3 = boxTextColor }):Play()
-            TweenService:Create(minusBtn, THEME_TWEEN_INFO, { BackgroundColor3 = darkBg }):Play()
-            TweenService:Create(plusBtn, THEME_TWEEN_INFO, { BackgroundColor3 = darkBg }):Play()
-        end
+        local panelBg, darkBg, textColor, boxTextColor = Utils.PanelColors(color, accent)
+        Animator.ApplyTheme(isInitial, {
+            { frame, { BackgroundColor3 = panelBg } },
+            { label, { TextColor3 = textColor } },
+            { box, { BackgroundColor3 = darkBg, TextColor3 = boxTextColor } },
+            { minusBtn, { BackgroundColor3 = darkBg } },
+            { plusBtn, { BackgroundColor3 = darkBg } },
+        })
     end
     theme:Subscribe(function(c, a, initial) self:ApplyTheme(c, a, initial) end)
     return self
@@ -1042,19 +1049,13 @@ function Components.RadioGroup(parent, theme, connMgr, opts)
         select(v)
     end
     function self:ApplyTheme(color, accent, isInitial)
-        local panelBg = Utils.Brighten(color, 1.2)
-        local textColor = Utils.GetTextColorFor(panelBg, accent)
-        if isInitial then
-            container.BackgroundColor3 = panelBg
-            if titleLabel then titleLabel.TextColor3 = textColor end
-            for _, row in ipairs(rows) do row.label.TextColor3 = textColor end
-        else
-            TweenService:Create(container, THEME_TWEEN_INFO, { BackgroundColor3 = panelBg }):Play()
-            if titleLabel then TweenService:Create(titleLabel, THEME_TWEEN_INFO, { TextColor3 = textColor }):Play() end
-            for _, row in ipairs(rows) do
-                TweenService:Create(row.label, THEME_TWEEN_INFO, { TextColor3 = textColor }):Play()
-            end
+        local panelBg, _, textColor = Utils.PanelColors(color, accent)
+        local entries = { { container, { BackgroundColor3 = panelBg } } }
+        if titleLabel then table.insert(entries, { titleLabel, { TextColor3 = textColor } }) end
+        for _, row in ipairs(rows) do
+            table.insert(entries, { row.label, { TextColor3 = textColor } })
         end
+        Animator.ApplyTheme(isInitial, entries)
         restyleRows()
     end
     theme:Subscribe(function(c, a, initial) self:ApplyTheme(c, a, initial) end)
@@ -1112,23 +1113,12 @@ function Components.Textbox(parent, theme, connMgr, opts)
         if opts.Callback then opts.Callback(box.Text) end
     end
     function self:ApplyTheme(color, accent, isInitial)
-        local panelBg = Utils.Brighten(color, 1.2)
-        local darkBg = Utils.Darken(color, 0.8)
-        local labelTextColor = Utils.GetTextColorFor(panelBg, accent)
-        local boxTextColor = Utils.GetTextColorFor(darkBg, accent)
-        if isInitial then
-            frame.BackgroundColor3 = panelBg
-            label.TextColor3 = labelTextColor
-            box.BackgroundColor3 = darkBg
-            box.TextColor3 = boxTextColor
-        else
-            TweenService:Create(frame, THEME_TWEEN_INFO, { BackgroundColor3 = panelBg }):Play()
-            TweenService:Create(label, THEME_TWEEN_INFO, { TextColor3 = labelTextColor }):Play()
-            TweenService:Create(box, THEME_TWEEN_INFO, {
-                BackgroundColor3 = darkBg,
-                TextColor3 = boxTextColor,
-            }):Play()
-        end
+        local panelBg, darkBg, labelTextColor, boxTextColor = Utils.PanelColors(color, accent)
+        Animator.ApplyTheme(isInitial, {
+            { frame, { BackgroundColor3 = panelBg } },
+            { label, { TextColor3 = labelTextColor } },
+            { box, { BackgroundColor3 = darkBg, TextColor3 = boxTextColor } },
+        })
     end
     theme:Subscribe(function(c, a, initial) self:ApplyTheme(c, a, initial) end)
     return self
@@ -1180,13 +1170,9 @@ function Components.Divider(parent, theme, connMgr, opts)
         local mutedText = (Utils.GetLuminance(color) > 0.55)
             and Color3.new(textColor.R * 0.6, textColor.G * 0.6, textColor.B * 0.6)
             or Color3.new(0.55 + textColor.R * 0.25, 0.55 + textColor.G * 0.25, 0.55 + textColor.B * 0.25)
-        if isInitial then
-            if label then label.TextColor3 = mutedText end
-            line.BackgroundColor3 = darkBg
-        else
-            if label then TweenService:Create(label, THEME_TWEEN_INFO, { TextColor3 = mutedText }):Play() end
-            TweenService:Create(line, THEME_TWEEN_INFO, { BackgroundColor3 = darkBg }):Play()
-        end
+        local entries = { { line, { BackgroundColor3 = darkBg } } }
+        if label then table.insert(entries, { label, { TextColor3 = mutedText } }) end
+        Animator.ApplyTheme(isInitial, entries)
     end
     theme:Subscribe(function(c, a, initial) self:ApplyTheme(c, a, initial) end)
     return self
@@ -1339,15 +1325,12 @@ function Components.Paragraph(parent, theme, connMgr, opts)
         local bodyColor = (Utils.GetLuminance(color) > 0.55)
             and Color3.new(titleColor.R * 0.7, titleColor.G * 0.7, titleColor.B * 0.7)
             or Color3.new(0.7 + titleColor.R * 0.3, 0.7 + titleColor.G * 0.3, 0.7 + titleColor.B * 0.3)
-        if isInitial then
-            titleLabel.TextColor3 = titleColor
-            body.TextColor3 = bodyColor
-            if arrow then arrow.TextColor3 = titleColor end
-        else
-            TweenService:Create(titleLabel, THEME_TWEEN_INFO, { TextColor3 = titleColor }):Play()
-            TweenService:Create(body, THEME_TWEEN_INFO, { TextColor3 = bodyColor }):Play()
-            if arrow then TweenService:Create(arrow, THEME_TWEEN_INFO, { TextColor3 = titleColor }):Play() end
-        end
+        local entries = {
+            { titleLabel, { TextColor3 = titleColor } },
+            { body, { TextColor3 = bodyColor } },
+        }
+        if arrow then table.insert(entries, { arrow, { TextColor3 = titleColor } }) end
+        Animator.ApplyTheme(isInitial, entries)
     end
     theme:Subscribe(function(c, a, initial) self:ApplyTheme(c, a, initial) end)
     return self
@@ -1654,33 +1637,20 @@ function Components.Dropdown(parent, theme, connMgr, opts)
         rowConnMgr:DisconnectAll()
     end
     function self:ApplyTheme(color, accent, isInitial)
-        local panelBg = Utils.Brighten(color, 1.2)
-        local headerTextColor = Utils.GetTextColorFor(panelBg, accent)
+        local panelBg, darkBg, headerTextColor, searchTextColor = Utils.PanelColors(color, accent)
         local valueTextColor = (Utils.GetLuminance(panelBg) > 0.55) and Color3.fromRGB(90, 90, 100) or Color3.fromRGB(190, 190, 200)
-        local darkBg = Utils.Darken(color, 0.8)
-        if isInitial then
-            exp.Header.BackgroundColor3 = panelBg
-            exp.TitleLabel.TextColor3 = headerTextColor
-            valueLabel.TextColor3 = valueTextColor
-            for _, row in ipairs(optionButtons) do row.btn.BackgroundColor3 = baseColorFor(row.text) end
-            if searchable then
-                searchBox.BackgroundColor3 = darkBg
-                searchBox.TextColor3 = Utils.GetTextColorFor(darkBg, accent)
-            end
-        else
-            TweenService:Create(exp.Header, THEME_TWEEN_INFO, { BackgroundColor3 = panelBg }):Play()
-            TweenService:Create(exp.TitleLabel, THEME_TWEEN_INFO, { TextColor3 = headerTextColor }):Play()
-            TweenService:Create(valueLabel, THEME_TWEEN_INFO, { TextColor3 = valueTextColor }):Play()
-            for _, row in ipairs(optionButtons) do
-                TweenService:Create(row.btn, THEME_TWEEN_INFO, { BackgroundColor3 = baseColorFor(row.text) }):Play()
-            end
-            if searchable then
-                TweenService:Create(searchBox, THEME_TWEEN_INFO, {
-                    BackgroundColor3 = darkBg,
-                    TextColor3 = Utils.GetTextColorFor(darkBg, accent),
-                }):Play()
-            end
+        local entries = {
+            { exp.Header, { BackgroundColor3 = panelBg } },
+            { exp.TitleLabel, { TextColor3 = headerTextColor } },
+            { valueLabel, { TextColor3 = valueTextColor } },
+        }
+        for _, row in ipairs(optionButtons) do
+            table.insert(entries, { row.btn, { BackgroundColor3 = baseColorFor(row.text) } })
         end
+        if searchable then
+            table.insert(entries, { searchBox, { BackgroundColor3 = darkBg, TextColor3 = searchTextColor } })
+        end
+        Animator.ApplyTheme(isInitial, entries)
     end
     theme:Subscribe(function(c, a, initial) self:ApplyTheme(c, a, initial) end)
     return self
@@ -1915,33 +1885,20 @@ function Components.MultiDropdown(parent, theme, connMgr, opts)
         rowConnMgr:DisconnectAll()
     end
     function self:ApplyTheme(color, accent, isInitial)
-        local panelBg = Utils.Brighten(color, 1.2)
-        local headerTextColor = Utils.GetTextColorFor(panelBg, accent)
+        local panelBg, darkBg, headerTextColor, searchTextColor = Utils.PanelColors(color, accent)
         local valueTextColor = (Utils.GetLuminance(panelBg) > 0.55) and Color3.fromRGB(90, 90, 100) or Color3.fromRGB(190, 190, 200)
-        local darkBg = Utils.Darken(color, 0.8)
-        if isInitial then
-            exp.Header.BackgroundColor3 = panelBg
-            exp.TitleLabel.TextColor3 = headerTextColor
-            valueLabel.TextColor3 = valueTextColor
-            for _, row in ipairs(rows) do row.btn.BackgroundColor3 = baseColorFor(row.text) end
-            if searchable then
-                searchBox.BackgroundColor3 = darkBg
-                searchBox.TextColor3 = Utils.GetTextColorFor(darkBg, accent)
-            end
-        else
-            TweenService:Create(exp.Header, THEME_TWEEN_INFO, { BackgroundColor3 = panelBg }):Play()
-            TweenService:Create(exp.TitleLabel, THEME_TWEEN_INFO, { TextColor3 = headerTextColor }):Play()
-            TweenService:Create(valueLabel, THEME_TWEEN_INFO, { TextColor3 = valueTextColor }):Play()
-            for _, row in ipairs(rows) do
-                TweenService:Create(row.btn, THEME_TWEEN_INFO, { BackgroundColor3 = baseColorFor(row.text) }):Play()
-            end
-            if searchable then
-                TweenService:Create(searchBox, THEME_TWEEN_INFO, {
-                    BackgroundColor3 = darkBg,
-                    TextColor3 = Utils.GetTextColorFor(darkBg, accent),
-                }):Play()
-            end
+        local entries = {
+            { exp.Header, { BackgroundColor3 = panelBg } },
+            { exp.TitleLabel, { TextColor3 = headerTextColor } },
+            { valueLabel, { TextColor3 = valueTextColor } },
+        }
+        for _, row in ipairs(rows) do
+            table.insert(entries, { row.btn, { BackgroundColor3 = baseColorFor(row.text) } })
         end
+        if searchable then
+            table.insert(entries, { searchBox, { BackgroundColor3 = darkBg, TextColor3 = searchTextColor } })
+        end
+        Animator.ApplyTheme(isInitial, entries)
     end
     theme:Subscribe(function(c, a, initial) self:ApplyTheme(c, a, initial) end)
     return self
@@ -2345,41 +2302,27 @@ function Components.ColorPicker(parent, theme, connMgr, opts)
         refresh()
     end
     function self:ApplyTheme(color, accent, isInitial)
-        local panelBg = Utils.Brighten(color, 1.2)
-        local headerTextColor = Utils.GetTextColorFor(panelBg, accent)
+        local panelBg, darkBg, headerTextColor, boxTextColor = Utils.PanelColors(color, accent)
         local hexTextColor = (Utils.GetLuminance(panelBg) > 0.55) and Color3.fromRGB(90, 90, 100) or Color3.fromRGB(190, 190, 200)
         -- The RGB/HEX numeric input boxes previously stayed a fixed dark
         -- gray no matter the theme (unlike Components.Textbox's identical-
         -- purpose input, which always tracks Utils.Darken(color, 0.8)) — now
         -- themed the same way, for consistency with every other input field
         -- in the library.
-        local darkBg = Utils.Darken(color, 0.8)
-        local boxTextColor = Utils.GetTextColorFor(darkBg, accent)
-        if isInitial then
-            exp.Header.BackgroundColor3 = panelBg
-            exp.TitleLabel.TextColor3 = headerTextColor
-            hexLabel.TextColor3 = hexTextColor
-            hexRowLabel.TextColor3 = headerTextColor
-            hexBox.BackgroundColor3 = darkBg
-            hexBox.TextColor3 = boxTextColor
-            for _, lbl in ipairs(rgbLabels) do lbl.TextColor3 = headerTextColor end
-            for _, box in ipairs({ rBox, gBox, bBox }) do
-                box.BackgroundColor3 = darkBg
-                box.TextColor3 = boxTextColor
-            end
-        else
-            TweenService:Create(exp.Header, THEME_TWEEN_INFO, { BackgroundColor3 = panelBg }):Play()
-            TweenService:Create(exp.TitleLabel, THEME_TWEEN_INFO, { TextColor3 = headerTextColor }):Play()
-            TweenService:Create(hexLabel, THEME_TWEEN_INFO, { TextColor3 = hexTextColor }):Play()
-            TweenService:Create(hexRowLabel, THEME_TWEEN_INFO, { TextColor3 = headerTextColor }):Play()
-            TweenService:Create(hexBox, THEME_TWEEN_INFO, { BackgroundColor3 = darkBg, TextColor3 = boxTextColor }):Play()
-            for _, lbl in ipairs(rgbLabels) do
-                TweenService:Create(lbl, THEME_TWEEN_INFO, { TextColor3 = headerTextColor }):Play()
-            end
-            for _, box in ipairs({ rBox, gBox, bBox }) do
-                TweenService:Create(box, THEME_TWEEN_INFO, { BackgroundColor3 = darkBg, TextColor3 = boxTextColor }):Play()
-            end
+        local entries = {
+            { exp.Header, { BackgroundColor3 = panelBg } },
+            { exp.TitleLabel, { TextColor3 = headerTextColor } },
+            { hexLabel, { TextColor3 = hexTextColor } },
+            { hexRowLabel, { TextColor3 = headerTextColor } },
+            { hexBox, { BackgroundColor3 = darkBg, TextColor3 = boxTextColor } },
+        }
+        for _, lbl in ipairs(rgbLabels) do
+            table.insert(entries, { lbl, { TextColor3 = headerTextColor } })
         end
+        for _, box in ipairs({ rBox, gBox, bBox }) do
+            table.insert(entries, { box, { BackgroundColor3 = darkBg, TextColor3 = boxTextColor } })
+        end
+        Animator.ApplyTheme(isInitial, entries)
     end
     theme:Subscribe(function(c, a, initial) self:ApplyTheme(c, a, initial) end)
     return self
@@ -2615,24 +2558,18 @@ function Components.GradientPicker(parent, theme, connMgr, opts)
 
     local self = { Instance = toggleFrame, GridInstance = gridContainer }
     function self:ApplyTheme(color, accent, isInitial)
-        local panelBg = Utils.Brighten(color, 1.2)
-        local textColor = Utils.GetTextColorFor(panelBg, accent)
+        local panelBg, _, textColor = Utils.PanelColors(color, accent)
         -- Retint the track in both states now — previously this only fired
         -- when `enabled` was false, so picking a new theme while gradient
         -- mode was ON left the toggle showing the *old* accent color.
         local trackColor = enabled and Utils.Brighten(accent, 1.15) or Utils.Darken(color, 0.8)
         local knobColor = Utils.GetKnobColor(accent)
-        if isInitial then
-            toggleFrame.BackgroundColor3 = panelBg
-            toggleLabel.TextColor3 = textColor
-            track.BackgroundColor3 = trackColor
-            knob.BackgroundColor3 = knobColor
-        else
-            TweenService:Create(toggleFrame, THEME_TWEEN_INFO, { BackgroundColor3 = panelBg }):Play()
-            TweenService:Create(toggleLabel, THEME_TWEEN_INFO, { TextColor3 = textColor }):Play()
-            TweenService:Create(track, THEME_TWEEN_INFO, { BackgroundColor3 = trackColor }):Play()
-            TweenService:Create(knob, THEME_TWEEN_INFO, { BackgroundColor3 = knobColor }):Play()
-        end
+        Animator.ApplyTheme(isInitial, {
+            { toggleFrame, { BackgroundColor3 = panelBg } },
+            { toggleLabel, { TextColor3 = textColor } },
+            { track, { BackgroundColor3 = trackColor } },
+            { knob, { BackgroundColor3 = knobColor } },
+        })
         if enabled and not selectedIndex then
             pushGradientColors(isInitial)
         end
@@ -2783,15 +2720,11 @@ function Components.Keybind(parent, theme, connMgr, opts)
         if opts.Callback then opts.Callback(currentKey) end
     end
     function self:ApplyTheme(color, accent, isInitial)
-        local panelBg = Utils.Brighten(color, 1.2)
-        local textColor = Utils.GetTextColorFor(panelBg, accent)
-        if isInitial then
-            frame.BackgroundColor3 = panelBg
-            label.TextColor3 = textColor
-        else
-            TweenService:Create(frame, THEME_TWEEN_INFO, { BackgroundColor3 = panelBg }):Play()
-            TweenService:Create(label, THEME_TWEEN_INFO, { TextColor3 = textColor }):Play()
-        end
+        local panelBg, _, textColor = Utils.PanelColors(color, accent)
+        Animator.ApplyTheme(isInitial, {
+            { frame, { BackgroundColor3 = panelBg } },
+            { label, { TextColor3 = textColor } },
+        })
         restyleKeyBtn(isInitial)
     end
     theme:Subscribe(function(c, a, initial) self:ApplyTheme(c, a, initial) end)
@@ -2847,15 +2780,11 @@ function Components.Accordion(parent, theme, connMgr, opts)
     self._body, self._theme, self._connMgr, self._order = body, theme, connMgr, 0
 
     function self:ApplyTheme(color, accent, isInitial)
-        local panelBg = Utils.Brighten(color, 1.2)
-        local headerTextColor = Utils.GetTextColorFor(panelBg, accent)
-        if isInitial then
-            exp.Header.BackgroundColor3 = panelBg
-            exp.TitleLabel.TextColor3 = headerTextColor
-        else
-            TweenService:Create(exp.Header, THEME_TWEEN_INFO, { BackgroundColor3 = panelBg }):Play()
-            TweenService:Create(exp.TitleLabel, THEME_TWEEN_INFO, { TextColor3 = headerTextColor }):Play()
-        end
+        local panelBg, _, headerTextColor = Utils.PanelColors(color, accent)
+        Animator.ApplyTheme(isInitial, {
+            { exp.Header, { BackgroundColor3 = panelBg } },
+            { exp.TitleLabel, { TextColor3 = headerTextColor } },
+        })
     end
     theme:Subscribe(function(c, a, initial) self:ApplyTheme(c, a, initial) end)
     return self
@@ -2901,7 +2830,7 @@ end
 
 -- ---------- TableList ----------
 -- Danh sách cuộn được, mỗi dòng có Text/SubText + checkbox riêng (vd: bật
--- ESP cho từng player). opts.Items = { { Text, SubText, Toggled, OnToggle(state), OnClick } }.
+-- ??? cho từng player). opts.Items = { { Text, SubText, Toggled, OnToggle(state), OnClick } }.
 -- :Refresh(newItems) rebuild toàn bộ (khi player join/leave), dùng lại
 -- pattern rowConnMgr như Dropdown/MultiDropdown để không leak connection.
 function Components.TableList(parent, theme, connMgr, opts)
@@ -3059,34 +2988,24 @@ function Components.TableList(parent, theme, connMgr, opts)
     end
     function self:Destroy() rowConnMgr:DisconnectAll() end
     function self:ApplyTheme(color, accent, isInitial)
-        local panelBg = Utils.Brighten(color, 1.2)
-        local textColor = Utils.GetTextColorFor(panelBg, accent)
+        local panelBg, _, textColor = Utils.PanelColors(color, accent)
         local darkBg = Utils.Darken(color, 0.75)
         local rowBg = Utils.Darken(color, 0.85)
         local subColor = Utils.GetTextColorFor(rowBg, accent)
-        if isInitial then
-            container.BackgroundColor3 = panelBg
-            if headerLabel then headerLabel.TextColor3 = textColor end
-            emptyLabel.TextColor3 = subColor
-            for _, row in ipairs(rows) do
-                row.holder.BackgroundColor3 = rowBg
-                row.textLabel.TextColor3 = textColor
-                if row.subLabel then row.subLabel.TextColor3 = subColor end
-                if row.check then row.check.BackgroundColor3 = row.toggled and accent or darkBg end
-            end
-        else
-            TweenService:Create(container, THEME_TWEEN_INFO, { BackgroundColor3 = panelBg }):Play()
-            if headerLabel then TweenService:Create(headerLabel, THEME_TWEEN_INFO, { TextColor3 = textColor }):Play() end
-            TweenService:Create(emptyLabel, THEME_TWEEN_INFO, { TextColor3 = subColor }):Play()
-            for _, row in ipairs(rows) do
-                TweenService:Create(row.holder, THEME_TWEEN_INFO, { BackgroundColor3 = rowBg }):Play()
-                TweenService:Create(row.textLabel, THEME_TWEEN_INFO, { TextColor3 = textColor }):Play()
-                if row.subLabel then TweenService:Create(row.subLabel, THEME_TWEEN_INFO, { TextColor3 = subColor }):Play() end
-                if row.check then
-                    TweenService:Create(row.check, THEME_TWEEN_INFO, { BackgroundColor3 = row.toggled and accent or darkBg }):Play()
-                end
+        local entries = {
+            { container, { BackgroundColor3 = panelBg } },
+            { emptyLabel, { TextColor3 = subColor } },
+        }
+        if headerLabel then table.insert(entries, { headerLabel, { TextColor3 = textColor } }) end
+        for _, row in ipairs(rows) do
+            table.insert(entries, { row.holder, { BackgroundColor3 = rowBg } })
+            table.insert(entries, { row.textLabel, { TextColor3 = textColor } })
+            if row.subLabel then table.insert(entries, { row.subLabel, { TextColor3 = subColor } }) end
+            if row.check then
+                table.insert(entries, { row.check, { BackgroundColor3 = row.toggled and accent or darkBg } })
             end
         end
+        Animator.ApplyTheme(isInitial, entries)
     end
     theme:Subscribe(function(c, a, initial) self:ApplyTheme(c, a, initial) end)
     return self
@@ -3159,20 +3078,14 @@ function Components.ProgressBar(parent, theme, connMgr, opts)
         TweenService:Create(fill, info, { Size = UDim2.new(alpha, 0, 1, 0) }):Play()
     end
     function self:ApplyTheme(color, accent, isInitial)
-        local panelBg = Utils.Brighten(color, 1.2)
-        local textColor = Utils.GetTextColorFor(panelBg, accent)
-        local darkBg = Utils.Darken(color, 0.8)
-        if isInitial then
-            frame.BackgroundColor3 = panelBg
-            if label then label.TextColor3 = textColor end
-            track.BackgroundColor3 = darkBg
-            fill.BackgroundColor3 = accent
-        else
-            TweenService:Create(frame, THEME_TWEEN_INFO, { BackgroundColor3 = panelBg }):Play()
-            if label then TweenService:Create(label, THEME_TWEEN_INFO, { TextColor3 = textColor }):Play() end
-            TweenService:Create(track, THEME_TWEEN_INFO, { BackgroundColor3 = darkBg }):Play()
-            TweenService:Create(fill, THEME_TWEEN_INFO, { BackgroundColor3 = accent }):Play()
-        end
+        local panelBg, darkBg, textColor = Utils.PanelColors(color, accent)
+        local entries = {
+            { frame, { BackgroundColor3 = panelBg } },
+            { track, { BackgroundColor3 = darkBg } },
+            { fill, { BackgroundColor3 = accent } },
+        }
+        if label then table.insert(entries, { label, { TextColor3 = textColor } }) end
+        Animator.ApplyTheme(isInitial, entries)
     end
     theme:Subscribe(function(c, a, initial) self:ApplyTheme(c, a, initial) end)
     return self
@@ -3256,13 +3169,10 @@ function Components.Tooltip(target, theme, connMgr, opts)
     function self:ApplyTheme(color, accent, isInitial)
         local bg = Utils.Darken(color, 0.6)
         local border = Utils.Brighten(color, 1.6)
-        if isInitial then
-            bubble.BackgroundColor3 = bg
-            stroke.Color = border
-        else
-            TweenService:Create(bubble, THEME_TWEEN_INFO, { BackgroundColor3 = bg }):Play()
-            TweenService:Create(stroke, THEME_TWEEN_INFO, { Color = border }):Play()
-        end
+        Animator.ApplyTheme(isInitial, {
+            { bubble, { BackgroundColor3 = bg } },
+            { stroke, { Color = border } },
+        })
     end
     theme:Subscribe(function(c, a, initial) self:ApplyTheme(c, a, initial) end)
     return self
@@ -3357,13 +3267,10 @@ function Components.SegmentedControl(parent, theme, connMgr, opts)
     end
     function self:ApplyTheme(color, accent, isInitial)
         local outerBg = Utils.Darken(color, 0.85)
-        if isInitial then
-            outer.BackgroundColor3 = outerBg
-            highlight.BackgroundColor3 = accent
-        else
-            TweenService:Create(outer, THEME_TWEEN_INFO, { BackgroundColor3 = outerBg }):Play()
-            TweenService:Create(highlight, THEME_TWEEN_INFO, { BackgroundColor3 = accent }):Play()
-        end
+        Animator.ApplyTheme(isInitial, {
+            { outer, { BackgroundColor3 = outerBg } },
+            { highlight, { BackgroundColor3 = accent } },
+        })
         restyle()
     end
     theme:Subscribe(function(c, a, initial) self:ApplyTheme(c, a, initial) end)
@@ -3473,18 +3380,14 @@ function Components.LogPanel(parent, theme, connMgr, opts)
     end
 
     function self:ApplyTheme(color, accent, isInitial)
-        local panelBg = Utils.Brighten(color, 1.2)
-        local textColor = Utils.GetTextColorFor(panelBg, accent)
+        local panelBg, _, textColor = Utils.PanelColors(color, accent)
         local darkBg = Utils.Darken(color, 0.85)
-        if isInitial then
-            container.BackgroundColor3 = panelBg
-            if headerLabel then headerLabel.TextColor3 = textColor end
-            scroller.BackgroundColor3 = darkBg
-        else
-            TweenService:Create(container, THEME_TWEEN_INFO, { BackgroundColor3 = panelBg }):Play()
-            if headerLabel then TweenService:Create(headerLabel, THEME_TWEEN_INFO, { TextColor3 = textColor }):Play() end
-            TweenService:Create(scroller, THEME_TWEEN_INFO, { BackgroundColor3 = darkBg }):Play()
-        end
+        local entries = {
+            { container, { BackgroundColor3 = panelBg } },
+            { scroller, { BackgroundColor3 = darkBg } },
+        }
+        if headerLabel then table.insert(entries, { headerLabel, { TextColor3 = textColor } }) end
+        Animator.ApplyTheme(isInitial, entries)
     end
     theme:Subscribe(function(c, a, initial) self:ApplyTheme(c, a, initial) end)
     return self
@@ -4123,20 +4026,13 @@ function Window:_buildChrome(title, originalSize)
         local strokeColor = Utils.Brighten(color, 1.3)
         local titleTextColor = Utils.GetTextColorFor(darkTitle, accent)
 
-        if isInitial then
-            mainFrame.BackgroundColor3 = color
-            titleBar.BackgroundColor3 = darkTitle
-            tabContainer.BackgroundColor3 = darkTab
-            stroke.Color = strokeColor
-            titleLabel.TextColor3 = titleTextColor
-        else
-            local info = THEME_TWEEN_INFO
-            TweenService:Create(mainFrame, info, { BackgroundColor3 = color }):Play()
-            TweenService:Create(titleBar, info, { BackgroundColor3 = darkTitle }):Play()
-            TweenService:Create(tabContainer, info, { BackgroundColor3 = darkTab }):Play()
-            TweenService:Create(stroke, info, { Color = strokeColor }):Play()
-            TweenService:Create(titleLabel, info, { TextColor3 = titleTextColor }):Play()
-        end
+        Animator.ApplyTheme(isInitial, {
+            { mainFrame, { BackgroundColor3 = color } },
+            { titleBar, { BackgroundColor3 = darkTitle } },
+            { tabContainer, { BackgroundColor3 = darkTab } },
+            { stroke, { Color = strokeColor } },
+            { titleLabel, { TextColor3 = titleTextColor } },
+        })
 
         self:_restyleTabButtons(color, accent)
     end)
@@ -5125,17 +5021,11 @@ function TabMeta:CreateSearchBar(opts)
 
     local self2 = { Instance = frame }
     function self2:ApplyTheme(color, accent, isInitial)
-        local panelBg = Utils.Brighten(color, 1.2)
-        local darkBg = Utils.Darken(color, 0.8)
-        local textColor = Utils.GetTextColorFor(darkBg, accent)
-        if isInitial then
-            frame.BackgroundColor3 = panelBg
-            box.BackgroundColor3 = darkBg
-            box.TextColor3 = textColor
-        else
-            TweenService:Create(frame, THEME_TWEEN_INFO, { BackgroundColor3 = panelBg }):Play()
-            TweenService:Create(box, THEME_TWEEN_INFO, { BackgroundColor3 = darkBg, TextColor3 = textColor }):Play()
-        end
+        local panelBg, darkBg, _, textColor = Utils.PanelColors(color, accent)
+        Animator.ApplyTheme(isInitial, {
+            { frame, { BackgroundColor3 = panelBg } },
+            { box, { BackgroundColor3 = darkBg, TextColor3 = textColor } },
+        })
     end
     self._theme:Subscribe(function(c, a, initial) self2:ApplyTheme(c, a, initial) end)
     return self2
