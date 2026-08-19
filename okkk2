@@ -1,6 +1,6 @@
 --[[
     ============================================================
-    Selenix UI Library — Modular Rewrite (FIXED + Keybind)
+    Selenix UI Library — Modular Rewrite (FIXED + Keybind + Extras)
     ============================================================
     Same visual/behavioural feature set as the original monolithic
     script, reorganized into independent modules:
@@ -10,8 +10,9 @@
         Theme      -> holds the current {Color, Accent}, notifies subscribers on change
         Window     -> chrome: loading screen, titlebar, drag, resize, minimize
         Components -> factory functions for each control (Button, Label, Toggle, Slider,
-                       Textbox, Dropdown, MultiDropdown, ColorPicker, ThemeGrid, GradientPicker,
-                       Keybind, Notification)
+                       NumberStepper, Textbox, Dropdown, MultiDropdown, RadioGroup,
+                       ColorPicker, ThemeGrid, GradientPicker, Keybind, Accordion,
+                       TableList, Notification)
         Tab        -> a page + its tab button; exposes Tab:AddXxx(opts) which delegates to Components
         Config     -> Flags + SaveConfig/LoadConfig (writefile/readfile via executor)
 
@@ -37,17 +38,74 @@
         growing pile of dead connections into the window's shared
         ConnectionManager every time :Refresh() is called (e.g. every
         Save/Delete in CreateConfigList).
-      * New: Components.Keybind + TabMeta:CreateKeybind, following the
+      * Components.Keybind + TabMeta:CreateKeybind, following the
         same {Instance, Get, Set, ApplyTheme} contract as Toggle/Slider/
         Textbox, so it auto-registers into SaveConfig/LoadConfig via
         opts.Flag. Includes a per-window "only one Keybind capturing at a
         time" guard (keybindListening) so rebinding one Keybind can't
         spuriously fire another Keybind's Pressed() callback.
-      * New (this revision): a batch of additional controls — Checkbox,
-        RadioGroup, Stepper (numeric +/-), SearchBox, ProgressBar, Rating,
-        Image, Textarea (multi-line), Table (read-only data grid), Badge,
-        and a shared Utils.AddTooltip helper any control's .Instance can be
-        wired to. See "MODULE: Components (extra controls)" below.
+      * Fix: Toggle:Set / Textbox:Set / Keybind:Set now fire opts.Callback,
+        so Window:LoadConfig actually rewires consumer-side logic instead
+        of only repainting the control.
+      * Fix: Slider Min > Max is now swapped instead of falling back to a
+        range of 1 (which produced silently-wrong alpha math).
+      * New: Components.NumberStepper — textbox + -/+ buttons, easier to
+        drive precisely on touch than dragging Slider.
+      * New: Components.RadioGroup — always-expanded single-select list,
+        for 2-4 option choices that don't need Dropdown's collapse.
+      * New: Components.Accordion (+ AccordionMeta) — reuses
+        ExpandableHeader but self-measures its body height from the
+        content UIListLayout instead of a fixed BodyHeight, so any mix of
+        child controls can be nested inside and it still expands/collapses
+        to the right size.
+      * New: Components.TableList — scrollable row list with an optional
+        per-row toggle (checkbox) or click callback, for ESP-style
+        per-entity lists. :Refresh(newItems) rebuilds cheaply via its own
+        rowConnMgr (same leak-avoidance pattern as Dropdown/MultiDropdown).
+      * New: TabMeta:CreateSearchBar — filters every control created in
+        that tab (via a generic wrapper around every TabMeta:CreateXxx
+        that tags obj.Instance with a searchable attribute) by Text/Title,
+        case-insensitive substring match, toggling Visible so
+        UIListLayout reflows automatically.
+
+    PATCH NOTES (this file):
+      * Fix: Accordion no longer skips its first-open height priming when
+        DefaultOpen is false/omitted — previously :recompute() only ran
+        inside the DefaultOpen branch, so the FIRST manual open of an
+        accordion snapped to the stale BodyHeight=0 default (closedHeight
+        + 6px) before AbsoluteContentSize fired and corrected it, which
+        looked like the body "jumping"/overlapping the header on open.
+      * Fix: TabMeta:CreateSearchBar's input box now gets both left AND
+        right UIPadding (previously only left was passed to
+        Utils.AddPadding, so the placeholder/typed text sat flush against
+        the right edge while the left side had a 10px gap).
+      * Fix: Components.Paragraph now waits two Heartbeat frames (matching
+        the pattern already used by Components.Notification) before
+        measuring body.AbsoluteSize.Y for the clipped bodyClip height —
+        one frame was not always enough for a multi-line TextLabel's
+        AutomaticSize to fully converge, which cropped the last line.
+      * Fix: Components.TableList — the per-row checkmark TextLabel was
+        being assigned to a NEW block-scoped `local mark` inside the
+        `if hasToggle then` branch instead of the outer `mark` variable
+        declared alongside `check`. That left the outer `mark` permanently
+        nil, so MouseButton1Click handler's `TweenService:Create(mark, ...)`
+        threw on every click — which meant the following lines, including
+        `item.OnToggle(toggled)`, never ran. Any consumer callback wired to
+        a TableList row's checkbox was silently dead. Fixed by assigning to
+        the outer `mark` instead of shadowing it.
+      * Change: Components.RadioGroup no longer supports deselecting the
+        currently-selected option by clicking it again (previously reused
+        Dropdown's toggle-off-on-reclick behavior). A radio group should
+        always have exactly one option selected once a Default is provided;
+        Dropdown keeps its original deselect-on-reclick behavior since an
+        optional "nothing selected" dropdown state is still a legitimate,
+        commonly-used pattern.
+      * Robustness: Dropdown/MultiDropdown's searchable variant no longer
+        mutates the caller's own `opts.OnToggle` in place to hook "clear
+        filter on close". It now reads/wraps the original callback into a
+        fresh local closure instead, so the `opts` table handed in by the
+        caller is left untouched (relevant if the same opts table were ever
+        reused across multiple CreateDropdown/CreateMultiDropdown calls).
     ============================================================
 ]]
 
@@ -565,6 +623,7 @@ function Components.Toggle(parent, theme, connMgr, opts)
         state = v
         label.Text = labelText()
         restyle(false)
+        if opts.Callback then opts.Callback(state) end
     end
     function self:ApplyTheme(color, accent, isInitial)
         local panelBg = Utils.Brighten(color, 1.2)
@@ -589,12 +648,13 @@ end
 -- drive a 0-1 float parameter from this control at all.
 function Components.Slider(parent, theme, connMgr, opts)
     local min, max = opts.Min or 0, opts.Max or 100
-    -- Guard against a misconfigured Min == Max (or Min > Max): every alpha
-    -- calculation below divides by (max - min), which previously produced
-    -- NaN positions/sizes (and a NaN drag value) instead of just clamping.
+    -- Guard against a misconfigured Min == Max, or Min > Max: every alpha
+    -- calculation below divides by (max - min) and Roblox's math.clamp
+    -- requires min <= max, so swap them first instead of erroring out /
+    -- producing NaN positions, sizes, and drag values.
+    if min > max then min, max = max, min end
     local range = (max > min) and (max - min) or 1
     local decimals = math.max(math.floor(opts.Decimals or 0), 0)
-    local step = 10 ^ (-decimals) -- smallest representable increment at this precision
 
     local function roundTo(n)
         local mult = 10 ^ decimals
@@ -727,6 +787,280 @@ function Components.Slider(parent, theme, connMgr, opts)
     return self
 end
 
+-- ---------- NumberStepper ----------
+-- Textbox nhập số trực tiếp + nút -/+ bước theo opts.Step. Dễ thao tác trên
+-- Android hơn Slider (kéo tay chính xác khó), phù hợp cho giá trị rời rạc
+-- (số lượng, index, iteration count...).
+function Components.NumberStepper(parent, theme, connMgr, opts)
+    local min, max = opts.Min or 0, opts.Max or 100
+    if min > max then min, max = max, min end
+    local step = opts.Step or 1
+    local decimals = math.max(math.floor(opts.Decimals or 0), 0)
+    local suffix = opts.Suffix or ""
+    local function escapePattern(s)
+        return (s:gsub("[%(%)%.%%%+%-%*%?%[%]%^%$]", "%%%1"))
+    end
+    local suffixPattern = escapePattern(suffix) .. "$"
+
+    local function roundTo(n)
+        local mult = 10 ^ decimals
+        return math.round(n * mult) / mult
+    end
+    local function fmt(n)
+        if decimals <= 0 then return tostring(math.floor(n + 0.5)) end
+        return string.format("%." .. decimals .. "f", n)
+    end
+
+    local value = roundTo(math.clamp(opts.Default or min, min, max))
+
+    local frame = Instance.new("Frame")
+    frame.Size = opts.Size or UDim2.new(1, 0, 0, 40)
+    frame.LayoutOrder = opts.LayoutOrder or 0
+    frame.Parent = parent
+    Utils.AddCorner(frame, UDim.new(0, 8))
+
+    local label = Instance.new("TextLabel")
+    label.Size = UDim2.new(1, -160, 1, 0)
+    label.Position = UDim2.new(0, 10, 0, 0)
+    label.BackgroundTransparency = 1
+    label.Text = opts.Text or "Giá trị"
+    label.TextColor3 = Color3.fromRGB(255, 255, 255)
+    label.TextXAlignment = Enum.TextXAlignment.Left
+    label.Font = Enum.Font.GothamBold
+    label.TextSize = 15
+    label.Parent = frame
+
+    local function makeStepBtn(xOffsetFromRight, text)
+        local b = Instance.new("TextButton")
+        b.AnchorPoint = Vector2.new(1, 0.5)
+        b.Position = UDim2.new(1, xOffsetFromRight, 0.5, 0)
+        b.Size = UDim2.new(0, 26, 0, 26)
+        b.Text = text
+        b.TextColor3 = Color3.fromRGB(255, 255, 255)
+        b.Font = Enum.Font.GothamBold
+        b.TextSize = 16
+        b.AutoButtonColor = false
+        b.Parent = frame
+        Utils.AddCorner(b, UDim.new(0, 6))
+        Animator.AddThickenStroke(b, connMgr)
+        return b
+    end
+
+    local plusBtn = makeStepBtn(-10, "+")
+    local box = Instance.new("TextBox")
+    box.AnchorPoint = Vector2.new(1, 0.5)
+    box.Position = UDim2.new(1, -42, 0.5, 0)
+    box.Size = UDim2.new(0, 60, 0, 28)
+    box.Text = fmt(value) .. suffix
+    box.TextColor3 = Color3.fromRGB(255, 255, 255)
+    box.Font = Enum.Font.Gotham
+    box.TextSize = 14
+    box.ClearTextOnFocus = false
+    box.Parent = frame
+    Utils.AddCorner(box, UDim.new(0, 6))
+    local minusBtn = makeStepBtn(-108, "−")
+
+    local function setValue(v)
+        v = roundTo(math.clamp(v, min, max))
+        value = v
+        if not box:IsFocused() then box.Text = fmt(value) .. suffix end
+        if opts.Callback then opts.Callback(value) end
+    end
+
+    connMgr:Track(minusBtn.MouseButton1Click:Connect(function() setValue(value - step) end))
+    connMgr:Track(plusBtn.MouseButton1Click:Connect(function() setValue(value + step) end))
+    connMgr:Track(box.FocusLost:Connect(function()
+        local numStr = box.Text:gsub(suffixPattern, ""):gsub("[^%d%.%-]", "")
+        local n = tonumber(numStr)
+        if n then setValue(n) else box.Text = fmt(value) .. suffix end
+    end))
+
+    local self = { Instance = frame }
+    function self:Get() return value end
+    -- Programmatically set the value (used by Window:LoadConfig).
+    function self:Set(v) setValue(v) end
+    function self:ApplyTheme(color, accent, isInitial)
+        local panelBg = Utils.Brighten(color, 1.2)
+        local textColor = Utils.GetTextColorFor(panelBg, accent)
+        local darkBg = Utils.Darken(color, 0.8)
+        local boxTextColor = Utils.GetTextColorFor(darkBg, accent)
+        if isInitial then
+            frame.BackgroundColor3 = panelBg
+            label.TextColor3 = textColor
+            box.BackgroundColor3 = darkBg
+            box.TextColor3 = boxTextColor
+            minusBtn.BackgroundColor3 = darkBg
+            plusBtn.BackgroundColor3 = darkBg
+        else
+            TweenService:Create(frame, THEME_TWEEN_INFO, { BackgroundColor3 = panelBg }):Play()
+            TweenService:Create(label, THEME_TWEEN_INFO, { TextColor3 = textColor }):Play()
+            TweenService:Create(box, THEME_TWEEN_INFO, { BackgroundColor3 = darkBg, TextColor3 = boxTextColor }):Play()
+            TweenService:Create(minusBtn, THEME_TWEEN_INFO, { BackgroundColor3 = darkBg }):Play()
+            TweenService:Create(plusBtn, THEME_TWEEN_INFO, { BackgroundColor3 = darkBg }):Play()
+        end
+    end
+    theme:Subscribe(function(c, a, initial) self:ApplyTheme(c, a, initial) end)
+    return self
+end
+
+-- ---------- RadioGroup ----------
+-- Chọn 1-trong-N hiển thị luôn cả list (không cần mở/đóng như Dropdown),
+-- hợp khi chỉ 2-4 lựa chọn.
+--
+-- FIX: previously reused Dropdown's "click the selected option again to
+-- deselect" behavior, which left a RadioGroup able to end up with NO
+-- option selected — unexpected for a control whose whole point is "always
+-- exactly one choice". Clicking the already-selected row is now a no-op;
+-- selection only ever changes to a DIFFERENT option, and Options[1] is a
+-- guaranteed non-nil initial selection unless the caller explicitly passes
+-- Default = nil with an empty Options list.
+function Components.RadioGroup(parent, theme, connMgr, opts)
+    local options = opts.Options or {}
+    local selected = opts.Default or options[1]
+    local optionHeight = 34
+    local titleHeight = (opts.Text and opts.Text ~= "") and 24 or 0
+
+    local container = Instance.new("Frame")
+    container.Size = opts.Size or UDim2.new(1, 0, 0,
+        titleHeight + (#options * optionHeight) + math.max(#options - 1, 0) * 6 + 12)
+    container.LayoutOrder = opts.LayoutOrder or 0
+    container.Parent = parent
+    Utils.AddCorner(container, UDim.new(0, 8))
+
+    local titleLabel
+    if titleHeight > 0 then
+        titleLabel = Instance.new("TextLabel")
+        titleLabel.Size = UDim2.new(1, -20, 0, titleHeight)
+        titleLabel.Position = UDim2.new(0, 10, 0, 6)
+        titleLabel.BackgroundTransparency = 1
+        titleLabel.Text = opts.Text
+        titleLabel.TextXAlignment = Enum.TextXAlignment.Left
+        titleLabel.Font = Enum.Font.GothamBold
+        titleLabel.TextSize = 15
+        titleLabel.Parent = container
+    end
+
+    local list = Instance.new("Frame")
+    list.Size = UDim2.new(1, -12, 0, 0)
+    list.Position = UDim2.new(0, 6, 0, titleHeight + 6)
+    list.AutomaticSize = Enum.AutomaticSize.Y
+    list.BackgroundTransparency = 1
+    list.Parent = container
+    local layout = Instance.new("UIListLayout")
+    layout.Padding = UDim.new(0, 6)
+    layout.Parent = list
+
+    local rows = {}
+    local function restyleRows()
+        for _, row in ipairs(rows) do
+            local isSel = (row.text == selected)
+            TweenService:Create(row.ring, TweenInfo.new(0.2, EASE, EASE_OUT), {
+                BackgroundColor3 = isSel and theme.Accent or Utils.Darken(theme.Color, 0.75)
+            }):Play()
+            TweenService:Create(row.dot, TweenInfo.new(0.2, EASE, EASE_OUT), {
+                BackgroundTransparency = isSel and 0 or 1
+            }):Play()
+        end
+    end
+
+    -- THÊM: đọc AllowDeselect, mặc định false (không cho bỏ chọn)
+    local allowDeselect = opts.AllowDeselect == true
+
+    local function select(text)
+        -- Nếu bấm vào option đang chọn
+        if text == selected then
+            if allowDeselect then
+                selected = nil
+                restyleRows()
+                if opts.Callback then opts.Callback(nil) end
+            end
+            return -- không làm gì thêm
+        end
+        -- Chọn option khác
+        selected = text
+        restyleRows()
+        if opts.Callback then opts.Callback(text) end
+    end
+
+    for i, text in ipairs(options) do
+        local row = Instance.new("TextButton")
+        row.Size = UDim2.new(1, 0, 0, optionHeight)
+        row.LayoutOrder = i
+        row.BackgroundTransparency = 1
+        row.Text = ""
+        row.AutoButtonColor = false
+        row.Parent = list
+        Animator.AddThickenStroke(row, connMgr)
+        Utils.AddCorner(row, UDim.new(0, 6))
+
+        local ring = Instance.new("Frame")
+        ring.AnchorPoint = Vector2.new(0, 0.5)
+        ring.Position = UDim2.new(0, 8, 0.5, 0)
+        ring.Size = UDim2.new(0, 20, 0, 20)
+        ring.BackgroundColor3 = Utils.Darken(theme.Color, 0.75)
+        ring.Parent = row
+        Utils.AddCorner(ring, UDim.new(1, 0))
+
+        local dot = Instance.new("Frame")
+        dot.AnchorPoint = Vector2.new(0.5, 0.5)
+        dot.Position = UDim2.new(0.5, 0, 0.5, 0)
+        dot.Size = UDim2.new(0, 10, 0, 10)
+        dot.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+        dot.BackgroundTransparency = (text == selected) and 0 or 1
+        dot.Parent = ring
+        Utils.AddCorner(dot, UDim.new(1, 0))
+
+        local lbl = Instance.new("TextLabel")
+        lbl.Size = UDim2.new(1, -42, 1, 0)
+        lbl.Position = UDim2.new(0, 36, 0, 0)
+        lbl.BackgroundTransparency = 1
+        lbl.Text = text
+        lbl.TextXAlignment = Enum.TextXAlignment.Left
+        lbl.Font = Enum.Font.Gotham
+        lbl.TextSize = 14
+        lbl.Parent = row
+
+        connMgr:Track(row.MouseButton1Click:Connect(function()
+            select(text)
+        end))
+        table.insert(rows, { ring = ring, dot = dot, label = lbl, text = text })
+    end
+
+    local self = { Instance = container }
+    function self:Get() return selected end
+    function self:Set(v)
+        if v == nil then
+            if selected == nil then return end
+            selected = nil
+            restyleRows()
+            if opts.Callback then opts.Callback(nil) end
+            return
+        end
+        local found = false
+        for _, t in ipairs(options) do if t == v then found = true break end end
+        if not found then return end
+        select(v)
+    end
+    function self:ApplyTheme(color, accent, isInitial)
+        local panelBg = Utils.Brighten(color, 1.2)
+        local textColor = Utils.GetTextColorFor(panelBg, accent)
+        if isInitial then
+            container.BackgroundColor3 = panelBg
+            if titleLabel then titleLabel.TextColor3 = textColor end
+            for _, row in ipairs(rows) do row.label.TextColor3 = textColor end
+        else
+            TweenService:Create(container, THEME_TWEEN_INFO, { BackgroundColor3 = panelBg }):Play()
+            if titleLabel then TweenService:Create(titleLabel, THEME_TWEEN_INFO, { TextColor3 = textColor }):Play() end
+            for _, row in ipairs(rows) do
+                TweenService:Create(row.label, THEME_TWEEN_INFO, { TextColor3 = textColor }):Play()
+            end
+        end
+        restyleRows()
+    end
+    theme:Subscribe(function(c, a, initial) self:ApplyTheme(c, a, initial) end)
+    return self
+end
+
 -- ---------- Textbox ----------
 function Components.Textbox(parent, theme, connMgr, opts)
     local frame = Instance.new("Frame")
@@ -768,11 +1102,14 @@ function Components.Textbox(parent, theme, connMgr, opts)
 
     local self = { Instance = frame }
     function self:Get() return box.Text end
-    -- Programmatically set the text (used by Window:LoadConfig). Does not
-    -- fire opts.Callback (matches Toggle/Slider convention: only a real
-    -- FocusLost+Enter counts as a user commit), just updates the box text.
+    -- Programmatically set the text (used by Window:LoadConfig). Also fires
+    -- opts.Callback so a config-loaded value actually reaches consumer code
+    -- and not just the visible text — previously only a real FocusLost+Enter
+    -- fired it, so loading a config silently never applied the effect tied
+    -- to this field.
     function self:Set(v)
         box.Text = tostring(v)
+        if opts.Callback then opts.Callback(box.Text) end
     end
     function self:ApplyTheme(color, accent, isInitial)
         local panelBg = Utils.Brighten(color, 1.2)
@@ -891,6 +1228,7 @@ function Components.Paragraph(parent, theme, connMgr, opts)
     inner.BackgroundTransparency = 1
     inner.Parent = holder
     local layout = Instance.new("UIListLayout")
+    layout.SortOrder = Enum.SortOrder.LayoutOrder
     layout.Padding = UDim.new(0, 4)
     layout.Parent = inner
     Utils.AddPadding(inner, UDim.new(0, 15), UDim.new(0, 15), UDim.new(0, 8), UDim.new(0, 8))
@@ -961,11 +1299,15 @@ function Components.Paragraph(parent, theme, connMgr, opts)
     end
 
     if collapsible then
-        -- Body text needs one render step before AbsoluteSize.Y reflects the
-        -- actual wrapped height, so the very first paint is deferred a frame
-        -- (matches the pattern used elsewhere in this library for
-        -- AutomaticSize convergence, e.g. Components.Notification).
+        -- Body text needs a render step (or two) before AbsoluteSize.Y
+        -- reflects the actual wrapped height, so the very first paint is
+        -- deferred — matches the pattern used elsewhere in this library
+        -- for AutomaticSize convergence (see Components.Notification,
+        -- which also waits two Heartbeats). One frame was not always
+        -- enough for a multi-line TextLabel to finish wrapping/resizing,
+        -- which cropped the last line of text on first render.
         task.defer(function()
+            RunService.Heartbeat:Wait()
             RunService.Heartbeat:Wait()
             snapToNatural(open)
         end)
@@ -982,9 +1324,10 @@ function Components.Paragraph(parent, theme, connMgr, opts)
             }):Play()
         end))
     else
-        -- Not collapsible: always fully open, same one-frame defer so the
+        -- Not collapsible: always fully open, same two-frame defer so the
         -- clip's height matches the text's real wrapped height immediately.
         task.defer(function()
+            RunService.Heartbeat:Wait()
             RunService.Heartbeat:Wait()
             snapToNatural(true)
         end)
@@ -1012,8 +1355,8 @@ end
 
 -- ---------- ExpandableHeader ----------
 -- Shared "header row that expands into a body panel" used by Dropdown,
--- MultiDropdown and ColorPicker. Collapses three near-identical blocks
--- from the original script into one reusable piece.
+-- MultiDropdown, ColorPicker, and Accordion. Collapses several near-
+-- identical blocks from the original script into one reusable piece.
 function Components.ExpandableHeader(parent, theme, connMgr, opts)
     local closedHeight = opts.ClosedHeight or 46
     local bodyHeight = opts.BodyHeight or 200
@@ -1117,6 +1460,11 @@ end
 -- children, so the list reflows automatically with no manual
 -- repositioning needed). opts.SearchPlaceholder overrides the placeholder
 -- text. The filter clears whenever the dropdown closes.
+--
+-- Deselect-on-reclick is intentionally KEPT for Dropdown (unlike
+-- RadioGroup): clicking the currently-selected option clears the
+-- selection, since "nothing chosen" is a normal, useful state for an
+-- optional dropdown filter/setting.
 function Components.Dropdown(parent, theme, connMgr, opts)
     local optionHeight = 32
     local searchable = opts.Searchable == true
@@ -1124,13 +1472,6 @@ function Components.Dropdown(parent, theme, connMgr, opts)
     local optionButtons = {}
     local options, selected
 
-    -- FIX: rows are rebuilt on every :Refresh() call (e.g. every Save/Delete
-    -- via CreateConfigList). Previously every row's connections were tracked
-    -- directly on the shared `connMgr`, so destroying+recreating rows left
-    -- the dead connections from the old rows sitting in connMgr forever —
-    -- a slow leak that grows every refresh. rowConnMgr is disconnected in
-    -- full at the top of every rebuild, right before the old buttons are
-    -- destroyed, so only the CURRENT rows' connections are ever alive.
     local rowConnMgr = ConnectionManager.new()
 
     local function bodyHeightFor(count)
@@ -1141,16 +1482,16 @@ function Components.Dropdown(parent, theme, connMgr, opts)
     options = opts.Options or {}
     selected = opts.Default or options[1]
 
+    local userOnToggle = opts.OnToggle
+    local function fireOnToggle(isOpen)
+        if userOnToggle then userOnToggle(isOpen) end
+    end
+
     local exp = Components.ExpandableHeader(parent, theme, connMgr, {
         Text = opts.Text or "Chọn mục:",
         LayoutOrder = opts.LayoutOrder,
         BodyHeight = bodyHeightFor(#options),
-        -- Proxy so ExpandableHeader always calls whatever opts.OnToggle
-        -- currently is, looked up at call time — the searchable block below
-        -- reassigns opts.OnToggle *after* this header is built, so without
-        -- this indirection ExpandableHeader would keep calling `nil`
-        -- forever and the "clear filter on close" behavior would never fire.
-        OnToggle = function(isOpen) if opts.OnToggle then opts.OnToggle(isOpen) end end,
+        OnToggle = function(isOpen) fireOnToggle(isOpen) end,
     })
 
     local valueLabel = Instance.new("TextLabel")
@@ -1166,7 +1507,6 @@ function Components.Dropdown(parent, theme, connMgr, opts)
     valueLabel.TextTruncate = Enum.TextTruncate.AtEnd
     valueLabel.Parent = exp.Header
 
-    -- Search row (only built when Searchable is true)
     local searchBox
     if searchable then
         local searchHolder = Instance.new("Frame")
@@ -1186,7 +1526,7 @@ function Components.Dropdown(parent, theme, connMgr, opts)
         searchBox.ClearTextOnFocus = false
         searchBox.TextXAlignment = Enum.TextXAlignment.Left
         searchBox.Parent = searchHolder
-        Utils.AddPadding(searchBox, UDim.new(0, 10))
+        Utils.AddPadding(searchBox, UDim.new(0, 10), UDim.new(0, 10))
         Utils.AddCorner(searchBox, UDim.new(0, 6))
 
         exp._searchHolder = searchHolder
@@ -1218,10 +1558,6 @@ function Components.Dropdown(parent, theme, connMgr, opts)
         if opts.Callback then opts.Callback(text) end
     end
 
-    -- Filters existing rows by Visible instead of destroying/rebuilding
-    -- them, so filtering while typing stays cheap (no Instance churn per
-    -- keystroke). UIListLayout automatically skips invisible children, so
-    -- the visible rows reflow with no gaps.
     local function applyFilter(query)
         query = (query or ""):lower()
         for _, row in ipairs(optionButtons) do
@@ -1229,12 +1565,11 @@ function Components.Dropdown(parent, theme, connMgr, opts)
         end
     end
 
-    -- Rebuilds the option rows in `list` from the `options` array. Used both
-    -- at creation and by :Refresh() below, so a Dropdown's Options can be
-    -- repopulated at runtime (e.g. a "saved configs" list that changes as
-    -- the user saves new ones) instead of being frozen at creation time.
+    -- THÊM: đọc option AllowDeselect, mặc định true (giống hành vi cũ)
+    local allowDeselect = opts.AllowDeselect ~= false
+
     local function rebuildOptions()
-        rowConnMgr:DisconnectAll() -- drop connections belonging to the OLD rows first
+        rowConnMgr:DisconnectAll()
         for _, row in ipairs(optionButtons) do row.btn:Destroy() end
         table.clear(optionButtons)
 
@@ -1259,7 +1594,15 @@ function Components.Dropdown(parent, theme, connMgr, opts)
             rowConnMgr:Track(btn.MouseLeave:Connect(function()
                 TweenService:Create(btn, TweenInfo.new(0.18, EASE, EASE_OUT), { BackgroundColor3 = baseColorFor(text) }):Play()
             end))
-            rowConnMgr:Track(btn.MouseButton1Click:Connect(function() select(text) end))
+
+            -- SỬA: logic click có điều kiện AllowDeselect
+            rowConnMgr:Track(btn.MouseButton1Click:Connect(function()
+                if allowDeselect then
+                    select(text == selected and nil or text)
+                else
+                    if text ~= selected then select(text) end
+                end
+            end))
 
             table.insert(optionButtons, { btn = btn, text = text })
         end
@@ -1272,33 +1615,28 @@ function Components.Dropdown(parent, theme, connMgr, opts)
         connMgr:Track(searchBox:GetPropertyChangedSignal("Text"):Connect(function()
             applyFilter(searchBox.Text)
         end))
-        -- Clear the filter (and refocus the list) whenever the dropdown
-        -- closes, so reopening it always starts from the full list.
-        local origToggle = opts.OnToggle
-        opts.OnToggle = function(isOpen)
+        local originalOnToggle = userOnToggle
+        userOnToggle = function(isOpen)
             if not isOpen then
                 searchBox.Text = ""
                 applyFilter("")
             end
-            if origToggle then origToggle(isOpen) end
+            if originalOnToggle then originalOnToggle(isOpen) end
         end
     end
 
     local self = { Instance = exp.Container }
     function self:Get() return selected end
-    -- Programmatically select an option (used by Window:LoadConfig).
-    -- Silently ignores values that aren't in the current Options list.
     function self:Set(v)
+        if v == nil then
+            select(nil)
+            return
+        end
         local found = false
         for _, t in ipairs(options) do if t == v then found = true break end end
         if not found then return end
         select(v)
     end
-    -- Replaces the Options list at runtime and rebuilds the option rows +
-    -- the expand/collapse body height to match. If keepSelection is false
-    -- (default), selection falls back to the first new option (or nil if
-    -- newOptions is empty); if true, the current selection is kept when it
-    -- still exists in newOptions, otherwise it also falls back.
     function self:Refresh(newOptions, keepSelection)
         options = newOptions or {}
         if keepSelection then
@@ -1312,11 +1650,6 @@ function Components.Dropdown(parent, theme, connMgr, opts)
         rebuildOptions()
         valueLabel.Text = selected or ""
     end
-    -- Drops the row-level connections. Not called automatically (the
-    -- Container is normally torn down with the rest of the window via
-    -- connMgr:DisconnectAll()), but exposed for symmetry with the
-    -- {Instance, ApplyTheme, Destroy} component contract and for anyone
-    -- who wants to discard a Dropdown independently of its window.
     function self:Destroy()
         rowConnMgr:DisconnectAll()
     end
@@ -1373,12 +1706,17 @@ function Components.MultiDropdown(parent, theme, connMgr, opts)
         return searchable and (base + SEARCH_ROW_HEIGHT) or base
     end
 
+    -- Same "don't mutate the caller's opts.OnToggle" fix as Dropdown above.
+    local userOnToggle = opts.OnToggle
+    local function fireOnToggle(isOpen)
+        if userOnToggle then userOnToggle(isOpen) end
+    end
+
     local exp = Components.ExpandableHeader(parent, theme, connMgr, {
         Text = opts.Text or "Chọn nhiều:",
         LayoutOrder = opts.LayoutOrder,
         BodyHeight = bodyHeightFor(#options),
-        -- Same OnToggle proxy fix as Dropdown above.
-        OnToggle = function(isOpen) if opts.OnToggle then opts.OnToggle(isOpen) end end,
+        OnToggle = function(isOpen) fireOnToggle(isOpen) end,
     })
 
     local function summaryText()
@@ -1423,7 +1761,7 @@ function Components.MultiDropdown(parent, theme, connMgr, opts)
         searchBox.ClearTextOnFocus = false
         searchBox.TextXAlignment = Enum.TextXAlignment.Left
         searchBox.Parent = searchHolder
-        Utils.AddPadding(searchBox, UDim.new(0, 10))
+        Utils.AddPadding(searchBox, UDim.new(0, 10), UDim.new(0, 10))
         Utils.AddCorner(searchBox, UDim.new(0, 6))
     end
 
@@ -1519,13 +1857,13 @@ function Components.MultiDropdown(parent, theme, connMgr, opts)
         connMgr:Track(searchBox:GetPropertyChangedSignal("Text"):Connect(function()
             applyFilter(searchBox.Text)
         end))
-        local origToggle = opts.OnToggle
-        opts.OnToggle = function(isOpen)
+        local originalOnToggle = userOnToggle
+        userOnToggle = function(isOpen)
             if not isOpen then
                 searchBox.Text = ""
                 applyFilter("")
             end
-            if origToggle then origToggle(isOpen) end
+            if originalOnToggle then originalOnToggle(isOpen) end
         end
     end
 
@@ -2120,7 +2458,20 @@ function Components.ThemeGrid(parent, theme, connMgr, opts)
     end
 
     local self = { Instance = container }
-    function self:ApplyTheme() end -- swatches show fixed preset colors, not the live theme
+    -- Swatches always show their own fixed preset colors — this only keeps
+    -- the selection ring in sync when the theme changes from somewhere
+    -- OTHER than clicking a swatch in this grid (e.g. a second ThemeGrid,
+    -- or a direct theme:Apply() call elsewhere), so the ring doesn't point
+    -- at a stale preset.
+    function self:ApplyTheme(color, accent)
+        for i, preset in ipairs(presets) do
+            if preset[1] == color and preset[2] == accent then
+                if i ~= selectedIndex then selectIndex(i) end
+                return
+            end
+        end
+    end
+    theme:Subscribe(function(c, a) self:ApplyTheme(c, a) end)
     return self
 end
 
@@ -2329,6 +2680,7 @@ function Components.Keybind(parent, theme, connMgr, opts)
     keyBtn.AutoButtonColor = false
     keyBtn.Font = Enum.Font.GothamBold
     keyBtn.TextSize = 13
+    keyBtn.TextTruncate = Enum.TextTruncate.AtEnd
     keyBtn.Parent = frame
     Utils.AddCorner(keyBtn, UDim.new(0, 6))
     Animator.AddThickenStroke(keyBtn, connMgr)
@@ -2355,9 +2707,25 @@ function Components.Keybind(parent, theme, connMgr, opts)
 
     local function setListening(v)
         listening = v
-        keybindListening[connMgr] = v or nil -- clear the key entirely when turning off, so the table doesn't grow
         keyBtn.Text = keyText()
         restyleKeyBtn(false)
+        if v then
+            keybindListening[connMgr] = true
+        else
+            -- Deferred instead of synchronous: other Keybinds on this same
+            -- window may still be mid-way through handling the SAME
+            -- InputBegan event (their connections fire after this one in
+            -- the same dispatch). Clearing the flag synchronously here let
+            -- them see it as already-cleared and wrongly fire their own
+            -- Pressed() for the key that just finished a rebind. task.defer
+            -- pushes the clear to after this input event has fully
+            -- propagated to every connection.
+            task.defer(function()
+                if not listening then -- guard against being re-triggered before this runs
+                    keybindListening[connMgr] = nil
+                end
+            end)
+        end
     end
 
     connMgr:Track(keyBtn.MouseButton1Click:Connect(function()
@@ -2402,13 +2770,17 @@ function Components.Keybind(parent, theme, connMgr, opts)
     -- only special-cases Color3) with no extra handling needed.
     function self:Get() return currentKey and currentKey.Name or nil end
     -- Programmatically bind a key by name (used by Window:LoadConfig).
-    -- Silently ignores names that aren't valid Enum.KeyCode members.
+    -- Silently ignores names that aren't valid Enum.KeyCode members. Also
+    -- fires opts.Callback so a config-loaded bind actually reaches
+    -- consumer code — previously LoadConfig would only repaint the button
+    -- text and the game logic behind the keybind was never rewired.
     function self:Set(name)
         if type(name) ~= "string" then return end
         local key = Enum.KeyCode[name]
         if not key then return end
         currentKey = key
         keyBtn.Text = keyText()
+        if opts.Callback then opts.Callback(currentKey) end
     end
     function self:ApplyTheme(color, accent, isInitial)
         local panelBg = Utils.Brighten(color, 1.2)
@@ -2426,936 +2798,292 @@ function Components.Keybind(parent, theme, connMgr, opts)
     return self
 end
 
---============================================================
--- MODULE: Components (extra controls)
--- Additional, self-contained controls layered on top of the same
--- {Instance, ApplyTheme, Get/Set, Destroy} contract used above. Each one
--- follows the same visual language (panelBg background, darkBg for sunken
--- inputs, accent for the "active" state) so they drop into any existing
--- tab without looking out of place next to Toggle/Slider/Dropdown/etc.
---============================================================
+-- ---------- Accordion ----------
+-- Section xổ/thu dùng lại ExpandableHeader, nhưng thay vì fixed BodyHeight
+-- thì tự đo chiều cao nội dung bên trong qua UIListLayout.AbsoluteContentSize
+-- mỗi khi có control mới được thêm, rồi gọi exp.SetBodyHeight để cập nhật.
+local AccordionMeta = {}
+AccordionMeta.__index = AccordionMeta
 
--- ---------- Utils.AddTooltip ----------
--- Attaches a small floating tooltip to ANY existing GuiObject (typically
--- someComponent.Instance). Shown on hover after a short delay, hidden
--- immediately on leave. Parented to the same top-level ScreenGui as the
--- target so it can float above tab pages/ScrollingFrames without being
--- clipped by them. Returns a handle with :SetText(text) / :Destroy().
-function Utils.AddTooltip(target, theme, connMgr, text, opts)
-    opts = opts or {}
-    local screenGui = target:FindFirstAncestorOfClass("ScreenGui")
-    if not screenGui then return nil end
+function Components.Accordion(parent, theme, connMgr, opts)
+    local exp = Components.ExpandableHeader(parent, theme, connMgr, {
+        Text = opts.Text or "Nhóm",
+        LayoutOrder = opts.LayoutOrder,
+        BodyHeight = 0,
+    })
 
-    local tip = Instance.new("TextLabel")
-    tip.Name = "Tooltip"
-    tip.Visible = false
-    tip.ZIndex = 200
-    tip.Size = UDim2.new(0, 0, 0, 0)
-    tip.AutomaticSize = Enum.AutomaticSize.XY
-    tip.Text = text or ""
-    tip.TextColor3 = Color3.fromRGB(255, 255, 255)
-    tip.Font = Enum.Font.Gotham
-    tip.TextSize = 13
-    tip.BackgroundTransparency = 0
-    tip.TextTransparency = 1
-    tip.BackgroundTransparency = 1
-    tip.Parent = screenGui
-    Utils.AddCorner(tip, UDim.new(0, 6))
-    Utils.AddPadding(tip, UDim.new(0, 8), UDim.new(0, 8), UDim.new(0, 5), UDim.new(0, 5))
-    local stroke = Instance.new("UIStroke")
-    stroke.Transparency = 1
-    stroke.Thickness = 1
-    stroke.Parent = tip
-
-    local function restyle(isInitial)
-        local bg = Utils.Darken(theme.Color, 0.6)
-        local textColor = Utils.GetTextColorFor(bg, theme.Accent)
-        if isInitial then
-            tip.BackgroundColor3 = bg
-            tip.TextColor3 = textColor
-            stroke.Color = Utils.Brighten(theme.Color, 1.4)
-        else
-            TweenService:Create(tip, THEME_TWEEN_INFO, { BackgroundColor3 = bg, TextColor3 = textColor }):Play()
-        end
-    end
-    theme:Subscribe(function(c, a, initial) restyle(initial) end)
-
-    local hoverToken = 0
-    connMgr:Track(target.MouseEnter:Connect(function()
-        hoverToken = hoverToken + 1
-        local myToken = hoverToken
-        task.delay(opts.Delay or 0.35, function()
-            if myToken ~= hoverToken then return end -- mouse already left before the delay elapsed
-            local mouse = UserInputService:GetMouseLocation()
-            tip.Position = UDim2.new(0, mouse.X + 14, 0, mouse.Y + 18)
-            tip.Visible = true
-            TweenService:Create(tip, TweenInfo.new(0.15, EASE, EASE_OUT), { BackgroundTransparency = 0, TextTransparency = 0 }):Play()
-            TweenService:Create(stroke, TweenInfo.new(0.15, EASE, EASE_OUT), { Transparency = 0.3 }):Play()
-        end)
-    end))
-    connMgr:Track(target.MouseLeave:Connect(function()
-        hoverToken = hoverToken + 1
-        tip.Visible = false
-    end))
-
-    return {
-        SetText = function(_, newText) tip.Text = newText end,
-        Destroy = function() tip:Destroy() end,
-    }
-end
-
--- ---------- Checkbox ----------
--- A lighter-weight alternative to Toggle: a small square check box with a
--- label, instead of a pill switch. Same {Get,Set,Flag} contract.
-function Components.Checkbox(parent, theme, connMgr, opts)
-    local frame = Instance.new("Frame")
-    frame.Size = opts.Size or UDim2.new(1, 0, 0, 40)
-    frame.LayoutOrder = opts.LayoutOrder or 0
-    frame.Parent = parent
-    Utils.AddCorner(frame, UDim.new(0, 8))
-
-    local label = Instance.new("TextLabel")
-    label.Size = UDim2.new(1, -55, 1, 0)
-    label.Position = UDim2.new(0, 10, 0, 0)
-    label.BackgroundTransparency = 1
-    label.Text = opts.Text or "Checkbox"
-    label.TextColor3 = Color3.fromRGB(255, 255, 255)
-    label.TextXAlignment = Enum.TextXAlignment.Left
-    label.Font = Enum.Font.GothamBold
-    label.TextSize = 16
-    label.Parent = frame
-
-    local box = Instance.new("TextButton")
-    box.AnchorPoint = Vector2.new(1, 0.5)
-    box.Position = UDim2.new(1, -10, 0.5, 0)
-    box.Size = UDim2.new(0, 24, 0, 24)
-    box.Text = ""
-    box.AutoButtonColor = false
-    box.Parent = frame
-    Utils.AddCorner(box, UDim.new(0, 6))
-    local boxStroke = Instance.new("UIStroke")
-    boxStroke.Thickness = 1.5
-    boxStroke.Parent = box
-
-    local check = Instance.new("TextLabel")
-    check.Size = UDim2.new(1, 0, 1, 0)
-    check.BackgroundTransparency = 1
-    check.Text = "✓"
-    check.TextColor3 = Color3.fromRGB(255, 255, 255)
-    check.Font = Enum.Font.GothamBold
-    check.TextSize = 16
-    check.Parent = box
-
-    local state = opts.Default or false
-
-    local function restyle(instant)
-        local info = TweenInfo.new(instant and 0 or 0.2, EASE, EASE_OUT)
-        TweenService:Create(box, info, { BackgroundColor3 = state and theme.Accent or Utils.Darken(theme.Color, 0.8) }):Play()
-        TweenService:Create(check, info, { TextTransparency = state and 0 or 1 }):Play()
-    end
-
-    connMgr:Track(box.MouseButton1Click:Connect(function()
-        state = not state
-        restyle(false)
-        if opts.Callback then opts.Callback(state) end
-    end))
-
-    local self = { Instance = frame }
-    function self:Get() return state end
-    function self:Set(v)
-        if v == state then return end
-        state = v
-        restyle(false)
-    end
-    function self:ApplyTheme(color, accent, isInitial)
-        local panelBg = Utils.Brighten(color, 1.2)
-        local textColor = Utils.GetTextColorFor(panelBg, accent)
-        if isInitial then
-            frame.BackgroundColor3 = panelBg
-            label.TextColor3 = textColor
-            boxStroke.Color = Utils.Brighten(color, 1.5)
-        else
-            TweenService:Create(frame, THEME_TWEEN_INFO, { BackgroundColor3 = panelBg }):Play()
-            TweenService:Create(label, THEME_TWEEN_INFO, { TextColor3 = textColor }):Play()
-            TweenService:Create(boxStroke, THEME_TWEEN_INFO, { Color = Utils.Brighten(color, 1.5) }):Play()
-        end
-        restyle(isInitial)
-    end
-    theme:Subscribe(function(c, a, initial) self:ApplyTheme(c, a, initial) end)
-    return self
-end
-
--- ---------- RadioGroup ----------
--- opts: { Text (optional header), Options (array), Default, Flag, Callback(value) }
--- Vertical list of circular radio buttons; exactly one selected at a time.
-function Components.RadioGroup(parent, theme, connMgr, opts)
-    local options = opts.Options or {}
-    local ROW_HEIGHT = 32
-    local hasHeader = opts.Text and opts.Text ~= ""
-    local headerHeight = hasHeader and 26 or 0
-    local totalHeight = headerHeight + (#options * ROW_HEIGHT) + math.max(#options - 1, 0) * 4 + 12
-
-    local frame = Instance.new("Frame")
-    frame.Size = opts.Size or UDim2.new(1, 0, 0, totalHeight)
-    frame.LayoutOrder = opts.LayoutOrder or 0
-    frame.Parent = parent
-    Utils.AddCorner(frame, UDim.new(0, 8))
-
-    local inner = Instance.new("Frame")
-    inner.Size = UDim2.new(1, 0, 1, 0)
-    inner.BackgroundTransparency = 1
-    inner.Parent = frame
+    local body = exp.Body
     local layout = Instance.new("UIListLayout")
-    layout.Padding = UDim.new(0, 4)
-    layout.Parent = inner
-    Utils.AddPadding(inner, UDim.new(0, 10), UDim.new(0, 10), UDim.new(0, 6), UDim.new(0, 6))
+    layout.SortOrder = Enum.SortOrder.LayoutOrder
+    layout.Padding = UDim.new(0, 8)
+    layout.Parent = body
+    Utils.AddPadding(body, UDim.new(0, 6), UDim.new(0, 6), UDim.new(0, 4), UDim.new(0, 10))
 
-    local headerLabel
-    if hasHeader then
-        headerLabel = Instance.new("TextLabel")
-        headerLabel.Size = UDim2.new(1, 0, 0, headerHeight - 6)
-        headerLabel.LayoutOrder = 0
-        headerLabel.BackgroundTransparency = 1
-        headerLabel.Text = opts.Text
-        headerLabel.TextXAlignment = Enum.TextXAlignment.Left
-        headerLabel.Font = Enum.Font.GothamBold
-        headerLabel.TextSize = 15
-        headerLabel.Parent = inner
+    local function recompute()
+        exp.SetBodyHeight(layout.AbsoluteContentSize.Y + 14)
     end
+    connMgr:Track(layout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(recompute))
 
-    local selected = opts.Default or options[1]
-    local rows = {}
-
-    for i, text in ipairs(options) do
-        local row = Instance.new("TextButton")
-        row.Size = UDim2.new(1, 0, 0, ROW_HEIGHT)
-        row.LayoutOrder = i
-        row.Text = ""
-        row.AutoButtonColor = false
-        row.BackgroundTransparency = 1
-        row.Parent = inner
-
-        local dot = Instance.new("Frame")
-        dot.Size = UDim2.new(0, 18, 0, 18)
-        dot.Position = UDim2.new(0, 0, 0.5, -9)
-        dot.BackgroundTransparency = 1
-        dot.Parent = row
-        Utils.AddCorner(dot, UDim.new(1, 0))
-        local dotStroke = Instance.new("UIStroke")
-        dotStroke.Thickness = 1.5
-        dotStroke.Parent = dot
-        local dotFill = Instance.new("Frame")
-        dotFill.AnchorPoint = Vector2.new(0.5, 0.5)
-        dotFill.Position = UDim2.new(0.5, 0, 0.5, 0)
-        dotFill.Size = UDim2.new(0, 0, 0, 0)
-        dotFill.Parent = dot
-        Utils.AddCorner(dotFill, UDim.new(1, 0))
-
-        local rowLabel = Instance.new("TextLabel")
-        rowLabel.Size = UDim2.new(1, -28, 1, 0)
-        rowLabel.Position = UDim2.new(0, 26, 0, 0)
-        rowLabel.BackgroundTransparency = 1
-        rowLabel.Text = text
-        rowLabel.TextXAlignment = Enum.TextXAlignment.Left
-        rowLabel.Font = Enum.Font.Gotham
-        rowLabel.TextSize = 14
-        rowLabel.Parent = row
-
-        table.insert(rows, { row = row, dot = dot, dotStroke = dotStroke, dotFill = dotFill, label = rowLabel, text = text })
-    end
-
-    local function restyleRows(instant)
-        local dotBg = Utils.Darken(theme.Color, 0.75)
-        local panelBg = Utils.Brighten(theme.Color, 1.2)
-        local textColor = Utils.GetTextColorFor(panelBg, theme.Accent)
-        for _, r in ipairs(rows) do
-            local isSel = (r.text == selected)
-            local info = TweenInfo.new(instant and 0 or 0.2, EASE, EASE_OUT)
-            TweenService:Create(r.dot, info, { BackgroundColor3 = dotBg }):Play()
-            TweenService:Create(r.dotStroke, info, { Color = isSel and theme.Accent or Utils.Brighten(theme.Color, 1.5) }):Play()
-            TweenService:Create(r.dotFill, info, { Size = isSel and UDim2.new(0, 10, 0, 10) or UDim2.new(0, 0, 0, 0), BackgroundColor3 = theme.Accent }):Play()
-            TweenService:Create(r.label, info, { TextColor3 = textColor }):Play()
+    -- FIX: previously this priming block only ran when opts.DefaultOpen
+    -- was true, so an accordion created with DefaultOpen = false (the
+    -- common case) never had its real content height measured until the
+    -- user manually opened it for the first time. At that point
+    -- exp.SetOpen(true) would tween to the *stale* default openHeight
+    -- (BodyHeight=0 -> closedHeight+6px) and only snap to the correct,
+    -- much taller size once AbsoluteContentSize's changed-signal fired a
+    -- frame later — visible as the body "jumping"/overlapping whatever
+    -- sits below the header. Now the height is always primed up front,
+    -- regardless of DefaultOpen, so the very first open already animates
+    -- to the correct size.
+    task.defer(function()
+        RunService.Heartbeat:Wait()
+        recompute()
+        if opts.DefaultOpen then
+            exp.SetOpen(true)
         end
-    end
+    end)
 
-    local function select(text)
-        selected = text
-        restyleRows(false)
-        if opts.Callback then opts.Callback(text) end
-    end
-    for _, r in ipairs(rows) do
-        connMgr:Track(r.row.MouseButton1Click:Connect(function() select(r.text) end))
-    end
+    local self = setmetatable({ Instance = exp.Container }, AccordionMeta)
+    self._body, self._theme, self._connMgr, self._order = body, theme, connMgr, 0
 
-    local self = { Instance = frame }
-    function self:Get() return selected end
-    function self:Set(v)
-        local found = false
-        for _, t in ipairs(options) do if t == v then found = true break end end
-        if not found then return end
-        selected = v
-        restyleRows(false)
-    end
     function self:ApplyTheme(color, accent, isInitial)
         local panelBg = Utils.Brighten(color, 1.2)
-        local textColor = Utils.GetTextColorFor(panelBg, accent)
+        local headerTextColor = Utils.GetTextColorFor(panelBg, accent)
         if isInitial then
-            frame.BackgroundColor3 = panelBg
-            if headerLabel then headerLabel.TextColor3 = textColor end
+            exp.Header.BackgroundColor3 = panelBg
+            exp.TitleLabel.TextColor3 = headerTextColor
         else
-            TweenService:Create(frame, THEME_TWEEN_INFO, { BackgroundColor3 = panelBg }):Play()
-            if headerLabel then TweenService:Create(headerLabel, THEME_TWEEN_INFO, { TextColor3 = textColor }):Play() end
-        end
-        restyleRows(isInitial)
-    end
-    theme:Subscribe(function(c, a, initial) self:ApplyTheme(c, a, initial) end)
-    return self
-end
-
--- ---------- Stepper (numeric +/-) ----------
--- opts: { Text, Min, Max, Default, Step (default 1), Suffix, Flag, Callback(value) }
-function Components.Stepper(parent, theme, connMgr, opts)
-    local min, max = opts.Min or 0, opts.Max or 100
-    local step = opts.Step or 1
-    local value = math.clamp(opts.Default or min, min, max)
-    local suffix = opts.Suffix or ""
-
-    local frame = Instance.new("Frame")
-    frame.Size = opts.Size or UDim2.new(1, 0, 0, 40)
-    frame.LayoutOrder = opts.LayoutOrder or 0
-    frame.Parent = parent
-    Utils.AddCorner(frame, UDim.new(0, 8))
-
-    local label = Instance.new("TextLabel")
-    label.Size = UDim2.new(1, -140, 1, 0)
-    label.Position = UDim2.new(0, 10, 0, 0)
-    label.BackgroundTransparency = 1
-    label.Text = opts.Text or "Số lượng"
-    label.TextColor3 = Color3.fromRGB(255, 255, 255)
-    label.TextXAlignment = Enum.TextXAlignment.Left
-    label.Font = Enum.Font.GothamBold
-    label.TextSize = 15
-    label.Parent = frame
-
-    local function makeBtn(xOffset, text)
-        local b = Instance.new("TextButton")
-        b.AnchorPoint = Vector2.new(1, 0.5)
-        b.Position = UDim2.new(1, xOffset, 0.5, 0)
-        b.Size = UDim2.new(0, 26, 0, 26)
-        b.Text = text
-        b.TextColor3 = Color3.fromRGB(255, 255, 255)
-        b.Font = Enum.Font.GothamBold
-        b.TextSize = 16
-        b.AutoButtonColor = false
-        b.Parent = frame
-        Utils.AddCorner(b, UDim.new(0, 6))
-        Animator.AddThickenStroke(b, connMgr)
-        return b
-    end
-
-    local minusBtn = makeBtn(-10, "-")
-    local plusBtn = makeBtn(-72, "+")
-
-    local valueLabel = Instance.new("TextLabel")
-    valueLabel.AnchorPoint = Vector2.new(1, 0.5)
-    valueLabel.Position = UDim2.new(1, -46, 0.5, 0)
-    valueLabel.Size = UDim2.new(0, 40, 1, 0)
-    valueLabel.BackgroundTransparency = 1
-    valueLabel.Font = Enum.Font.GothamBold
-    valueLabel.TextSize = 15
-    valueLabel.Parent = frame
-
-    local function fmt(n)
-        if step % 1 == 0 then return tostring(math.floor(n + 0.5)) .. suffix end
-        return string.format("%.2f", n) .. suffix
-    end
-
-    local function refresh()
-        valueLabel.Text = fmt(value)
-    end
-    refresh()
-
-    local function setValue(v, fire)
-        v = math.clamp(v, min, max)
-        if v == value then return end
-        value = v
-        refresh()
-        if fire ~= false and opts.Callback then opts.Callback(value) end
-    end
-
-    connMgr:Track(minusBtn.MouseButton1Click:Connect(function() setValue(value - step) end))
-    connMgr:Track(plusBtn.MouseButton1Click:Connect(function() setValue(value + step) end))
-
-    local self = { Instance = frame }
-    function self:Get() return value end
-    function self:Set(v) setValue(v, false) end
-    function self:ApplyTheme(color, accent, isInitial)
-        local panelBg = Utils.Brighten(color, 1.2)
-        local textColor = Utils.GetTextColorFor(panelBg, accent)
-        local darkBg = Utils.Darken(color, 0.8)
-        if isInitial then
-            frame.BackgroundColor3 = panelBg
-            label.TextColor3 = textColor
-            valueLabel.TextColor3 = textColor
-            minusBtn.BackgroundColor3 = darkBg
-            plusBtn.BackgroundColor3 = darkBg
-        else
-            TweenService:Create(frame, THEME_TWEEN_INFO, { BackgroundColor3 = panelBg }):Play()
-            TweenService:Create(label, THEME_TWEEN_INFO, { TextColor3 = textColor }):Play()
-            TweenService:Create(valueLabel, THEME_TWEEN_INFO, { TextColor3 = textColor }):Play()
-            TweenService:Create(minusBtn, THEME_TWEEN_INFO, { BackgroundColor3 = darkBg }):Play()
-            TweenService:Create(plusBtn, THEME_TWEEN_INFO, { BackgroundColor3 = darkBg }):Play()
+            TweenService:Create(exp.Header, THEME_TWEEN_INFO, { BackgroundColor3 = panelBg }):Play()
+            TweenService:Create(exp.TitleLabel, THEME_TWEEN_INFO, { TextColor3 = headerTextColor }):Play()
         end
     end
     theme:Subscribe(function(c, a, initial) self:ApplyTheme(c, a, initial) end)
     return self
 end
 
--- ---------- SearchBox ----------
--- A standalone search field (visually distinct from Textbox: full-width,
--- placeholder-first, no side label). Fires opts.Callback(query) on every
--- text change, debounced one frame the same way ColorPicker's RGB fields
--- are, so rapid typing collapses into one callback per settled frame
--- instead of one per keystroke.
-function Components.SearchBox(parent, theme, connMgr, opts)
-    local frame = Instance.new("Frame")
-    frame.Size = opts.Size or UDim2.new(1, 0, 0, 40)
-    frame.LayoutOrder = opts.LayoutOrder or 0
-    frame.Parent = parent
-    Utils.AddCorner(frame, UDim.new(0, 8))
-
-    local icon = Instance.new("TextLabel")
-    icon.Size = UDim2.new(0, 24, 1, 0)
-    icon.Position = UDim2.new(0, 8, 0, 0)
-    icon.BackgroundTransparency = 1
-    icon.Text = "🔍"
-    icon.TextSize = 14
-    icon.Parent = frame
-
-    local box = Instance.new("TextBox")
-    box.Size = UDim2.new(1, -70, 1, -10)
-    box.Position = UDim2.new(0, 32, 0, 5)
-    box.Text = opts.Default or ""
-    box.PlaceholderText = opts.Placeholder or "Tìm kiếm..."
-    box.PlaceholderColor3 = Color3.fromRGB(150, 150, 160)
-    box.Font = Enum.Font.Gotham
-    box.TextSize = 14
-    box.ClearTextOnFocus = false
-    box.TextXAlignment = Enum.TextXAlignment.Left
-    box.BackgroundTransparency = 1
-    box.Parent = frame
-
-    local clearBtn = Instance.new("TextButton")
-    clearBtn.AnchorPoint = Vector2.new(1, 0.5)
-    clearBtn.Position = UDim2.new(1, -8, 0.5, 0)
-    clearBtn.Size = UDim2.new(0, 22, 0, 22)
-    clearBtn.BackgroundTransparency = 1
-    clearBtn.Text = "×"
-    clearBtn.Font = Enum.Font.GothamBold
-    clearBtn.TextSize = 14
-    clearBtn.Visible = box.Text ~= ""
-    clearBtn.Parent = frame
-
-    local pending = false
-    local function fire()
-        if opts.Callback then opts.Callback(box.Text) end
-    end
-    connMgr:Track(box:GetPropertyChangedSignal("Text"):Connect(function()
-        clearBtn.Visible = box.Text ~= ""
-        if pending then return end
-        pending = true
-        task.defer(function() pending = false; fire() end)
-    end))
-    connMgr:Track(clearBtn.MouseButton1Click:Connect(function()
-        box.Text = ""
-        box:CaptureFocus()
-    end))
-
-    local self = { Instance = frame }
-    function self:Get() return box.Text end
-    function self:Set(v) box.Text = tostring(v or "") end
-    function self:ApplyTheme(color, accent, isInitial)
-        local darkBg = Utils.Darken(color, 0.8)
-        local textColor = Utils.GetTextColorFor(darkBg, accent)
-        if isInitial then
-            frame.BackgroundColor3 = darkBg
-            box.TextColor3 = textColor
-            icon.TextColor3 = textColor
-            clearBtn.TextColor3 = textColor
-        else
-            TweenService:Create(frame, THEME_TWEEN_INFO, { BackgroundColor3 = darkBg }):Play()
-            TweenService:Create(box, THEME_TWEEN_INFO, { TextColor3 = textColor }):Play()
-            TweenService:Create(icon, THEME_TWEEN_INFO, { TextColor3 = textColor }):Play()
-            TweenService:Create(clearBtn, THEME_TWEEN_INFO, { TextColor3 = textColor }):Play()
+-- Sinh AccordionMeta:CreateToggle/Slider/... bằng bảng ánh xạ thay vì chép
+-- tay 12 hàm gần giống hệt TabMeta — cùng tinh thần "gom logic lặp lại"
+-- như ExpandableHeader đã làm cho Dropdown/MultiDropdown/ColorPicker.
+local ACCORDION_FACTORY_MAP = {
+    CreateLabel = { fn = "Label" },
+    CreateButton = { fn = "Button" },
+    CreateToggle = { fn = "Toggle", flag = true },
+    CreateSlider = { fn = "Slider", flag = true },
+    CreateNumberStepper = { fn = "NumberStepper", flag = true },
+    CreateTextbox = { fn = "Textbox", flag = true },
+    CreateDropdown = { fn = "Dropdown", flag = true },
+    CreateMultiDropdown = { fn = "MultiDropdown", flag = true },
+    CreateRadioGroup = { fn = "RadioGroup", flag = true },
+    CreateColorPicker = { fn = "ColorPicker", flag = true },
+    CreateKeybind = { fn = "Keybind", flag = true },
+    CreateDivider = { fn = "Divider" },
+}
+for methodName, info in pairs(ACCORDION_FACTORY_MAP) do
+    AccordionMeta[methodName] = function(self, opts)
+        opts = opts or {}
+        self._order = self._order + 1
+        opts.LayoutOrder = self._order
+        local obj = Components[info.fn](self._body, self._theme, self._connMgr, opts)
+        if info.flag and self._window then self._window:_registerFlag(opts.Flag, obj) end
+        -- Register with the owning tab's search index, same as top-level
+        -- TabMeta:CreateXxx controls, so CreateSearchBar's filter also
+        -- reaches controls nested inside an accordion — previously these
+        -- were invisible to search entirely.
+        if obj and obj.Instance and self._tab then
+            local searchText = opts.Text or opts.Title or ""
+            obj.Instance:SetAttribute("SelenixSearchText", tostring(searchText):lower())
+            self._tab._searchEntries = self._tab._searchEntries or {}
+            table.insert(self._tab._searchEntries, obj.Instance)
         end
+        return obj
     end
-    theme:Subscribe(function(c, a, initial) self:ApplyTheme(c, a, initial) end)
-    return self
 end
 
--- ---------- Textarea (multi-line text box) ----------
--- opts: { Text (header label above the box), Default, Placeholder, Height
--- (default 90), Flag, Callback(text) — fires on FocusLost like Textbox. }
-function Components.Textarea(parent, theme, connMgr, opts)
-    local boxHeight = opts.Height or 90
+-- ---------- TableList ----------
+-- Danh sách cuộn được, mỗi dòng có Text/SubText + checkbox riêng (vd: bật
+-- ESP cho từng player). opts.Items = { { Text, SubText, Toggled, OnToggle(state), OnClick } }.
+-- :Refresh(newItems) rebuild toàn bộ (khi player join/leave), dùng lại
+-- pattern rowConnMgr như Dropdown/MultiDropdown để không leak connection.
+function Components.TableList(parent, theme, connMgr, opts)
+    local items = opts.Items or {}
+    local rowHeight = opts.RowHeight or 34
+    local maxVisible = opts.MaxVisibleRows or 5
     local hasHeader = opts.Text and opts.Text ~= ""
-    local headerHeight = hasHeader and 22 or 0
+    local headerHeight = hasHeader and 30 or 0
+    local rowConnMgr = ConnectionManager.new()
 
-    local frame = Instance.new("Frame")
-    frame.Size = opts.Size or UDim2.new(1, 0, 0, headerHeight + boxHeight + 16)
-    frame.LayoutOrder = opts.LayoutOrder or 0
-    frame.Parent = parent
-    Utils.AddCorner(frame, UDim.new(0, 8))
+    local container = Instance.new("Frame")
+    container.LayoutOrder = opts.LayoutOrder or 0
+    container.Parent = parent
+    Utils.AddCorner(container, UDim.new(0, 8))
 
     local headerLabel
     if hasHeader then
         headerLabel = Instance.new("TextLabel")
         headerLabel.Size = UDim2.new(1, -20, 0, headerHeight)
-        headerLabel.Position = UDim2.new(0, 10, 0, 6)
+        headerLabel.Position = UDim2.new(0, 10, 0, 4)
         headerLabel.BackgroundTransparency = 1
         headerLabel.Text = opts.Text
         headerLabel.TextXAlignment = Enum.TextXAlignment.Left
         headerLabel.Font = Enum.Font.GothamBold
         headerLabel.TextSize = 14
-        headerLabel.Parent = frame
+        headerLabel.Parent = container
     end
-
-    local box = Instance.new("TextBox")
-    box.Position = UDim2.new(0, 8, 0, headerHeight + 8)
-    box.Size = UDim2.new(1, -16, 0, boxHeight)
-    box.Text = opts.Default or ""
-    box.PlaceholderText = opts.Placeholder or "Nhập nội dung..."
-    box.PlaceholderColor3 = Color3.fromRGB(150, 150, 160)
-    box.Font = Enum.Font.Gotham
-    box.TextSize = 13
-    box.TextXAlignment = Enum.TextXAlignment.Left
-    box.TextYAlignment = Enum.TextYAlignment.Top
-    box.TextWrapped = true
-    box.MultiLine = true
-    box.ClearTextOnFocus = false
-    box.ClipsDescendants = true
-    box.Parent = frame
-    Utils.AddPadding(box, UDim.new(0, 8), UDim.new(0, 8), UDim.new(0, 6), UDim.new(0, 6))
-    Utils.AddCorner(box, UDim.new(0, 6))
-
-    connMgr:Track(box.FocusLost:Connect(function(enterPressed)
-        if opts.Callback then opts.Callback(box.Text) end
-    end))
-
-    local self = { Instance = frame }
-    function self:Get() return box.Text end
-    function self:Set(v) box.Text = tostring(v or "") end
-    function self:ApplyTheme(color, accent, isInitial)
-        local panelBg = Utils.Brighten(color, 1.2)
-        local darkBg = Utils.Darken(color, 0.8)
-        local headerColor = Utils.GetTextColorFor(panelBg, accent)
-        local boxTextColor = Utils.GetTextColorFor(darkBg, accent)
-        if isInitial then
-            frame.BackgroundColor3 = panelBg
-            if headerLabel then headerLabel.TextColor3 = headerColor end
-            box.BackgroundColor3 = darkBg
-            box.TextColor3 = boxTextColor
-        else
-            TweenService:Create(frame, THEME_TWEEN_INFO, { BackgroundColor3 = panelBg }):Play()
-            if headerLabel then TweenService:Create(headerLabel, THEME_TWEEN_INFO, { TextColor3 = headerColor }):Play() end
-            TweenService:Create(box, THEME_TWEEN_INFO, { BackgroundColor3 = darkBg, TextColor3 = boxTextColor }):Play()
-        end
-    end
-    theme:Subscribe(function(c, a, initial) self:ApplyTheme(c, a, initial) end)
-    return self
-end
-
--- ---------- ProgressBar ----------
--- A read/write display bar (0-100), distinct from Slider: not draggable by
--- the user, meant for showing progress driven by script code (loading a
--- resource, farm progress, xp, etc) via :Set(percent).
-function Components.ProgressBar(parent, theme, connMgr, opts)
-    local value = math.clamp(opts.Default or 0, 0, 100)
-
-    local frame = Instance.new("Frame")
-    frame.Size = opts.Size or UDim2.new(1, 0, 0, 46)
-    frame.LayoutOrder = opts.LayoutOrder or 0
-    frame.Parent = parent
-    Utils.AddCorner(frame, UDim.new(0, 8))
-
-    local label = Instance.new("TextLabel")
-    label.Size = UDim2.new(1, -70, 0, 18)
-    label.Position = UDim2.new(0, 10, 0, 4)
-    label.BackgroundTransparency = 1
-    label.Text = opts.Text or "Tiến trình"
-    label.TextXAlignment = Enum.TextXAlignment.Left
-    label.Font = Enum.Font.GothamBold
-    label.TextSize = 13
-    label.Parent = frame
-
-    local percentLabel = Instance.new("TextLabel")
-    percentLabel.AnchorPoint = Vector2.new(1, 0)
-    percentLabel.Position = UDim2.new(1, -10, 0, 4)
-    percentLabel.Size = UDim2.new(0, 50, 0, 18)
-    percentLabel.BackgroundTransparency = 1
-    percentLabel.TextXAlignment = Enum.TextXAlignment.Right
-    percentLabel.Font = Enum.Font.Gotham
-    percentLabel.TextSize = 13
-    percentLabel.Parent = frame
-
-    local track = Instance.new("Frame")
-    track.Position = UDim2.new(0, 10, 0, 26)
-    track.Size = UDim2.new(1, -20, 0, 10)
-    track.BorderSizePixel = 0
-    track.Parent = frame
-    Utils.AddCorner(track, UDim.new(1, 0))
-
-    local fill = Instance.new("Frame")
-    fill.Size = UDim2.new(value / 100, 0, 1, 0)
-    fill.BorderSizePixel = 0
-    fill.Parent = track
-    Utils.AddCorner(fill, UDim.new(1, 0))
-
-    local function refresh(instant)
-        percentLabel.Text = tostring(math.floor(value + 0.5)) .. "%"
-        local info = TweenInfo.new(instant and 0 or 0.3, EASE, EASE_OUT)
-        TweenService:Create(fill, info, { Size = UDim2.new(value / 100, 0, 1, 0) }):Play()
-    end
-    refresh(true)
-
-    local self = { Instance = frame }
-    function self:Get() return value end
-    function self:Set(v)
-        value = math.clamp(v, 0, 100)
-        refresh(false)
-    end
-    function self:ApplyTheme(color, accent, isInitial)
-        local panelBg = Utils.Brighten(color, 1.2)
-        local textColor = Utils.GetTextColorFor(panelBg, accent)
-        local darkBg = Utils.Darken(color, 0.8)
-        if isInitial then
-            frame.BackgroundColor3 = panelBg
-            label.TextColor3 = textColor
-            percentLabel.TextColor3 = textColor
-            track.BackgroundColor3 = darkBg
-            fill.BackgroundColor3 = accent
-        else
-            TweenService:Create(frame, THEME_TWEEN_INFO, { BackgroundColor3 = panelBg }):Play()
-            TweenService:Create(label, THEME_TWEEN_INFO, { TextColor3 = textColor }):Play()
-            TweenService:Create(percentLabel, THEME_TWEEN_INFO, { TextColor3 = textColor }):Play()
-            TweenService:Create(track, THEME_TWEEN_INFO, { BackgroundColor3 = darkBg }):Play()
-            TweenService:Create(fill, THEME_TWEEN_INFO, { BackgroundColor3 = accent }):Play()
-        end
-    end
-    theme:Subscribe(function(c, a, initial) self:ApplyTheme(c, a, initial) end)
-    return self
-end
-
--- ---------- Rating (stars) ----------
--- opts: { Text, Max (default 5), Default, Flag, Callback(rating) }
-function Components.Rating(parent, theme, connMgr, opts)
-    local maxStars = opts.Max or 5
-    local value = math.clamp(opts.Default or 0, 0, maxStars)
-
-    local frame = Instance.new("Frame")
-    frame.Size = opts.Size or UDim2.new(1, 0, 0, 40)
-    frame.LayoutOrder = opts.LayoutOrder or 0
-    frame.Parent = parent
-    Utils.AddCorner(frame, UDim.new(0, 8))
-
-    local label = Instance.new("TextLabel")
-    label.Size = UDim2.new(0.5, 0, 1, 0)
-    label.Position = UDim2.new(0, 10, 0, 0)
-    label.BackgroundTransparency = 1
-    label.Text = opts.Text or "Đánh giá"
-    label.TextXAlignment = Enum.TextXAlignment.Left
-    label.Font = Enum.Font.GothamBold
-    label.TextSize = 15
-    label.Parent = frame
-
-    local starsHolder = Instance.new("Frame")
-    starsHolder.AnchorPoint = Vector2.new(1, 0.5)
-    starsHolder.Position = UDim2.new(1, -10, 0.5, 0)
-    starsHolder.Size = UDim2.new(0, maxStars * 26, 1, 0)
-    starsHolder.BackgroundTransparency = 1
-    starsHolder.Parent = frame
-    local starsLayout = Instance.new("UIListLayout")
-    starsLayout.FillDirection = Enum.FillDirection.Horizontal
-    starsLayout.VerticalAlignment = Enum.VerticalAlignment.Center
-    starsLayout.Parent = starsHolder
-
-    local stars = {}
-    for i = 1, maxStars do
-        local star = Instance.new("TextButton")
-        star.Size = UDim2.new(0, 26, 1, 0)
-        star.LayoutOrder = i
-        star.Text = "★"
-        star.Font = Enum.Font.GothamBold
-        star.TextSize = 20
-        star.BackgroundTransparency = 1
-        star.AutoButtonColor = false
-        star.Parent = starsHolder
-        table.insert(stars, star)
-    end
-
-    local function restyle(instant)
-        local filled = Utils.GetKnobColor(theme.Accent)
-        local empty = Utils.Darken(theme.Color, 0.75)
-        for i, star in ipairs(stars) do
-            local info = TweenInfo.new(instant and 0 or 0.15, EASE, EASE_OUT)
-            TweenService:Create(star, info, { TextColor3 = (i <= value) and theme.Accent or empty }):Play()
-        end
-    end
-    local function setValue(v, fire)
-        value = math.clamp(v, 0, maxStars)
-        restyle(false)
-        if fire ~= false and opts.Callback then opts.Callback(value) end
-    end
-    for i, star in ipairs(stars) do
-        connMgr:Track(star.MouseButton1Click:Connect(function() setValue(i) end))
-        connMgr:Track(star.MouseEnter:Connect(function()
-            for j, s in ipairs(stars) do
-                s.TextColor3 = (j <= i) and Utils.Brighten(theme.Accent, 1.2) or Utils.Darken(theme.Color, 0.75)
-            end
-        end))
-        connMgr:Track(star.MouseLeave:Connect(function() restyle(true) end))
-    end
-
-    local self = { Instance = frame }
-    function self:Get() return value end
-    function self:Set(v) setValue(v, false) end
-    function self:ApplyTheme(color, accent, isInitial)
-        local panelBg = Utils.Brighten(color, 1.2)
-        local textColor = Utils.GetTextColorFor(panelBg, accent)
-        if isInitial then
-            frame.BackgroundColor3 = panelBg
-            label.TextColor3 = textColor
-        else
-            TweenService:Create(frame, THEME_TWEEN_INFO, { BackgroundColor3 = panelBg }):Play()
-            TweenService:Create(label, THEME_TWEEN_INFO, { TextColor3 = textColor }):Play()
-        end
-        restyle(isInitial)
-    end
-    theme:Subscribe(function(c, a, initial) self:ApplyTheme(c, a, initial) end)
-    return self
-end
-
--- ---------- Image ----------
--- opts: { Image (asset id, string or number), Height (default 140), Caption }
-function Components.Image(parent, theme, connMgr, opts)
-    local imgHeight = opts.Height or 140
-    local hasCaption = opts.Caption and opts.Caption ~= ""
-
-    local frame = Instance.new("Frame")
-    frame.Size = opts.Size or UDim2.new(1, 0, 0, imgHeight + (hasCaption and 26 or 10))
-    frame.LayoutOrder = opts.LayoutOrder or 0
-    frame.Parent = parent
-    Utils.AddCorner(frame, UDim.new(0, 8))
-
-    local img = Instance.new("ImageLabel")
-    img.Position = UDim2.new(0, 6, 0, 6)
-    img.Size = UDim2.new(1, -12, 0, imgHeight)
-    img.BackgroundTransparency = 1
-    local imageId = opts.Image
-    if type(imageId) == "number" then imageId = "rbxassetid://" .. tostring(imageId) end
-    img.Image = imageId or ""
-    img.ScaleType = Enum.ScaleType.Crop
-    img.Parent = frame
-    Utils.AddCorner(img, UDim.new(0, 6))
-
-    local caption
-    if hasCaption then
-        caption = Instance.new("TextLabel")
-        caption.Position = UDim2.new(0, 6, 0, imgHeight + 8)
-        caption.Size = UDim2.new(1, -12, 0, 16)
-        caption.BackgroundTransparency = 1
-        caption.Text = opts.Caption
-        caption.Font = Enum.Font.Gotham
-        caption.TextSize = 12
-        caption.TextXAlignment = Enum.TextXAlignment.Center
-        caption.Parent = frame
-    end
-
-    local self = { Instance = frame }
-    function self:SetImage(newImage)
-        if type(newImage) == "number" then newImage = "rbxassetid://" .. tostring(newImage) end
-        img.Image = newImage or ""
-    end
-    function self:ApplyTheme(color, accent, isInitial)
-        local panelBg = Utils.Brighten(color, 1.2)
-        local textColor = Utils.GetTextColorFor(panelBg, accent)
-        if isInitial then
-            frame.BackgroundColor3 = panelBg
-            if caption then caption.TextColor3 = textColor end
-        else
-            TweenService:Create(frame, THEME_TWEEN_INFO, { BackgroundColor3 = panelBg }):Play()
-            if caption then TweenService:Create(caption, THEME_TWEEN_INFO, { TextColor3 = textColor }):Play() end
-        end
-    end
-    theme:Subscribe(function(c, a, initial) self:ApplyTheme(c, a, initial) end)
-    return self
-end
-
--- ---------- Badge ----------
--- A tiny inline pill for status/tags, e.g. next to a Label. Not meant to
--- stand alone in a tab's LayoutOrder chain — construct one and parent it
--- yourself onto another control's .Instance if you need it inline, or use
--- it standalone via TabMeta:CreateBadge for a simple status row.
-function Components.Badge(parent, theme, connMgr, opts)
-    local holder = Instance.new("Frame")
-    holder.Size = opts.Size or UDim2.new(1, 0, 0, 30)
-    holder.LayoutOrder = opts.LayoutOrder or 0
-    holder.BackgroundTransparency = 1
-    holder.Parent = parent
-
-    local pill = Instance.new("Frame")
-    pill.Size = UDim2.new(0, 0, 0, 24)
-    pill.AutomaticSize = Enum.AutomaticSize.X
-    pill.Position = UDim2.new(0, 10, 0.5, -12)
-    pill.Parent = holder
-    Utils.AddCorner(pill, UDim.new(1, 0))
-    Utils.AddPadding(pill, UDim.new(0, 12), UDim.new(0, 12))
-
-    local text = Instance.new("TextLabel")
-    text.Size = UDim2.new(0, 0, 1, 0)
-    text.AutomaticSize = Enum.AutomaticSize.X
-    text.BackgroundTransparency = 1
-    text.Text = opts.Text or "Badge"
-    text.Font = Enum.Font.GothamBold
-    text.TextSize = 12
-    text.Parent = pill
-
-    local variantColors = {
-        accent  = function(c, a) return a end,
-        success = function() return Color3.fromRGB(60, 200, 120) end,
-        error   = function() return Color3.fromRGB(220, 70, 70) end,
-        warning = function() return Color3.fromRGB(230, 170, 50) end,
-        info    = function() return Color3.fromRGB(70, 140, 230) end,
-    }
-    local getColor = variantColors[opts.Variant] or variantColors.accent
-
-    local self = { Instance = holder }
-    function self:SetText(t) text.Text = t end
-    function self:ApplyTheme(color, accent, isInitial)
-        local pillColor = getColor(color, accent)
-        local textColor = Utils.GetTextColorFor(pillColor, accent)
-        if isInitial then
-            pill.BackgroundColor3 = pillColor
-            text.TextColor3 = textColor
-        else
-            TweenService:Create(pill, THEME_TWEEN_INFO, { BackgroundColor3 = pillColor }):Play()
-            TweenService:Create(text, THEME_TWEEN_INFO, { TextColor3 = textColor }):Play()
-        end
-    end
-    theme:Subscribe(function(c, a, initial) self:ApplyTheme(c, a, initial) end)
-    return self
-end
-
--- ---------- Table (read-only data grid) ----------
--- opts: { Columns (array of header strings), Rows (array of array-of-
--- strings, one sub-array per row, same length as Columns), RowHeight
--- (default 30), MaxVisibleRows (default 6, controls the scrolling height) }
--- Read-only display control — no Get/Set/Flag, just :SetRows(rows) to
--- replace the data at runtime (e.g. a live player list / leaderboard).
-function Components.Table(parent, theme, connMgr, opts)
-    local columns = opts.Columns or {}
-    local rowHeight = opts.RowHeight or 30
-    local headerHeight = 30
-    local maxVisibleRows = opts.MaxVisibleRows or 6
-    local colCount = math.max(#columns, 1)
-    local colWidth = 1 / colCount
-
-    local frame = Instance.new("Frame")
-    frame.Size = opts.Size or UDim2.new(1, 0, 0, headerHeight + math.min(maxVisibleRows, math.max(#(opts.Rows or {}), 1)) * rowHeight + 8)
-    frame.LayoutOrder = opts.LayoutOrder or 0
-    frame.ClipsDescendants = true
-    frame.Parent = parent
-    Utils.AddCorner(frame, UDim.new(0, 8))
-
-    local header = Instance.new("Frame")
-    header.Size = UDim2.new(1, 0, 0, headerHeight)
-    header.BackgroundTransparency = 1
-    header.Parent = frame
-    local headerLabels = {}
-    for i, colName in ipairs(columns) do
-        local h = Instance.new("TextLabel")
-        h.Size = UDim2.new(colWidth, 0, 1, 0)
-        h.Position = UDim2.new(colWidth * (i - 1), 0, 0, 0)
-        h.BackgroundTransparency = 1
-        h.Text = colName
-        h.Font = Enum.Font.GothamBold
-        h.TextSize = 13
-        h.TextXAlignment = (i == 1) and Enum.TextXAlignment.Left or Enum.TextXAlignment.Center
-        h.Parent = header
-        Utils.AddPadding(h, UDim.new(0, i == 1 and 12 or 4), UDim.new(0, 4))
-        table.insert(headerLabels, h)
-    end
-    local headerLine = Instance.new("Frame")
-    headerLine.Size = UDim2.new(1, 0, 0, 1)
-    headerLine.Position = UDim2.new(0, 0, 1, -1)
-    headerLine.BorderSizePixel = 0
-    headerLine.Parent = header
 
     local scroller = Instance.new("ScrollingFrame")
-    scroller.Position = UDim2.new(0, 0, 0, headerHeight)
-    scroller.Size = UDim2.new(1, 0, 1, -headerHeight)
+    scroller.Position = UDim2.new(0, 6, 0, headerHeight + 4)
     scroller.BackgroundTransparency = 1
     scroller.BorderSizePixel = 0
     scroller.ScrollBarThickness = 4
     scroller.CanvasSize = UDim2.new(0, 0, 0, 0)
     scroller.AutomaticCanvasSize = Enum.AutomaticSize.Y
-    scroller.Parent = frame
-    local rowsLayout = Instance.new("UIListLayout")
-    rowsLayout.SortOrder = Enum.SortOrder.LayoutOrder
-    rowsLayout.Parent = scroller
+    scroller.Parent = container
+    local listLayout = Instance.new("UIListLayout")
+    listLayout.Padding = UDim.new(0, 4)
+    listLayout.Parent = scroller
 
-    local rowFrames = {}
-    local function buildRows(rows)
-        for _, rf in ipairs(rowFrames) do rf:Destroy() end
-        table.clear(rowFrames)
-        for ri, rowData in ipairs(rows or {}) do
-            local rf = Instance.new("Frame")
-            rf.Size = UDim2.new(1, 0, 0, rowHeight)
-            rf.LayoutOrder = ri
-            rf.BackgroundTransparency = (ri % 2 == 0) and 1 or 0.6
-            rf.Parent = scroller
-            for ci = 1, colCount do
-                local cell = Instance.new("TextLabel")
-                cell.Size = UDim2.new(colWidth, 0, 1, 0)
-                cell.Position = UDim2.new(colWidth * (ci - 1), 0, 0, 0)
-                cell.BackgroundTransparency = 1
-                cell.Text = tostring(rowData[ci] or "")
-                cell.Font = Enum.Font.Gotham
-                cell.TextSize = 13
-                cell.TextXAlignment = (ci == 1) and Enum.TextXAlignment.Left or Enum.TextXAlignment.Center
-                cell.TextTruncate = Enum.TextTruncate.AtEnd
-                cell.Parent = rf
-                Utils.AddPadding(cell, UDim.new(0, ci == 1 and 12 or 4), UDim.new(0, 4))
-            end
-            table.insert(rowFrames, rf)
-        end
+    local emptyLabel = Instance.new("TextLabel")
+    emptyLabel.Size = UDim2.new(1, 0, 0, rowHeight)
+    emptyLabel.BackgroundTransparency = 1
+    emptyLabel.Text = opts.EmptyText or "Không có mục nào"
+    emptyLabel.TextXAlignment = Enum.TextXAlignment.Left
+    emptyLabel.Font = Enum.Font.Gotham
+    emptyLabel.TextSize = 13
+    emptyLabel.Parent = scroller
+    Utils.AddPadding(emptyLabel, UDim.new(0, 8))
+
+    local rows = {}
+    local function updateContainerHeight()
+        local scrollH = math.max(math.min(#items, maxVisible), 1) * (rowHeight + 4)
+        scroller.Size = UDim2.new(1, -12, 0, scrollH)
+        container.Size = UDim2.new(1, 0, 0, headerHeight + scrollH + 10)
     end
-    buildRows(opts.Rows)
 
-    local self = { Instance = frame }
-    function self:SetRows(rows) buildRows(rows) end
+    local function rebuild()
+        rowConnMgr:DisconnectAll()
+        for _, row in ipairs(rows) do row.holder:Destroy() end
+        table.clear(rows)
+        emptyLabel.Visible = (#items == 0)
+
+        for i, item in ipairs(items) do
+            local holder = Instance.new("TextButton")
+            holder.Size = UDim2.new(1, 0, 0, rowHeight)
+            holder.LayoutOrder = i
+            holder.Text = ""
+            holder.AutoButtonColor = false
+            holder.Parent = scroller
+            Utils.AddCorner(holder, UDim.new(0, 6))
+            Animator.AddThickenStroke(holder, rowConnMgr)
+
+            local hasToggle = item.OnToggle ~= nil
+            local toggled = item.Toggled and true or false
+            local check, mark
+
+            if hasToggle then
+                check = Instance.new("Frame")
+                check.AnchorPoint = Vector2.new(0, 0.5)
+                check.Position = UDim2.new(0, 8, 0.5, 0)
+                check.Size = UDim2.new(0, 18, 0, 18)
+                check.Parent = holder
+                Utils.AddCorner(check, UDim.new(0, 4))
+                -- FIX: this used to be `local mark = Instance.new(...)`,
+                -- which shadowed the OUTER `mark` declared above (in
+                -- `local check, mark`) with a brand-new block-scoped
+                -- variable. The outer `mark` stayed nil forever, so the
+                -- MouseButton1Click handler below's
+                -- `TweenService:Create(mark, ...)` threw on every click —
+                -- which meant the subsequent `item.OnToggle(toggled)` call
+                -- never ran. Assigning to the outer `mark` (no `local`)
+                -- fixes both the error and the dead callback.
+                mark = Instance.new("TextLabel")
+                mark.Size = UDim2.new(1, 0, 1, 0)
+                mark.BackgroundTransparency = 1
+                mark.Text = "✓"
+                mark.TextColor3 = Color3.fromRGB(255, 255, 255)
+                mark.Font = Enum.Font.GothamBold
+                mark.TextSize = 13
+                mark.TextTransparency = toggled and 0 or 1
+                mark.Parent = check
+            end
+
+            local textLabel = Instance.new("TextLabel")
+            textLabel.Position = UDim2.new(0, hasToggle and 36 or 10, 0, 0)
+            textLabel.Size = UDim2.new(1, hasToggle and -130 or -104, 1, 0)
+            textLabel.BackgroundTransparency = 1
+            textLabel.Text = item.Text or ""
+            textLabel.TextXAlignment = Enum.TextXAlignment.Left
+            textLabel.Font = Enum.Font.Gotham
+            textLabel.TextSize = 14
+            textLabel.TextTruncate = Enum.TextTruncate.AtEnd
+            textLabel.Parent = holder
+
+            local subLabel
+            if item.SubText then
+                subLabel = Instance.new("TextLabel")
+                subLabel.AnchorPoint = Vector2.new(1, 0.5)
+                subLabel.Position = UDim2.new(1, -10, 0.5, 0)
+                subLabel.Size = UDim2.new(0, 80, 1, 0)
+                subLabel.BackgroundTransparency = 1
+                subLabel.Text = item.SubText
+                subLabel.TextXAlignment = Enum.TextXAlignment.Right
+                subLabel.Font = Enum.Font.Gotham
+                subLabel.TextSize = 13
+                subLabel.Parent = holder
+            end
+
+            if hasToggle then
+                rowConnMgr:Track(holder.MouseButton1Click:Connect(function()
+                    toggled = not toggled
+                    rows[i].toggled = toggled
+                    TweenService:Create(mark, TweenInfo.new(0.2, EASE, EASE_OUT), { TextTransparency = toggled and 0 or 1 }):Play()
+                    TweenService:Create(check, TweenInfo.new(0.2, EASE, EASE_OUT), {
+                        BackgroundColor3 = toggled and theme.Accent or Utils.Darken(theme.Color, 0.75)
+                    }):Play()
+                    item.OnToggle(toggled)
+                end))
+            elseif item.OnClick then
+                rowConnMgr:Track(holder.MouseButton1Click:Connect(function() item.OnClick() end))
+            end
+
+            table.insert(rows, { holder = holder, check = check, mark = mark, textLabel = textLabel, subLabel = subLabel, toggled = toggled })
+        end
+        updateContainerHeight()
+    end
+    rebuild()
+
+    local self = { Instance = container }
+    -- Rebuilds the row list from a new Items array (e.g. player join/leave).
+    function self:Refresh(newItems)
+        items = newItems or {}
+        rebuild()
+    end
+    function self:Destroy() rowConnMgr:DisconnectAll() end
     function self:ApplyTheme(color, accent, isInitial)
         local panelBg = Utils.Brighten(color, 1.2)
-        local darkBg = Utils.Darken(color, 0.85)
         local textColor = Utils.GetTextColorFor(panelBg, accent)
+        local darkBg = Utils.Darken(color, 0.75)
+        local rowBg = Utils.Darken(color, 0.85)
+        local subColor = Utils.GetTextColorFor(rowBg, accent)
         if isInitial then
-            frame.BackgroundColor3 = panelBg
-            headerLine.BackgroundColor3 = darkBg
-            for _, h in ipairs(headerLabels) do h.TextColor3 = textColor end
-            for _, rf in ipairs(rowFrames) do
-                rf.BackgroundColor3 = darkBg
-                for _, cell in ipairs(rf:GetChildren()) do
-                    if cell:IsA("TextLabel") then cell.TextColor3 = textColor end
-                end
+            container.BackgroundColor3 = panelBg
+            if headerLabel then headerLabel.TextColor3 = textColor end
+            emptyLabel.TextColor3 = subColor
+            for _, row in ipairs(rows) do
+                row.holder.BackgroundColor3 = rowBg
+                row.textLabel.TextColor3 = textColor
+                if row.subLabel then row.subLabel.TextColor3 = subColor end
+                if row.check then row.check.BackgroundColor3 = row.toggled and accent or darkBg end
             end
         else
-            TweenService:Create(frame, THEME_TWEEN_INFO, { BackgroundColor3 = panelBg }):Play()
-            TweenService:Create(headerLine, THEME_TWEEN_INFO, { BackgroundColor3 = darkBg }):Play()
-            for _, h in ipairs(headerLabels) do TweenService:Create(h, THEME_TWEEN_INFO, { TextColor3 = textColor }):Play() end
-            for _, rf in ipairs(rowFrames) do
-                TweenService:Create(rf, THEME_TWEEN_INFO, { BackgroundColor3 = darkBg }):Play()
-                for _, cell in ipairs(rf:GetChildren()) do
-                    if cell:IsA("TextLabel") then TweenService:Create(cell, THEME_TWEEN_INFO, { TextColor3 = textColor }):Play() end
+            TweenService:Create(container, THEME_TWEEN_INFO, { BackgroundColor3 = panelBg }):Play()
+            if headerLabel then TweenService:Create(headerLabel, THEME_TWEEN_INFO, { TextColor3 = textColor }):Play() end
+            TweenService:Create(emptyLabel, THEME_TWEEN_INFO, { TextColor3 = subColor }):Play()
+            for _, row in ipairs(rows) do
+                TweenService:Create(row.holder, THEME_TWEEN_INFO, { BackgroundColor3 = rowBg }):Play()
+                TweenService:Create(row.textLabel, THEME_TWEEN_INFO, { TextColor3 = textColor }):Play()
+                if row.subLabel then TweenService:Create(row.subLabel, THEME_TWEEN_INFO, { TextColor3 = subColor }):Play() end
+                if row.check then
+                    TweenService:Create(row.check, THEME_TWEEN_INFO, { BackgroundColor3 = row.toggled and accent or darkBg }):Play()
                 end
             end
         end
@@ -3721,3 +3449,1291 @@ function Components.Notification(parent, theme, connMgr, opts)
     function self:ApplyTheme() end -- notifications keep their creation-time look; they're short-lived
     return self
 end
+
+
+--============================================================
+-- MODULE: Tab (forward-declared; methods attached after Window below)
+--============================================================
+local TabMeta = {}
+TabMeta.__index = TabMeta
+
+--============================================================
+-- MODULE: Window
+-- Owns the ScreenGui, loading screen, chrome (titlebar/drag/resize/
+-- minimize) and the tab strip. Delegates page content to Tab objects,
+-- which delegate individual controls to Components. There is no in-UI
+-- close button — the window is closed programmatically instead, via
+-- Library:Destroy() (or Window:Destroy() directly).
+--============================================================
+local Window = {}
+Window.__index = Window
+
+-- Maps a window Title -> its ConnectionManager, for the currently-live
+-- window using that title. Lets destroyExisting() fully tear down a
+-- previous run's connections (drag/resize/hover/heartbeat tweens) instead
+-- of only deleting its ScreenGui and leaking every connection it made,
+-- which is what re-running this script used to do every single time.
+local activeWindows = {}
+
+local function destroyExisting(playerGui, name)
+    local prevConnMgr = activeWindows[name]
+    if prevConnMgr then
+        prevConnMgr:DisconnectAll()
+        activeWindows[name] = nil
+    end
+    local existing = playerGui:FindFirstChild(name)
+    if existing then existing:Destroy() end
+end
+
+-- Clamps a desired window size to the current viewport (minus a margin) so
+-- a window configured larger than the screen never spawns off-screen or
+-- clipped. Used both for the initial Size and for re-fitting on a
+-- ViewportSize change (device rotation, window resize, etc).
+local VIEWPORT_MARGIN = 40
+-- Shared with _setupResize's resize-drag clamp below so a window can never
+-- be fit smaller than the size the resize handle itself allows shrinking
+-- to. Previously these were two separate, out-of-sync constants (300x220
+-- here vs 340x260 in _setupResize), so a window fit to the smaller floor
+-- on a tiny viewport would visibly snap larger the first time it was
+-- resized by hand.
+local MIN_WINDOW_W, MIN_WINDOW_H = 340, 260
+local MIN_FIT_W, MIN_FIT_H = MIN_WINDOW_W, MIN_WINDOW_H
+local function fitToViewport(size)
+    local viewport = workspace.CurrentCamera.ViewportSize
+    local maxW = math.max(viewport.X - VIEWPORT_MARGIN, MIN_FIT_W)
+    local maxH = math.max(viewport.Y - VIEWPORT_MARGIN, MIN_FIT_H)
+    local w = math.min(size.X.Offset, maxW)
+    local h = math.min(size.Y.Offset, maxH)
+    return UDim2.new(0, w, 0, h)
+end
+
+-- Clamps a frame's Position so it stays fully on-screen for the given
+-- Size/AnchorPoint. Shared by the titlebar drag handler and the viewport
+-- refit handler below — previously only drag clamped position, so a
+-- window sitting near a screen edge whose viewport then shrank (rotation,
+-- resizing the game window) could end up stuck partly off-screen with no
+-- way to recover short of dragging it back manually.
+local function clampFramePosition(pos, size, anchor)
+    local viewport = workspace.CurrentCamera.ViewportSize
+    local w, h = size.X.Offset, size.Y.Offset
+
+    local scaleX = pos.X.Scale * viewport.X
+    local scaleY = pos.Y.Scale * viewport.Y
+
+    local minX, maxX = anchor.X * w - scaleX, viewport.X - (1 - anchor.X) * w - scaleX
+    local minY, maxY = anchor.Y * h - scaleY, viewport.Y - (1 - anchor.Y) * h - scaleY
+
+    if minX > maxX then minX, maxX = maxX, minX end
+    if minY > maxY then minY, maxY = maxY, minY end
+
+    local x = math.clamp(pos.X.Offset, minX, maxX)
+    local y = math.clamp(pos.Y.Offset, minY, maxY)
+    return UDim2.new(pos.X.Scale, x, pos.Y.Scale, y)
+end
+
+function Window.new(config)
+    config = config or {}
+    local title = config.Title or "Selenix"
+    local size = config.Size or UDim2.new(0, 460, 0, 390)
+    -- Optional titlebar icon. Pass an asset id string (e.g. "rbxassetid://123"
+    -- or just the numeric id, both accepted below). Leave nil/"" to omit the
+    -- icon entirely — the title text then shifts left to fill the freed space
+    -- instead of leaving an empty gap where the icon would have been.
+    local icon = config.Icon
+    if type(icon) == "number" then icon = "rbxassetid://" .. tostring(icon) end
+    if icon == "" then icon = nil end
+
+    local playerGui = Player:WaitForChild("PlayerGui")
+    destroyExisting(playerGui, title)
+
+    local screenGui = Instance.new("ScreenGui")
+    screenGui.Name = title
+    screenGui.ResetOnSpawn = false
+    screenGui.Parent = playerGui
+
+    local connMgr = ConnectionManager.new()
+    local theme = Theme.new(config.Color or Color3.fromRGB(30, 30, 35), config.Accent or Color3.fromRGB(60, 60, 70))
+    activeWindows[title] = connMgr
+
+    local self = setmetatable({
+        _title = title,
+        _icon = icon,
+        _screenGui = screenGui,
+        _connMgr = connMgr,
+        _theme = theme,
+        _tabs = {},
+        _tabButtons = {},
+        _pages = {},
+        _activeTabIndex = 1,
+        -- config.Loading (optional): { Manual = bool, WaitForGameLoaded = bool,
+        -- PreloadIcon = bool } — see _buildLoadingScreen / SetLoadingProgress.
+        _loadingConfig = config.Loading or {},
+        -- Flag -> component object registry, populated by Tab:CreateXxx({Flag=...})
+        -- and consumed by SaveConfig/LoadConfig below.
+        _flags = {},
+    }, Window)
+
+    self:_buildChrome(title, fitToViewport(size))
+    self:_buildNotificationLayer()
+    return self
+end
+
+function Window:_buildChrome(title, originalSize)
+    local screenGui, connMgr, theme = self._screenGui, self._connMgr, self._theme
+
+    -- Main frame
+    local mainFrame = Instance.new("Frame")
+    mainFrame.AnchorPoint = Vector2.new(0.5, 0.5)
+    mainFrame.Size = originalSize
+    mainFrame.Position = UDim2.new(0.5, 0, 0.5, 0)
+    mainFrame.BorderSizePixel = 0
+    mainFrame.ClipsDescendants = true
+    mainFrame.Active = true
+    mainFrame.Visible = false
+    mainFrame.BackgroundTransparency = 1
+    mainFrame.Parent = screenGui
+    local MAIN_FRAME_RADIUS = UDim.new(0, 12)
+    Utils.AddCorner(mainFrame, MAIN_FRAME_RADIUS)
+    self._mainFrame = mainFrame
+    self._mainFrameRadius = MAIN_FRAME_RADIUS
+
+    local stroke = Instance.new("UIStroke")
+    stroke.Thickness = 1
+    stroke.Parent = mainFrame
+
+    local shadow = Instance.new("UIShadow")
+    shadow.Color = Color3.fromRGB(0, 0, 0)
+    shadow.Transparency = 1
+    shadow.BlurRadius = UDim.new(0, 18)
+    shadow.Offset = UDim2.new(0, 0, 0, 6)
+    shadow.Parent = mainFrame
+
+    local mainScale = Instance.new("UIScale")
+    mainScale.Scale = 0.8
+    mainScale.Parent = mainFrame
+
+    -- Loading screen
+    self:_buildLoadingScreen(title, mainFrame, mainScale, shadow)
+
+    -- Titlebar
+    local titleBar = Instance.new("Frame")
+    titleBar.Size = UDim2.new(1, 0, 0, 40)
+    titleBar.BorderSizePixel = 0
+    titleBar.Active = true
+    titleBar.Parent = mainFrame
+    local titleBarCorner = Utils.AddCornerEx(titleBar, UDim.new(0, 12), UDim.new(0, 12), UDim.new(0, 0), UDim.new(0, 0))
+    self._titleBar = titleBar
+    self._titleBarCorner = titleBarCorner
+
+    local hasIcon = self._icon ~= nil
+    local titleIcon
+    if hasIcon then
+        titleIcon = Instance.new("ImageLabel")
+        titleIcon.AnchorPoint = Vector2.new(0, 0.5)
+        titleIcon.Position = UDim2.new(0, 5, 0.5, 0)
+        titleIcon.Size = UDim2.new(0, 34, 0, 34)
+        titleIcon.BackgroundTransparency = 1
+        titleIcon.Image = self._icon
+        titleIcon.Parent = titleBar
+    end
+
+    local titleLabel = Instance.new("TextLabel")
+    if hasIcon then
+        titleLabel.Size = UDim2.new(1, -122, 1, 0)
+        titleLabel.Position = UDim2.new(0, 36, 0, 0)
+    else
+        titleLabel.Size = UDim2.new(1, -101, 1, 0)
+        titleLabel.Position = UDim2.new(0, 15, 0, 0)
+    end
+    titleLabel.BackgroundTransparency = 1
+    titleLabel.Text = title
+    titleLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
+    titleLabel.TextXAlignment = Enum.TextXAlignment.Left
+    titleLabel.Font = Enum.Font.GothamBold
+    titleLabel.TextSize = 18
+    titleLabel.Parent = titleBar
+
+    local function chromeButton(xOffset, text, bgColor, hoverColor)
+        local b = Instance.new("TextButton")
+        b.Size = UDim2.new(0, 30, 0, 30)
+        b.AnchorPoint = Vector2.new(0.5, 0.5)
+        b.Position = UDim2.new(1, xOffset + 15, 0, 5 + 15)
+        b.BackgroundColor3 = bgColor
+        b.BackgroundTransparency = 1
+        b.Text = text
+        b.TextColor3 = Color3.fromRGB(255, 255, 255)
+        b.TextSize = 18
+        b.Font = Enum.Font.GothamBold
+        b.Parent = titleBar
+        Utils.AddCorner(b, UDim.new(0, 6))
+        Animator.AddHoverEffect(b, connMgr, bgColor, hoverColor, true)
+        return b
+    end
+
+    local minimizeBtn = chromeButton(-40, "—", Color3.fromRGB(60, 60, 70), Color3.fromRGB(80, 80, 95))
+
+    self:_setupDrag(titleBar, mainFrame)
+
+    local mainGradient = Instance.new("UIGradient"); mainGradient.Rotation = 45; mainGradient.Enabled = false; mainGradient.Parent = mainFrame
+    local titleGradient = Instance.new("UIGradient"); titleGradient.Rotation = 45; titleGradient.Enabled = false; titleGradient.Parent = titleBar
+
+    local contentGroup = Instance.new("CanvasGroup")
+    contentGroup.Name = "Content"
+    contentGroup.Size = UDim2.new(1, 0, 1, 0)
+    contentGroup.BackgroundTransparency = 1
+    contentGroup.Parent = mainFrame
+    self._contentGroup = contentGroup
+
+    -- Tab strip
+    local tabContainer = Instance.new("ScrollingFrame")
+    tabContainer.Size = UDim2.new(1, 0, 0, 45)
+    tabContainer.Position = UDim2.new(0, 0, 0, 40)
+    tabContainer.BorderSizePixel = 0
+    tabContainer.ScrollingDirection = Enum.ScrollingDirection.X
+    tabContainer.ScrollBarThickness = 0
+    tabContainer.CanvasSize = UDim2.new(0, 0, 0, 0)
+    tabContainer.AutomaticCanvasSize = Enum.AutomaticSize.X
+    tabContainer.ElasticBehavior = Enum.ElasticBehavior.WhenScrollable
+    tabContainer.BackgroundTransparency = 1
+    tabContainer.Parent = contentGroup
+    local tabContainerGradient = Instance.new("UIGradient"); tabContainerGradient.Rotation = 45; tabContainerGradient.Enabled = false; tabContainerGradient.Parent = tabContainer
+    local tabLayout = Instance.new("UIListLayout")
+    tabLayout.FillDirection = Enum.FillDirection.Horizontal
+    tabLayout.SortOrder = Enum.SortOrder.LayoutOrder
+    tabLayout.VerticalAlignment = Enum.VerticalAlignment.Center
+    tabLayout.Padding = UDim.new(0, 10)
+    tabLayout.Parent = tabContainer
+    Utils.AddPadding(tabContainer, UDim.new(0, 10), UDim.new(0, 10))
+    self._tabContainer = tabContainer
+
+    local SLIDE_OFFSET = 26
+    self._slideOffset = SLIDE_OFFSET
+
+    self._gradients = {
+        { Gradient = mainGradient, Tint = 1 },
+        { Gradient = titleGradient, Tint = 0.7 },
+        { Gradient = tabContainerGradient, Tint = 0.85 },
+    }
+
+    self:_setupResize(mainFrame, originalSize)
+    self:_setupMinimize(mainFrame, minimizeBtn)
+    self:_setupViewportRefit(mainFrame)
+
+    theme:Subscribe(function(color, accent, isInitial)
+        local darkTitle = Utils.Darken(color, 0.7)
+        local darkTab = Utils.Darken(color, 0.85)
+        local strokeColor = Utils.Brighten(color, 1.3)
+        local titleTextColor = Utils.GetTextColorFor(darkTitle, accent)
+
+        if isInitial then
+            mainFrame.BackgroundColor3 = color
+            titleBar.BackgroundColor3 = darkTitle
+            tabContainer.BackgroundColor3 = darkTab
+            stroke.Color = strokeColor
+            titleLabel.TextColor3 = titleTextColor
+        else
+            local info = THEME_TWEEN_INFO
+            TweenService:Create(mainFrame, info, { BackgroundColor3 = color }):Play()
+            TweenService:Create(titleBar, info, { BackgroundColor3 = darkTitle }):Play()
+            TweenService:Create(tabContainer, info, { BackgroundColor3 = darkTab }):Play()
+            TweenService:Create(stroke, info, { Color = strokeColor }):Play()
+            TweenService:Create(titleLabel, info, { TextColor3 = titleTextColor }):Play()
+        end
+
+        self:_restyleTabButtons(color, accent)
+    end)
+end
+
+function Window:_setupViewportRefit(mainFrame)
+    local connMgr = self._connMgr
+    connMgr:Track(workspace.CurrentCamera:GetPropertyChangedSignal("ViewportSize"):Connect(function()
+        if self._resizing or self._animating or self._titleDragging then return end
+
+        if self._minimized then
+            -- mainFrame's current Size is the minimized bar, not the real
+            -- window size, so don't touch it — just keep _currentTargetSize
+            -- in sync with the new viewport so restoring later can't pop
+            -- back to a size larger than the (possibly now-smaller) screen.
+            self._currentTargetSize = fitToViewport(self._currentTargetSize)
+            return
+        end
+
+        local fitted = fitToViewport(mainFrame.Size)
+        local sizeChanged = fitted ~= mainFrame.Size
+        if sizeChanged then
+            Animator.Tween(mainFrame, { Size = fitted }, 0.25):Play()
+            self._currentTargetSize = fitted
+        end
+
+        -- Also re-clamp Position: a window parked near a screen edge can
+        -- end up partly (or entirely) off-screen once the viewport shrinks
+        -- (device rotation, resizing the game window), with nothing else
+        -- to pull it back — dragging clamps position, but a passive
+        -- viewport change previously didn't.
+        local clampedPos = clampFramePosition(mainFrame.Position, sizeChanged and fitted or mainFrame.Size, mainFrame.AnchorPoint)
+        if clampedPos ~= mainFrame.Position then
+            Animator.Tween(mainFrame, { Position = clampedPos }, 0.25):Play()
+        end
+    end))
+end
+
+function Window:_buildLoadingScreen(title, mainFrame, mainScale, mainShadow)
+    local screenGui = self._screenGui
+    local theme = self._theme
+    local loadingCfg = self._loadingConfig or {}
+    local manual = loadingCfg.Manual == true
+    local waitForGameLoaded = (loadingCfg.WaitForGameLoaded ~= false)
+    local preloadIcon = (loadingCfg.PreloadIcon ~= false) and (self._icon ~= nil)
+
+    local loading = Instance.new("Frame")
+    loading.AnchorPoint = Vector2.new(0.5, 0.5)
+    loading.Position = UDim2.new(0.5, 0, 0.5, 0)
+    loading.Size = UDim2.new(0, 280, 0, 130)
+    loading.BackgroundColor3 = theme.Color
+    loading.BorderSizePixel = 0
+    loading.Parent = screenGui
+    Utils.AddCorner(loading, UDim.new(0, 12))
+    local loadingStroke = Instance.new("UIStroke")
+    loadingStroke.Color = Utils.Brighten(theme.Color, 1.3)
+    loadingStroke.Thickness = 1
+    loadingStroke.Parent = loading
+
+    local loadingTitle = Instance.new("TextLabel")
+    loadingTitle.Size = UDim2.new(1, -30, 0, 28)
+    loadingTitle.Position = UDim2.new(0, 15, 0, 26)
+    loadingTitle.BackgroundTransparency = 1
+    loadingTitle.Text = title
+    loadingTitle.TextColor3 = Color3.fromRGB(255, 255, 255)
+    loadingTitle.TextXAlignment = Enum.TextXAlignment.Left
+    loadingTitle.Font = Enum.Font.GothamBold
+    loadingTitle.TextSize = 20
+    loadingTitle.Parent = loading
+
+    local loadingSubtitle = Instance.new("TextLabel")
+    loadingSubtitle.Size = UDim2.new(1, -30, 0, 18)
+    loadingSubtitle.Position = UDim2.new(0, 15, 0, 56)
+    loadingSubtitle.BackgroundTransparency = 1
+    loadingSubtitle.Text = "Đang khởi tạo..."
+    loadingSubtitle.TextColor3 = Color3.fromRGB(180, 180, 190)
+    loadingSubtitle.TextXAlignment = Enum.TextXAlignment.Left
+    loadingSubtitle.Font = Enum.Font.Gotham
+    loadingSubtitle.TextSize = 13
+    loadingSubtitle.Parent = loading
+
+    local barTrack = Instance.new("Frame")
+    barTrack.Size = UDim2.new(1, -30, 0, 6)
+    barTrack.Position = UDim2.new(0, 15, 1, -28)
+    barTrack.BackgroundColor3 = Utils.Darken(theme.Color, 0.8)
+    barTrack.BorderSizePixel = 0
+    barTrack.Parent = loading
+    Utils.AddCorner(barTrack, UDim.new(1, 0))
+
+    local barFill = Instance.new("Frame")
+    barFill.Size = UDim2.new(0, 0, 1, 0)
+    barFill.BackgroundColor3 = theme.Accent
+    barFill.BorderSizePixel = 0
+    barFill.Parent = barTrack
+    Utils.AddCorner(barFill, UDim.new(1, 0))
+
+    local loadingScale = Instance.new("UIScale")
+    loadingScale.Scale = 0.85
+    loadingScale.Parent = loading
+    loading.BackgroundTransparency = 1
+
+    Animator.Tween(loadingScale, { Scale = 1 }, 0.35):Play()
+    Animator.Tween(loading, { BackgroundTransparency = 0 }, 0.35):Play()
+
+    local connMgr = self._connMgr
+    self._loadingDone = false
+    self._loadingAlpha = 0
+
+    local function finishLoading()
+        if self._loadingDone then return end
+        self._loadingDone = true
+        Animator.Tween(loadingScale, { Scale = 0.85 }, 0.3, EASE, EASE_IN):Play()
+        local fadeOut = Animator.Tween(loading, { BackgroundTransparency = 1 }, 0.3, EASE, EASE_IN)
+        fadeOut.Completed:Connect(function()
+            loading:Destroy()
+            mainFrame.Visible = true
+            Animator.Tween(mainScale, { Scale = 1 }, 0.35):Play()
+            Animator.Tween(mainFrame, { BackgroundTransparency = 0 }, 0.45):Play()
+            Animator.Tween(mainShadow, { Transparency = 0.45 }, 0.5):Play()
+        end)
+        fadeOut:Play()
+    end
+    self._finishLoading = finishLoading
+
+    function self:SetLoadingProgress(alpha, text)
+        if self._loadingDone then return end
+        alpha = math.clamp(alpha or 0, 0, 1)
+        self._loadingAlpha = alpha
+        Animator.Tween(barFill, { Size = UDim2.new(alpha, 0, 1, 0) }, 0.25):Play()
+        if text then loadingSubtitle.Text = text end
+        if alpha >= 1 then finishLoading() end
+    end
+
+    function self:FinishLoading(text)
+        self:SetLoadingProgress(1, text)
+    end
+
+    task.spawn(function()
+        local steps = {}
+        if waitForGameLoaded and not game:IsLoaded() then table.insert(steps, "game") end
+        if preloadIcon then table.insert(steps, "icon") end
+
+        if #steps == 0 then
+            if not manual then self:FinishLoading("Sẵn sàng") end
+            return
+        end
+
+        local capMax = manual and 0.9 or 1.0
+        local completed = 0
+        local function stepDone(text)
+            completed = completed + 1
+            self:SetLoadingProgress((completed / #steps) * capMax, text)
+        end
+
+        if waitForGameLoaded and not game:IsLoaded() then
+            self:SetLoadingProgress(0, "Đang chờ game tải...")
+            game.Loaded:Wait()
+            stepDone("Đã tải game")
+        end
+        if preloadIcon then
+            local ok = pcall(function()
+                ContentProvider:PreloadAsync({ self._icon })
+            end)
+            stepDone(ok and "Đã tải icon" or "Bỏ qua icon")
+        end
+
+        if not manual then
+            self:FinishLoading("Sẵn sàng")
+        end
+    end)
+end
+
+function Window:_setupDrag(titleBar, mainFrame)
+    local connMgr = self._connMgr
+    self._titleDragging = false
+    local activeInput, dragStart, startPos
+
+    connMgr:Track(titleBar.InputBegan:Connect(function(input)
+        if self._titleDragging or self._resizing or self._animating then return end
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            self._titleDragging = true
+            activeInput = input
+            dragStart = input.Position
+            startPos = mainFrame.Position
+        end
+    end))
+    connMgr:Track(UserInputService.InputChanged:Connect(function(input)
+        if self._titleDragging and input == activeInput
+            and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+            local delta = input.Position - dragStart
+            local newPos = UDim2.new(
+                startPos.X.Scale, startPos.X.Offset + delta.X,
+                startPos.Y.Scale, startPos.Y.Offset + delta.Y
+            )
+            mainFrame.Position = clampFramePosition(newPos, mainFrame.Size, mainFrame.AnchorPoint)
+        end
+    end))
+    connMgr:Track(UserInputService.InputEnded:Connect(function(input)
+        if self._titleDragging and input == activeInput then
+            self._titleDragging = false
+            activeInput = nil
+        end
+    end))
+end
+
+function Window:_setupResize(mainFrame, originalSize)
+    local connMgr = self._connMgr
+    self._currentTargetSize = originalSize
+    self._resizing = false
+
+    local function maxSize()
+        local viewport = workspace.CurrentCamera.ViewportSize
+        return math.max(viewport.X - VIEWPORT_MARGIN, MIN_WINDOW_W),
+               math.max(viewport.Y - VIEWPORT_MARGIN, MIN_WINDOW_H)
+    end
+
+    local handle = Instance.new("TextButton")
+    handle.AnchorPoint = Vector2.new(1, 1)
+    handle.Size = UDim2.new(0, 22, 0, 22)
+    handle.Position = UDim2.new(1, -2, 1, -2)
+    handle.BackgroundTransparency = 1
+    handle.Text = "◢"
+    handle.TextColor3 = Color3.fromRGB(150, 150, 165)
+    handle.TextSize = 16
+    handle.Font = Enum.Font.GothamBold
+    handle.ZIndex = 15
+    handle.Active = true
+    handle.Parent = mainFrame
+    self._resizeHandle = handle
+
+    local function anchorTopLeftForResize()
+        local size, pos = mainFrame.Size, mainFrame.Position
+        mainFrame.AnchorPoint = Vector2.new(0, 0)
+        mainFrame.Position = UDim2.new(
+            pos.X.Scale, pos.X.Offset - size.X.Offset / 2,
+            pos.Y.Scale, pos.Y.Offset - size.Y.Offset / 2
+        )
+    end
+    local function anchorCenterAfterResize()
+        local size, pos = mainFrame.Size, mainFrame.Position
+        mainFrame.AnchorPoint = Vector2.new(0.5, 0.5)
+        mainFrame.Position = UDim2.new(
+            pos.X.Scale, pos.X.Offset + size.X.Offset / 2,
+            pos.Y.Scale, pos.Y.Offset + size.Y.Offset / 2
+        )
+    end
+
+    local contentGroup = self._contentGroup
+
+    local activeInput, dragStart, startSize
+    connMgr:Track(handle.InputBegan:Connect(function(input)
+        if self._resizing or self._titleDragging or self._minimized or self._animating then return end
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            self._resizing = true
+            activeInput = input
+            dragStart = input.Position
+            anchorTopLeftForResize()
+            startSize = mainFrame.Size
+            contentGroup.Visible = false
+        end
+    end))
+    connMgr:Track(UserInputService.InputChanged:Connect(function(input)
+        if self._resizing and input == activeInput
+            and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+            local delta = input.Position - dragStart
+            local MAX_W, MAX_H = maxSize()
+            local w = math.clamp(startSize.X.Offset + delta.X, MIN_WINDOW_W, MAX_W)
+            local h = math.clamp(startSize.Y.Offset + delta.Y, MIN_WINDOW_H, MAX_H)
+            mainFrame.Size = UDim2.new(0, w, 0, h)
+        end
+    end))
+    connMgr:Track(UserInputService.InputEnded:Connect(function(input)
+        if self._resizing and input == activeInput then
+            self._resizing = false
+            activeInput = nil
+            self._currentTargetSize = mainFrame.Size
+            anchorCenterAfterResize()
+            contentGroup.Visible = true
+        end
+    end))
+    connMgr:Track(handle.MouseEnter:Connect(function()
+        if not self._minimized then Animator.Tween(handle, { TextColor3 = Color3.fromRGB(220, 220, 230) }, 0.25):Play() end
+    end))
+    connMgr:Track(handle.MouseLeave:Connect(function()
+        Animator.Tween(handle, { TextColor3 = Color3.fromRGB(150, 150, 165) }, 0.25):Play()
+    end))
+end
+
+function Window:_setupMinimize(mainFrame, minimizeBtn)
+    local connMgr = self._connMgr
+    self._minimized = false
+    self._animating = false
+
+    local MINIMIZED_HEIGHT = 40
+    local SIZE_TWEEN_TIME = 0.4
+    local CONTENT_FADE_OUT_TIME = 0.22
+    local CONTENT_FADE_IN_TIME = 0.28
+
+    local function anchorTopCenter()
+        local size, pos = mainFrame.Size, mainFrame.Position
+        local topY = pos.Y.Offset - size.Y.Offset / 2
+        mainFrame.AnchorPoint = Vector2.new(0.5, 0)
+        mainFrame.Position = UDim2.new(pos.X.Scale, pos.X.Offset, pos.Y.Scale, topY)
+    end
+    local function anchorCenter()
+        local size, pos = mainFrame.Size, mainFrame.Position
+        local centerY = pos.Y.Offset + size.Y.Offset / 2
+        mainFrame.AnchorPoint = Vector2.new(0.5, 0.5)
+        mainFrame.Position = UDim2.new(pos.X.Scale, pos.X.Offset, pos.Y.Scale, centerY)
+    end
+
+    connMgr:Track(minimizeBtn.MouseButton1Click:Connect(function()
+        if self._animating then return end
+        self._animating = true
+        self._minimized = not self._minimized
+
+        local contentGroup = self._contentGroup
+        local titleBarCorner = self._titleBarCorner
+        local mainFrameRadius = self._mainFrameRadius
+
+        if self._minimized then
+            minimizeBtn.Text = "▢"
+            self._resizeHandle.Visible = false
+
+            local focused = UserInputService:GetFocusedTextBox()
+            if focused then focused:ReleaseFocus() end
+
+            Animator.FadeCanvasGroup(contentGroup, 1, CONTENT_FADE_OUT_TIME, connMgr, function()
+                self._tabContainer.Visible = false
+                for _, p in ipairs(self._pages) do p.Visible = false end
+
+                anchorTopCenter()
+                local currentW = mainFrame.Size.X.Offset
+                local shrink = Animator.Tween(mainFrame, {
+                    Size = UDim2.new(0, currentW, 0, MINIMIZED_HEIGHT)
+                }, SIZE_TWEEN_TIME)
+                Animator.Tween(titleBarCorner, {
+                    BottomLeftRadius = mainFrameRadius,
+                    BottomRightRadius = mainFrameRadius,
+                }, SIZE_TWEEN_TIME):Play()
+                shrink.Completed:Connect(function() self._animating = false end)
+                shrink:Play()
+            end)
+        else
+            minimizeBtn.Text = "—"
+
+            self._tabContainer.Visible = true
+            for i, p in ipairs(self._pages) do
+                p.Visible = (i == self._activeTabIndex)
+                p.Position = UDim2.new(0, 10, 0, 95)
+            end
+            self._resizeHandle.Visible = true
+            contentGroup.GroupTransparency = 1
+
+            local targetSize = self._currentTargetSize
+            local grow = Animator.Tween(mainFrame, { Size = targetSize }, SIZE_TWEEN_TIME)
+            Animator.Tween(titleBarCorner, {
+                BottomLeftRadius = UDim.new(0, 0),
+                BottomRightRadius = UDim.new(0, 0),
+            }, SIZE_TWEEN_TIME):Play()
+            grow.Completed:Connect(function()
+                anchorCenter()
+                if self._minimized then self._animating = false; return end
+
+                Animator.FadeCanvasGroup(contentGroup, 0, CONTENT_FADE_IN_TIME, connMgr, function()
+                    self._animating = false
+                end)
+            end)
+            grow:Play()
+        end
+    end))
+end
+
+function Window:_restyleTabButtons(color, accent)
+    local inactiveBg = Utils.Darken(color, 0.82)
+    for i, btn in ipairs(self._tabButtons) do
+        local isActive = (i == self._activeTabIndex)
+        local bg = isActive and accent or inactiveBg
+        Animator.Tween(btn, {
+            BackgroundColor3 = bg,
+            TextColor3 = Utils.GetTextColorFor(bg, accent),
+        }, 0.25):Play()
+    end
+end
+
+function Window:CreateTab(name)
+    local index = #self._tabButtons + 1
+    local connMgr, theme, mainFrame = self._connMgr, self._theme, self._mainFrame
+
+    local btn = Instance.new("TextButton")
+    btn.Size = UDim2.new(0, 120, 0, 35)
+    btn.LayoutOrder = index
+    btn.BackgroundColor3 = (index == 1) and theme.Accent or Utils.Darken(theme.Color, 0.82)
+    btn.Text = name
+    btn.Font = Enum.Font.GothamBold
+    btn.TextSize = 15
+    btn.AutoButtonColor = false
+    btn.Parent = self._tabContainer
+    Utils.AddCorner(btn, UDim.new(0, 6))
+
+    local function tabBaseColor()
+        return (index == self._activeTabIndex) and theme.Accent or Utils.Darken(theme.Color, 0.82)
+    end
+    local function tabTextColor()
+        return Utils.GetTextColorFor(tabBaseColor(), theme.Accent)
+    end
+    local function tabHoverTextColor()
+        return Utils.GetTextColorFor(Utils.Brighten(tabBaseColor(), 1.2), theme.Accent)
+    end
+
+    btn.TextColor3 = tabTextColor()
+
+    connMgr:Track(btn.MouseEnter:Connect(function()
+        local hoverBg = Utils.Brighten(tabBaseColor(), 1.2)
+        TweenService:Create(btn, TweenInfo.new(0.25, EASE, EASE_OUT), {
+            BackgroundColor3 = hoverBg,
+            TextColor3 = tabHoverTextColor(),
+        }):Play()
+    end))
+    connMgr:Track(btn.MouseLeave:Connect(function()
+        TweenService:Create(btn, TweenInfo.new(0.25, EASE, EASE_OUT), {
+            BackgroundColor3 = tabBaseColor(),
+            TextColor3 = tabTextColor(),
+        }):Play()
+    end))
+    table.insert(self._tabButtons, btn)
+
+    local page = Instance.new("ScrollingFrame")
+    page.Size = UDim2.new(1, -20, 1, -110)
+    page.Position = UDim2.new(0, 10, 0, 95)
+    page.BackgroundTransparency = 1
+    page.BorderSizePixel = 0
+    page.ScrollBarThickness = 0
+    page.CanvasSize = UDim2.new(0, 0, 0, 0)
+    page.AutomaticCanvasSize = Enum.AutomaticSize.Y
+    page.Parent = self._contentGroup
+    page.Visible = (index == 1)
+    local layout = Instance.new("UIListLayout")
+    layout.SortOrder = Enum.SortOrder.LayoutOrder
+    layout.Padding = UDim.new(0, 10)
+    layout.Parent = page
+    Utils.AddPadding(page, UDim.new(0, 4), UDim.new(0, 4), UDim.new(0, 4), UDim.new(0, 4))
+    table.insert(self._pages, page)
+
+    local switching = false
+    local PAGE_BASE_POS = UDim2.new(0, 10, 0, 95)
+    local function switchTo()
+        if switching or index == self._activeTabIndex then return end
+        switching = true
+        local previousIndex = self._activeTabIndex
+        local direction = (index > previousIndex) and 1 or -1
+        self._activeTabIndex = index
+        self:_restyleTabButtons(theme.Color, theme.Accent)
+
+        self._pages[previousIndex].Visible = false
+        self._pages[previousIndex].Position = PAGE_BASE_POS
+
+        local newPage = self._pages[index]
+        newPage.Position = UDim2.new(0, 10 + direction * self._slideOffset, 0, 95)
+        newPage.Visible = true
+
+        local slide = Animator.Tween(newPage, { Position = PAGE_BASE_POS }, 0.35)
+        slide.Completed:Connect(function() switching = false end)
+        slide:Play()
+    end
+    connMgr:Track(btn.MouseButton1Click:Connect(switchTo))
+
+    local tab = setmetatable({
+        _page = page,
+        _button = btn,
+        _theme = theme,
+        _connMgr = connMgr,
+        _window = self,
+        _order = 0,
+    }, TabMeta)
+    table.insert(self._tabs, tab)
+    return tab
+end
+
+function Window:Destroy()
+    if activeWindows[self._title] == self._connMgr then
+        activeWindows[self._title] = nil
+    end
+    self._connMgr:DisconnectAll()
+    local mainScale = self._mainFrame:FindFirstChildOfClass("UIScale")
+    local shadow = self._mainFrame:FindFirstChildOfClass("UIShadow")
+    if mainScale then Animator.Tween(mainScale, { Scale = 0.5 }, 0.3, EASE, EASE_IN):Play() end
+    Animator.Tween(self._mainFrame, { BackgroundTransparency = 1 }, 0.3, EASE, EASE_IN):Play()
+    if shadow then Animator.Tween(shadow, { Transparency = 1 }, 0.3, EASE, EASE_IN):Play() end
+    task.delay(0.3, function() self._screenGui:Destroy() end)
+end
+
+function Window:GetTheme() return self._theme end
+function Window:GetGradients() return self._gradients end
+
+function Window:_registerFlag(flag, obj)
+    if not flag then return end
+    if self._flags[flag] then
+        warn(("[Selenix] Flag \"%s\" is already registered — SaveConfig/LoadConfig will only see the most recently created control using this Flag."):format(tostring(flag)))
+    end
+    self._flags[flag] = obj
+end
+
+local CONFIG_FOLDER = "Selenix/Config"
+-- Marker file recording the name of the most recently *saved* config, kept
+-- outside the .json namespace (ListConfigs' pattern only matches "*.json")
+-- so it never shows up as a fake config entry. This is what
+-- Window:GetLastConfig() / CreateConfigList's AutoLoadLast read from.
+local LAST_CONFIG_MARKER = CONFIG_FOLDER .. "/_last.txt"
+
+local function configFolder()
+    if not (isfolder and makefolder) then return nil end
+    if not isfolder(CONFIG_FOLDER) then makefolder(CONFIG_FOLDER) end
+    return CONFIG_FOLDER
+end
+
+local function configPath(name)
+    return CONFIG_FOLDER .. "/" .. (name or "default") .. ".json"
+end
+
+function Window:SaveConfig(name)
+    if not writefile then return false, "executor has no writefile" end
+    if not (name and name ~= "") then return false, "config name is empty" end
+
+    configFolder()
+    local path = configPath(name)
+
+    local data = {}
+    for flag, obj in pairs(self._flags) do
+        if obj.Get then
+            local ok, v = pcall(function() return obj:Get() end)
+            if ok then
+                if typeof(v) == "Color3" then
+                    data[flag] = { __color3 = true, r = v.R, g = v.G, b = v.B }
+                else
+                    data[flag] = v
+                end
+            end
+        end
+    end
+
+    local okEncode, encoded = pcall(HttpService.JSONEncode, HttpService, data)
+    if not okEncode then return false, "JSONEncode failed" end
+    local okWrite = pcall(writefile, path, encoded)
+    if not okWrite then return false, "writefile failed" end
+
+    -- Record this as the most recently saved config. Best-effort: a failure
+    -- here shouldn't turn a successful SaveConfig into a reported failure,
+    -- it just means AutoLoadLast/GetLastConfig won't pick this one up.
+    pcall(writefile, LAST_CONFIG_MARKER, name)
+
+    return true
+end
+
+function Window:LoadConfig(name)
+    if not (readfile and isfile) then return false, "executor has no readfile/isfile" end
+
+    local path = configPath(name)
+    if not isfile(path) then return false, "config file not found" end
+
+    local okRead, raw = pcall(readfile, path)
+    if not okRead then return false, "readfile failed" end
+    local okDecode, data = pcall(HttpService.JSONDecode, HttpService, raw)
+    if not okDecode or type(data) ~= "table" then return false, "JSONDecode failed" end
+
+    for flag, obj in pairs(self._flags) do
+        local v = data[flag]
+        if v ~= nil and obj.Set then
+            if type(v) == "table" and v.__color3 then
+                v = Color3.new(v.r, v.g, v.b)
+            end
+            pcall(function() obj:Set(v) end)
+        end
+    end
+    return true
+end
+
+function Window:ListConfigs()
+    if not listfiles then return {} end
+    local folder = configFolder()
+    if not folder then return {} end
+
+    local okList, files = pcall(listfiles, folder)
+    if not okList then return {} end
+
+    local names = {}
+    for _, path in ipairs(files) do
+        local fname = path:match("([^/\\]+)%.json$")
+        if fname then table.insert(names, fname) end
+    end
+    table.sort(names)
+    return names
+end
+
+-- Returns the name of the most recently *saved* config (via the marker
+-- file SaveConfig writes), or nil if none is recorded / the executor
+-- doesn't support readfile. Unlike ListConfigs()[#ListConfigs()] (what
+-- CreateConfigList's AutoLoadLast used to fall back on), this reflects
+-- actual save recency instead of alphabetical order — "abc" saved after
+-- "main" no longer gets skipped in favor of "main" just because it sorts
+-- earlier.
+function Window:GetLastConfig()
+    if not (readfile and isfile) then return nil end
+    if not isfile(LAST_CONFIG_MARKER) then return nil end
+    local okRead, name = pcall(readfile, LAST_CONFIG_MARKER)
+    if not okRead or not name or name == "" then return nil end
+    if not isfile(configPath(name)) then return nil end
+    return name
+end
+
+function Window:DeleteConfig(name)
+    if not delfile then return false, "executor has no delfile" end
+    if not (name and name ~= "") then return false, "config name is empty" end
+
+    local path = configPath(name)
+    if not (isfile and isfile(path)) then return false, "config file not found" end
+
+    local okDelete = pcall(delfile, path)
+    if not okDelete then return false, "delfile failed" end
+    return true
+end
+
+function Window:_buildNotificationLayer()
+    local screenGui = self._screenGui
+
+    local container = Instance.new("Frame")
+    container.Name = "Notifications"
+    container.AnchorPoint = Vector2.new(1, 0)
+    container.Position = UDim2.new(1, -20, 0, 20)
+    container.BackgroundTransparency = 1
+    container.ZIndex = 100
+    container.Parent = screenGui
+
+    local MAX_WIDTH = 300
+    local MIN_MARGIN = 20
+    local function updateContainerSize()
+        local viewport = workspace.CurrentCamera.ViewportSize
+        local w = math.min(MAX_WIDTH, viewport.X - MIN_MARGIN * 2)
+        container.Size = UDim2.new(0, w, 1, -40)
+    end
+    updateContainerSize()
+    self._connMgr:Track(workspace.CurrentCamera:GetPropertyChangedSignal("ViewportSize"):Connect(updateContainerSize))
+
+    local layout = Instance.new("UIListLayout")
+    layout.SortOrder = Enum.SortOrder.LayoutOrder
+    layout.HorizontalAlignment = Enum.HorizontalAlignment.Right
+    layout.Padding = UDim.new(0, 8)
+    layout.Parent = container
+
+    self._notifContainer = container
+    self._notifOrder = 0
+
+    self._activeNotifs = {}
+    self._maxNotifs = 5
+end
+
+function Window:Notify(opts)
+    opts = opts or {}
+    self._notifOrder = self._notifOrder + 1
+    opts.LayoutOrder = self._notifOrder
+
+    if #self._activeNotifs >= self._maxNotifs then
+        local oldest = table.remove(self._activeNotifs, 1)
+        if oldest and oldest.Dismiss then oldest:Dismiss() end
+    end
+
+    local notif = Components.Notification(self._notifContainer, self._theme, self._connMgr, opts)
+    local userOnDismiss = opts.OnDismiss
+    opts.OnDismiss = function()
+        for i, n in ipairs(self._activeNotifs) do
+            if n == notif then table.remove(self._activeNotifs, i); break end
+        end
+        if userOnDismiss then userOnDismiss() end
+    end
+    table.insert(self._activeNotifs, notif)
+    return notif
+end
+
+local function nextOrder(tab)
+    tab._order = tab._order + 1
+    return tab._order
+end
+
+function TabMeta:CreateLabel(opts)
+    opts = opts or {}
+    opts.LayoutOrder = nextOrder(self)
+    return Components.Label(self._page, self._theme, self._connMgr, opts)
+end
+function TabMeta:CreateButton(opts)
+    opts = opts or {}
+    opts.LayoutOrder = nextOrder(self)
+    return Components.Button(self._page, self._theme, self._connMgr, opts)
+end
+function TabMeta:CreateToggle(opts)
+    opts = opts or {}
+    opts.LayoutOrder = nextOrder(self)
+    local obj = Components.Toggle(self._page, self._theme, self._connMgr, opts)
+    self._window:_registerFlag(opts.Flag, obj)
+    return obj
+end
+function TabMeta:CreateSlider(opts)
+    opts = opts or {}
+    opts.LayoutOrder = nextOrder(self)
+    local obj = Components.Slider(self._page, self._theme, self._connMgr, opts)
+    self._window:_registerFlag(opts.Flag, obj)
+    return obj
+end
+function TabMeta:CreateTextbox(opts)
+    opts = opts or {}
+    opts.LayoutOrder = nextOrder(self)
+    local obj = Components.Textbox(self._page, self._theme, self._connMgr, opts)
+    self._window:_registerFlag(opts.Flag, obj)
+    return obj
+end
+function TabMeta:CreateDropdown(opts)
+    opts = opts or {}
+    opts.LayoutOrder = nextOrder(self)
+    local obj = Components.Dropdown(self._page, self._theme, self._connMgr, opts)
+    self._window:_registerFlag(opts.Flag, obj)
+    return obj
+end
+function TabMeta:CreateMultiDropdown(opts)
+    opts = opts or {}
+    opts.LayoutOrder = nextOrder(self)
+    local obj = Components.MultiDropdown(self._page, self._theme, self._connMgr, opts)
+    self._window:_registerFlag(opts.Flag, obj)
+    return obj
+end
+function TabMeta:CreateColorPicker(opts)
+    opts = opts or {}
+    opts.LayoutOrder = nextOrder(self)
+    local obj = Components.ColorPicker(self._page, self._theme, self._connMgr, opts)
+    self._window:_registerFlag(opts.Flag, obj)
+    return obj
+end
+function TabMeta:CreateThemeGrid(opts)
+    opts = opts or {}
+    opts.LayoutOrder = nextOrder(self)
+    return Components.ThemeGrid(self._page, self._theme, self._connMgr, opts)
+end
+function TabMeta:CreateGradientPicker(opts)
+    opts = opts or {}
+    opts.LayoutOrder = nextOrder(self)
+    nextOrder(self)
+    return Components.GradientPicker(self._page, self._theme, self._connMgr, opts)
+end
+function TabMeta:CreateDivider(opts)
+    opts = opts or {}
+    opts.LayoutOrder = nextOrder(self)
+    return Components.Divider(self._page, self._theme, self._connMgr, opts)
+end
+function TabMeta:CreateParagraph(opts)
+    opts = opts or {}
+    opts.LayoutOrder = nextOrder(self)
+    return Components.Paragraph(self._page, self._theme, self._connMgr, opts)
+end
+function TabMeta:CreateKeybind(opts)
+    opts = opts or {}
+    opts.LayoutOrder = nextOrder(self)
+    local obj = Components.Keybind(self._page, self._theme, self._connMgr, opts)
+    self._window:_registerFlag(opts.Flag, obj)
+    return obj
+end
+function TabMeta:CreateNumberStepper(opts)
+    opts = opts or {}
+    opts.LayoutOrder = nextOrder(self)
+    local obj = Components.NumberStepper(self._page, self._theme, self._connMgr, opts)
+    self._window:_registerFlag(opts.Flag, obj)
+    return obj
+end
+function TabMeta:CreateRadioGroup(opts)
+    opts = opts or {}
+    opts.LayoutOrder = nextOrder(self)
+    local obj = Components.RadioGroup(self._page, self._theme, self._connMgr, opts)
+    self._window:_registerFlag(opts.Flag, obj)
+    return obj
+end
+function TabMeta:CreateAccordion(opts)
+    opts = opts or {}
+    opts.LayoutOrder = nextOrder(self)
+    local acc = Components.Accordion(self._page, self._theme, self._connMgr, opts)
+    acc._window = self._window
+    acc._tab = self -- lets AccordionMeta:CreateXxx register children into this tab's search index
+    return acc
+end
+function TabMeta:CreateTableList(opts)
+    opts = opts or {}
+    opts.LayoutOrder = nextOrder(self)
+    return Components.TableList(self._page, self._theme, self._connMgr, opts)
+end
+
+function TabMeta:CreateConfigList(opts)
+    opts = opts or {}
+    local window = self._window
+
+    local nameBox = self:CreateTextbox({
+        Text = opts.NameText or "Tên config:",
+        Placeholder = "vd: main",
+    })
+
+    local dropdown = self:CreateDropdown({
+        Text = opts.Text or "Config đã lưu:",
+        Options = window:ListConfigs(),
+        Callback = function(selectedName)
+            if selectedName then nameBox:Set(selectedName) end
+        end,
+    })
+
+    local function refreshList(keepSelection)
+        dropdown:Refresh(window:ListConfigs(), keepSelection)
+    end
+
+    self:CreateButton({
+        Text = opts.SaveText or "Lưu Config",
+        Callback = function()
+            local name = nameBox:Get()
+            local ok, err = window:SaveConfig(name)
+            refreshList(true)
+            if window.Notify then
+                window:Notify({
+                    Title = ok and "Đã lưu" or "Lỗi",
+                    Text = ok and ("Đã lưu config \"" .. name .. "\"") or (err or "Không thể lưu config"),
+                    Type = ok and "success" or "error",
+                })
+            end
+        end,
+    })
+
+    self:CreateButton({
+        Text = opts.LoadText or "Tải Config",
+        Callback = function()
+            local name = nameBox:Get()
+            local ok, err = window:LoadConfig(name)
+            if window.Notify then
+                window:Notify({
+                    Title = ok and "Đã tải" or "Lỗi",
+                    Text = ok and ("Đã tải config \"" .. name .. "\"") or (err or "Không thể tải config"),
+                    Type = ok and "success" or "error",
+                })
+            end
+        end,
+    })
+
+    self:CreateButton({
+        Text = opts.DeleteText or "Xoá Config",
+        Callback = function()
+            local name = nameBox:Get()
+            local ok, err = window:DeleteConfig(name)
+            refreshList(false)
+            if ok then nameBox:Set("") end
+            if window.Notify then
+                window:Notify({
+                    Title = ok and "Đã xoá" or "Lỗi",
+                    Text = ok and ("Đã xoá config \"" .. name .. "\"") or (err or "Không thể xoá config"),
+                    Type = ok and "success" or "error",
+                })
+            end
+        end,
+    })
+
+    if opts.AutoLoadLast then
+        -- Uses the actual last-*saved* config (see Window:GetLastConfig),
+        -- not ListConfigs()[#ListConfigs()] — that list is alphabetically
+        -- sorted, so it previously picked whichever name sorted last
+        -- ("main") instead of whichever was actually saved most recently
+        -- ("abc" saved afterwards).
+        local last = window:GetLastConfig()
+        if last then
+            nameBox:Set(last)
+            window:LoadConfig(last)
+        end
+    end
+
+    return { Dropdown = dropdown, NameBox = nameBox, Refresh = refreshList }
+end
+
+-- Bọc mọi TabMeta:CreateXxx hiện có (được định nghĩa phía trên, kể cả
+-- CreateConfigList) để tự gắn attribute chứa text tìm kiếm lên obj.Instance
+-- và đăng ký vào self._searchEntries — nhờ vậy CreateSearchBar không cần
+-- từng factory biết gì về search cả. Phải nằm SAU toàn bộ định nghĩa
+-- TabMeta:CreateXxx gốc vì nó snapshot pairs(TabMeta) tại thời điểm chạy.
+for methodName, fn in pairs(TabMeta) do
+    if methodName:sub(1, 6) == "Create" then
+        TabMeta[methodName] = function(self, opts, ...)
+            local obj = fn(self, opts, ...)
+            if obj and obj.Instance then
+                local searchText = (opts and (opts.Text or opts.Title)) or ""
+                local lowered = tostring(searchText):lower()
+                obj.Instance:SetAttribute("SelenixSearchText", lowered)
+                self._searchEntries = self._searchEntries or {}
+                table.insert(self._searchEntries, obj.Instance)
+                -- Some components (GradientPicker) render a SECOND top-level
+                -- GuiObject alongside Instance (its preset grid, exposed as
+                -- obj.GridInstance). Without also tagging/registering it
+                -- here, filtering hides the toggle row but leaves the grid
+                -- visible underneath it — tag it the same way when present.
+                if obj.GridInstance then
+                    obj.GridInstance:SetAttribute("SelenixSearchText", lowered)
+                    table.insert(self._searchEntries, obj.GridInstance)
+                end
+            end
+            return obj
+        end
+    end
+end
+
+-- ---------- Global SearchBar ----------
+-- Đặt đầu tab, lọc mọi control TRONG TAB ĐÓ theo Text/Title (không phân
+-- biệt hoa thường), ẩn/hiện qua Visible — UIListLayout của page tự reflow.
+-- Định nghĩa SAU khối wrap ở trên nên bản thân nó không bị wrap / không tự
+-- đăng ký làm search entry của chính nó.
+function TabMeta:CreateSearchBar(opts)
+    opts = opts or {}
+    opts.LayoutOrder = nextOrder(self)
+    local tab = self
+
+    local frame = Instance.new("Frame")
+    frame.Size = opts.Size or UDim2.new(1, 0, 0, 40)
+    frame.LayoutOrder = opts.LayoutOrder
+    frame.Parent = self._page
+    Utils.AddCorner(frame, UDim.new(0, 8))
+
+    local box = Instance.new("TextBox")
+    box.Size = UDim2.new(1, -20, 1, 0)
+    box.Position = UDim2.new(0, 10, 0, 0)
+    box.Text = ""
+    box.PlaceholderText = opts.Placeholder or "Tìm kiếm..."
+    box.PlaceholderColor3 = Color3.fromRGB(150, 150, 160)
+    box.TextColor3 = Color3.fromRGB(255, 255, 255)
+    box.Font = Enum.Font.Gotham
+    box.TextSize = 14
+    box.ClearTextOnFocus = false
+    box.TextXAlignment = Enum.TextXAlignment.Left
+    box.Parent = frame
+    Utils.AddCorner(box, UDim.new(0, 6))
+    -- FIX: previously only PaddingLeft was passed here (Utils.AddPadding(box,
+    -- UDim.new(0, 10)) with no second argument), so the text/placeholder sat
+    -- flush against the box's right edge while the left side kept its 10px
+    -- gap — the search bar's inner text visibly looked lopsided compared to
+    -- every other input in the library (Textbox, Dropdown's search row,
+    -- etc), which always pad both sides. Now padded symmetrically.
+    Utils.AddPadding(box, UDim.new(0, 10), UDim.new(0, 10))
+
+    local function applyFilter(query)
+        query = query:lower()
+        for _, inst in ipairs(tab._searchEntries or {}) do
+            if inst.Parent then
+                local text = inst:GetAttribute("SelenixSearchText") or ""
+                inst.Visible = (query == "") or text:find(query, 1, true) ~= nil
+            end
+        end
+    end
+    self._connMgr:Track(box:GetPropertyChangedSignal("Text"):Connect(function()
+        applyFilter(box.Text)
+    end))
+
+    local self2 = { Instance = frame }
+    function self2:ApplyTheme(color, accent, isInitial)
+        local panelBg = Utils.Brighten(color, 1.2)
+        local darkBg = Utils.Darken(color, 0.8)
+        local textColor = Utils.GetTextColorFor(darkBg, accent)
+        if isInitial then
+            frame.BackgroundColor3 = panelBg
+            box.BackgroundColor3 = darkBg
+            box.TextColor3 = textColor
+        else
+            TweenService:Create(frame, THEME_TWEEN_INFO, { BackgroundColor3 = panelBg }):Play()
+            TweenService:Create(box, THEME_TWEEN_INFO, { BackgroundColor3 = darkBg, TextColor3 = textColor }):Play()
+        end
+    end
+    self._theme:Subscribe(function(c, a, initial) self2:ApplyTheme(c, a, initial) end)
+    return self2
+end
+
+local Library = {}
+
+-- All windows created via Library:CreateWindow this session — not just the
+-- most recent one. Library:Destroy() tears down every one of them.
+-- Previously only a single _activeWindow was tracked, so creating a second
+-- window with a different Title silently orphaned the first one's
+-- ScreenGui + every connection it held (drag, resize, hover, gradient/
+-- notification Heartbeat loops) instead of cleaning it up.
+Library._windows = {}
+
+function Library:CreateWindow(config)
+    local window = Window.new(config)
+    table.insert(Library._windows, window)
+    return window
+end
+
+function Library:Destroy()
+    for _, window in ipairs(Library._windows) do
+        window:Destroy()
+    end
+    table.clear(Library._windows)
+end
+
+return Library
