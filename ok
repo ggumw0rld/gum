@@ -2926,7 +2926,7 @@ function Components.TableList(parent, theme, connMgr, opts)
 
             local hasToggle = item.OnToggle ~= nil
             local toggled = item.Toggled and true or false
-            local check
+            local check, mark
 
             if hasToggle then
                 check = Instance.new("Frame")
@@ -2944,7 +2944,6 @@ function Components.TableList(parent, theme, connMgr, opts)
                 mark.TextSize = 13
                 mark.TextTransparency = toggled and 0 or 1
                 mark.Parent = check
-                check.Mark = mark
             end
 
             local textLabel = Instance.new("TextLabel")
@@ -2976,7 +2975,7 @@ function Components.TableList(parent, theme, connMgr, opts)
                 rowConnMgr:Track(holder.MouseButton1Click:Connect(function()
                     toggled = not toggled
                     rows[i].toggled = toggled
-                    TweenService:Create(check.Mark, TweenInfo.new(0.2, EASE, EASE_OUT), { TextTransparency = toggled and 0 or 1 }):Play()
+                    TweenService:Create(mark, TweenInfo.new(0.2, EASE, EASE_OUT), { TextTransparency = toggled and 0 or 1 }):Play()
                     TweenService:Create(check, TweenInfo.new(0.2, EASE, EASE_OUT), {
                         BackgroundColor3 = toggled and theme.Accent or Utils.Darken(theme.Color, 0.75)
                     }):Play()
@@ -2986,7 +2985,7 @@ function Components.TableList(parent, theme, connMgr, opts)
                 rowConnMgr:Track(holder.MouseButton1Click:Connect(function() item.OnClick() end))
             end
 
-            table.insert(rows, { holder = holder, check = check, textLabel = textLabel, subLabel = subLabel, toggled = toggled })
+            table.insert(rows, { holder = holder, check = check, mark = mark, textLabel = textLabel, subLabel = subLabel, toggled = toggled })
         end
         updateContainerHeight()
     end
