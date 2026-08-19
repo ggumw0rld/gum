@@ -560,6 +560,7 @@ function Components.Toggle(parent, theme, connMgr, opts)
         state = v
         label.Text = labelText()
         restyle(false)
+        if opts.Callback then opts.Callback(state) end
     end
     function self:ApplyTheme(color, accent, isInitial)
         local panelBg = Utils.Brighten(color, 1.2)
@@ -584,12 +585,13 @@ end
 -- drive a 0-1 float parameter from this control at all.
 function Components.Slider(parent, theme, connMgr, opts)
     local min, max = opts.Min or 0, opts.Max or 100
-    -- Guard against a misconfigured Min == Max (or Min > Max): every alpha
-    -- calculation below divides by (max - min), which previously produced
-    -- NaN positions/sizes (and a NaN drag value) instead of just clamping.
+    -- Guard against a misconfigured Min == Max, or Min > Max: every alpha
+    -- calculation below divides by (max - min) and Roblox's math.clamp
+    -- requires min <= max, so swap them first instead of erroring out /
+    -- producing NaN positions, sizes, and drag values.
+    if min > max then min, max = max, min end
     local range = (max > min) and (max - min) or 1
     local decimals = math.max(math.floor(opts.Decimals or 0), 0)
-    local step = 10 ^ (-decimals) -- smallest representable increment at this precision
 
     local function roundTo(n)
         local mult = 10 ^ decimals
@@ -763,11 +765,14 @@ function Components.Textbox(parent, theme, connMgr, opts)
 
     local self = { Instance = frame }
     function self:Get() return box.Text end
-    -- Programmatically set the text (used by Window:LoadConfig). Does not
-    -- fire opts.Callback (matches Toggle/Slider convention: only a real
-    -- FocusLost+Enter counts as a user commit), just updates the box text.
+    -- Programmatically set the text (used by Window:LoadConfig). Also fires
+    -- opts.Callback so a config-loaded value actually reaches consumer code
+    -- and not just the visible text — previously only a real FocusLost+Enter
+    -- fired it, so loading a config silently never applied the effect tied
+    -- to this field.
     function self:Set(v)
         box.Text = tostring(v)
+        if opts.Callback then opts.Callback(box.Text) end
     end
     function self:ApplyTheme(color, accent, isInitial)
         local panelBg = Utils.Brighten(color, 1.2)
@@ -886,6 +891,7 @@ function Components.Paragraph(parent, theme, connMgr, opts)
     inner.BackgroundTransparency = 1
     inner.Parent = holder
     local layout = Instance.new("UIListLayout")
+    layout.SortOrder = Enum.SortOrder.LayoutOrder
     layout.Padding = UDim.new(0, 4)
     layout.Parent = inner
     Utils.AddPadding(inner, UDim.new(0, 15), UDim.new(0, 15), UDim.new(0, 8), UDim.new(0, 8))
@@ -2397,13 +2403,17 @@ function Components.Keybind(parent, theme, connMgr, opts)
     -- only special-cases Color3) with no extra handling needed.
     function self:Get() return currentKey and currentKey.Name or nil end
     -- Programmatically bind a key by name (used by Window:LoadConfig).
-    -- Silently ignores names that aren't valid Enum.KeyCode members.
+    -- Silently ignores names that aren't valid Enum.KeyCode members. Also
+    -- fires opts.Callback so a config-loaded bind actually reaches
+    -- consumer code — previously LoadConfig would only repaint the button
+    -- text and the game logic behind the keybind was never rewired.
     function self:Set(name)
         if type(name) ~= "string" then return end
         local key = Enum.KeyCode[name]
         if not key then return end
         currentKey = key
         keyBtn.Text = keyText()
+        if opts.Callback then opts.Callback(currentKey) end
     end
     function self:ApplyTheme(color, accent, isInitial)
         local panelBg = Utils.Brighten(color, 1.2)
