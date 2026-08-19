@@ -775,6 +775,10 @@ function Components.NumberStepper(parent, theme, connMgr, opts)
     local step = opts.Step or 1
     local decimals = math.max(math.floor(opts.Decimals or 0), 0)
     local suffix = opts.Suffix or ""
+    local function escapePattern(s)
+        return (s:gsub("[%(%)%.%%%+%-%*%?%[%]%^%$]", "%%%1"))
+    end
+    local suffixPattern = escapePattern(suffix) .. "$"
 
     local function roundTo(n)
         local mult = 10 ^ decimals
@@ -1552,7 +1556,9 @@ function Components.Dropdown(parent, theme, connMgr, opts)
             rowConnMgr:Track(btn.MouseLeave:Connect(function()
                 TweenService:Create(btn, TweenInfo.new(0.18, EASE, EASE_OUT), { BackgroundColor3 = baseColorFor(text) }):Play()
             end))
-            rowConnMgr:Track(btn.MouseButton1Click:Connect(function() select(text) end))
+            rowConnMgr:Track(btn.MouseButton1Click:Connect(function()
+                select(text == selected and nil or text)
+            end))
 
             table.insert(optionButtons, { btn = btn, text = text })
         end
@@ -1582,6 +1588,10 @@ function Components.Dropdown(parent, theme, connMgr, opts)
     -- Programmatically select an option (used by Window:LoadConfig).
     -- Silently ignores values that aren't in the current Options list.
     function self:Set(v)
+        if v == nil then
+            select(nil)
+            return
+        end
         local found = false
         for _, t in ipairs(options) do if t == v then found = true break end end
         if not found then return end
