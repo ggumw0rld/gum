@@ -844,7 +844,7 @@ function Components.NumberStepper(parent, theme, connMgr, opts)
     connMgr:Track(minusBtn.MouseButton1Click:Connect(function() setValue(value - step) end))
     connMgr:Track(plusBtn.MouseButton1Click:Connect(function() setValue(value + step) end))
     connMgr:Track(box.FocusLost:Connect(function()
-        local numStr = box.Text:gsub(suffix .. "$", ""):gsub("[^%d%.%-]", "")
+        local numStr = box.Text:gsub(suffixPattern, ""):gsub("[^%d%.%-]", "")
         local n = tonumber(numStr)
         if n then setValue(n) else box.Text = fmt(value) .. suffix end
     end))
@@ -2407,7 +2407,20 @@ function Components.ThemeGrid(parent, theme, connMgr, opts)
     end
 
     local self = { Instance = container }
-    function self:ApplyTheme() end -- swatches show fixed preset colors, not the live theme
+    -- Swatches always show their own fixed preset colors — this only keeps
+    -- the selection ring in sync when the theme changes from somewhere
+    -- OTHER than clicking a swatch in this grid (e.g. a second ThemeGrid,
+    -- or a direct theme:Apply() call elsewhere), so the ring doesn't point
+    -- at a stale preset.
+    function self:ApplyTheme(color, accent)
+        for i, preset in ipairs(presets) do
+            if preset[1] == color and preset[2] == accent then
+                if i ~= selectedIndex then selectIndex(i) end
+                return
+            end
+        end
+    end
+    theme:Subscribe(function(c, a) self:ApplyTheme(c, a) end)
     return self
 end
 
@@ -2643,9 +2656,25 @@ function Components.Keybind(parent, theme, connMgr, opts)
 
     local function setListening(v)
         listening = v
-        keybindListening[connMgr] = v or nil -- clear the key entirely when turning off, so the table doesn't grow
         keyBtn.Text = keyText()
         restyleKeyBtn(false)
+        if v then
+            keybindListening[connMgr] = true
+        else
+            -- Deferred instead of synchronous: other Keybinds on this same
+            -- window may still be mid-way through handling the SAME
+            -- InputBegan event (their connections fire after this one in
+            -- the same dispatch). Clearing the flag synchronously here let
+            -- them see it as already-cleared and wrongly fire their own
+            -- Pressed() for the key that just finished a rebind. task.defer
+            -- pushes the clear to after this input event has fully
+            -- propagated to every connection.
+            task.defer(function()
+                if not listening then -- guard against being re-triggered before this runs
+                    keybindListening[connMgr] = nil
+                end
+            end)
+        end
     end
 
     connMgr:Track(keyBtn.MouseButton1Click:Connect(function()
@@ -2805,6 +2834,16 @@ for methodName, info in pairs(ACCORDION_FACTORY_MAP) do
         opts.LayoutOrder = self._order
         local obj = Components[info.fn](self._body, self._theme, self._connMgr, opts)
         if info.flag and self._window then self._window:_registerFlag(opts.Flag, obj) end
+        -- Register with the owning tab's search index, same as top-level
+        -- TabMeta:CreateXxx controls, so CreateSearchBar's filter also
+        -- reaches controls nested inside an accordion — previously these
+        -- were invisible to search entirely.
+        if obj and obj.Instance and self._tab then
+            local searchText = opts.Text or opts.Title or ""
+            obj.Instance:SetAttribute("SelenixSearchText", tostring(searchText):lower())
+            self._tab._searchEntries = self._tab._searchEntries or {}
+            table.insert(self._tab._searchEntries, obj.Instance)
+        end
         return obj
     end
 end
@@ -4138,6 +4177,9 @@ function Window:GetGradients() return self._gradients end
 
 function Window:_registerFlag(flag, obj)
     if not flag then return end
+    if self._flags[flag] then
+        warn(("[Selenix] Flag \"%s\" is already registered — SaveConfig/LoadConfig will only see the most recently created control using this Flag."):format(tostring(flag)))
+    end
     self._flags[flag] = obj
 end
 
@@ -4420,6 +4462,7 @@ function TabMeta:CreateAccordion(opts)
     opts.LayoutOrder = nextOrder(self)
     local acc = Components.Accordion(self._page, self._theme, self._connMgr, opts)
     acc._window = self._window
+    acc._tab = self -- lets AccordionMeta:CreateXxx register children into this tab's search index
     return acc
 end
 function TabMeta:CreateTableList(opts)
@@ -4524,9 +4567,19 @@ for methodName, fn in pairs(TabMeta) do
             local obj = fn(self, opts, ...)
             if obj and obj.Instance then
                 local searchText = (opts and (opts.Text or opts.Title)) or ""
-                obj.Instance:SetAttribute("SelenixSearchText", tostring(searchText):lower())
+                local lowered = tostring(searchText):lower()
+                obj.Instance:SetAttribute("SelenixSearchText", lowered)
                 self._searchEntries = self._searchEntries or {}
                 table.insert(self._searchEntries, obj.Instance)
+                -- Some components (GradientPicker) render a SECOND top-level
+                -- GuiObject alongside Instance (its preset grid, exposed as
+                -- obj.GridInstance). Without also tagging/registering it
+                -- here, filtering hides the toggle row but leaves the grid
+                -- visible underneath it — tag it the same way when present.
+                if obj.GridInstance then
+                    obj.GridInstance:SetAttribute("SelenixSearchText", lowered)
+                    table.insert(self._searchEntries, obj.GridInstance)
+                end
             end
             return obj
         end
