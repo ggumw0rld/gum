@@ -972,7 +972,9 @@ function Components.RadioGroup(parent, theme, connMgr, opts)
         lbl.TextSize = 14
         lbl.Parent = row
 
-        connMgr:Track(row.MouseButton1Click:Connect(function() select(text) end))
+        connMgr:Track(row.MouseButton1Click:Connect(function()
+            select(text == selected and nil or text)
+        end))
         table.insert(rows, { ring = ring, dot = dot, label = lbl, text = text })
     end
 
@@ -980,6 +982,10 @@ function Components.RadioGroup(parent, theme, connMgr, opts)
     function self:Get() return selected end
     -- Programmatically select an option (used by Window:LoadConfig).
     function self:Set(v)
+        if v == nil then
+            select(nil)
+            return
+        end
         local found = false
         for _, t in ipairs(options) do if t == v then found = true break end end
         if not found then return end
