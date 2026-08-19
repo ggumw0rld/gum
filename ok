@@ -67,6 +67,23 @@
         that tags obj.Instance with a searchable attribute) by Text/Title,
         case-insensitive substring match, toggling Visible so
         UIListLayout reflows automatically.
+
+    PATCH NOTES (this file):
+      * Fix: Accordion no longer skips its first-open height priming when
+        DefaultOpen is false/omitted — previously :recompute() only ran
+        inside the DefaultOpen branch, so the FIRST manual open of an
+        accordion snapped to the stale BodyHeight=0 default (closedHeight
+        + 6px) before AbsoluteContentSize fired and corrected it, which
+        looked like the body "jumping"/overlapping the header on open.
+      * Fix: TabMeta:CreateSearchBar's input box now gets both left AND
+        right UIPadding (previously only left was passed to
+        Utils.AddPadding, so the placeholder/typed text sat flush against
+        the right edge while the left side had a 10px gap).
+      * Fix: Components.Paragraph now waits two Heartbeat frames (matching
+        the pattern already used by Components.Notification) before
+        measuring body.AbsoluteSize.Y for the clipped bodyClip height —
+        one frame was not always enough for a multi-line TextLabel's
+        AutomaticSize to fully converge, which cropped the last line.
     ============================================================
 ]]
 
@@ -1226,11 +1243,15 @@ function Components.Paragraph(parent, theme, connMgr, opts)
     end
 
     if collapsible then
-        -- Body text needs one render step before AbsoluteSize.Y reflects the
-        -- actual wrapped height, so the very first paint is deferred a frame
-        -- (matches the pattern used elsewhere in this library for
-        -- AutomaticSize convergence, e.g. Components.Notification).
+        -- Body text needs a render step (or two) before AbsoluteSize.Y
+        -- reflects the actual wrapped height, so the very first paint is
+        -- deferred — matches the pattern used elsewhere in this library
+        -- for AutomaticSize convergence (see Components.Notification,
+        -- which also waits two Heartbeats). One frame was not always
+        -- enough for a multi-line TextLabel to finish wrapping/resizing,
+        -- which cropped the last line of text on first render.
         task.defer(function()
+            RunService.Heartbeat:Wait()
             RunService.Heartbeat:Wait()
             snapToNatural(open)
         end)
@@ -1247,9 +1268,10 @@ function Components.Paragraph(parent, theme, connMgr, opts)
             }):Play()
         end))
     else
-        -- Not collapsible: always fully open, same one-frame defer so the
+        -- Not collapsible: always fully open, same two-frame defer so the
         -- clip's height matches the text's real wrapped height immediately.
         task.defer(function()
+            RunService.Heartbeat:Wait()
             RunService.Heartbeat:Wait()
             snapToNatural(true)
         end)
@@ -1451,7 +1473,7 @@ function Components.Dropdown(parent, theme, connMgr, opts)
         searchBox.ClearTextOnFocus = false
         searchBox.TextXAlignment = Enum.TextXAlignment.Left
         searchBox.Parent = searchHolder
-        Utils.AddPadding(searchBox, UDim.new(0, 10))
+        Utils.AddPadding(searchBox, UDim.new(0, 10), UDim.new(0, 10))
         Utils.AddCorner(searchBox, UDim.new(0, 6))
 
         exp._searchHolder = searchHolder
@@ -1688,7 +1710,7 @@ function Components.MultiDropdown(parent, theme, connMgr, opts)
         searchBox.ClearTextOnFocus = false
         searchBox.TextXAlignment = Enum.TextXAlignment.Left
         searchBox.Parent = searchHolder
-        Utils.AddPadding(searchBox, UDim.new(0, 10))
+        Utils.AddPadding(searchBox, UDim.new(0, 10), UDim.new(0, 10))
         Utils.AddCorner(searchBox, UDim.new(0, 6))
     end
 
@@ -2594,6 +2616,7 @@ function Components.Keybind(parent, theme, connMgr, opts)
     keyBtn.AutoButtonColor = false
     keyBtn.Font = Enum.Font.GothamBold
     keyBtn.TextSize = 13
+    keyBtn.TextTruncate = Enum.TextTruncate.AtEnd
     keyBtn.Parent = frame
     Utils.AddCorner(keyBtn, UDim.new(0, 6))
     Animator.AddThickenStroke(keyBtn, connMgr)
@@ -2721,13 +2744,24 @@ function Components.Accordion(parent, theme, connMgr, opts)
     end
     connMgr:Track(layout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(recompute))
 
-    if opts.DefaultOpen then
-        task.defer(function()
-            RunService.Heartbeat:Wait()
-            recompute()
+    -- FIX: previously this priming block only ran when opts.DefaultOpen
+    -- was true, so an accordion created with DefaultOpen = false (the
+    -- common case) never had its real content height measured until the
+    -- user manually opened it for the first time. At that point
+    -- exp.SetOpen(true) would tween to the *stale* default openHeight
+    -- (BodyHeight=0 -> closedHeight+6px) and only snap to the correct,
+    -- much taller size once AbsoluteContentSize's changed-signal fired a
+    -- frame later — visible as the body "jumping"/overlapping whatever
+    -- sits below the header. Now the height is always primed up front,
+    -- regardless of DefaultOpen, so the very first open already animates
+    -- to the correct size.
+    task.defer(function()
+        RunService.Heartbeat:Wait()
+        recompute()
+        if opts.DefaultOpen then
             exp.SetOpen(true)
-        end)
-    end
+        end
+    end)
 
     local self = setmetatable({ Instance = exp.Container }, AccordionMeta)
     self._body, self._theme, self._connMgr, self._order = body, theme, connMgr, 0
@@ -4528,7 +4562,13 @@ function TabMeta:CreateSearchBar(opts)
     box.TextXAlignment = Enum.TextXAlignment.Left
     box.Parent = frame
     Utils.AddCorner(box, UDim.new(0, 6))
-    Utils.AddPadding(box, UDim.new(0, 10))
+    -- FIX: previously only PaddingLeft was passed here (Utils.AddPadding(box,
+    -- UDim.new(0, 10)) with no second argument), so the text/placeholder sat
+    -- flush against the box's right edge while the left side kept its 10px
+    -- gap — the search bar's inner text visibly looked lopsided compared to
+    -- every other input in the library (Textbox, Dropdown's search row,
+    -- etc), which always pad both sides. Now padded symmetrically.
+    Utils.AddPadding(box, UDim.new(0, 10), UDim.new(0, 10))
 
     local function applyFilter(query)
         query = query:lower()
