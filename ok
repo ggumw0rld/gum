@@ -84,6 +84,28 @@
         measuring body.AbsoluteSize.Y for the clipped bodyClip height —
         one frame was not always enough for a multi-line TextLabel's
         AutomaticSize to fully converge, which cropped the last line.
+      * Fix: Components.TableList — the per-row checkmark TextLabel was
+        being assigned to a NEW block-scoped `local mark` inside the
+        `if hasToggle then` branch instead of the outer `mark` variable
+        declared alongside `check`. That left the outer `mark` permanently
+        nil, so MouseButton1Click handler's `TweenService:Create(mark, ...)`
+        threw on every click — which meant the following lines, including
+        `item.OnToggle(toggled)`, never ran. Any consumer callback wired to
+        a TableList row's checkbox was silently dead. Fixed by assigning to
+        the outer `mark` instead of shadowing it.
+      * Change: Components.RadioGroup no longer supports deselecting the
+        currently-selected option by clicking it again (previously reused
+        Dropdown's toggle-off-on-reclick behavior). A radio group should
+        always have exactly one option selected once a Default is provided;
+        Dropdown keeps its original deselect-on-reclick behavior since an
+        optional "nothing selected" dropdown state is still a legitimate,
+        commonly-used pattern.
+      * Robustness: Dropdown/MultiDropdown's searchable variant no longer
+        mutates the caller's own `opts.OnToggle` in place to hook "clear
+        filter on close". It now reads/wraps the original callback into a
+        fresh local closure instead, so the `opts` table handed in by the
+        caller is left untouched (relevant if the same opts table were ever
+        reused across multiple CreateDropdown/CreateMultiDropdown calls).
     ============================================================
 ]]
 
@@ -884,6 +906,14 @@ end
 -- ---------- RadioGroup ----------
 -- Chọn 1-trong-N hiển thị luôn cả list (không cần mở/đóng như Dropdown),
 -- hợp khi chỉ 2-4 lựa chọn.
+--
+-- FIX: previously reused Dropdown's "click the selected option again to
+-- deselect" behavior, which left a RadioGroup able to end up with NO
+-- option selected — unexpected for a control whose whole point is "always
+-- exactly one choice". Clicking the already-selected row is now a no-op;
+-- selection only ever changes to a DIFFERENT option, and Options[1] is a
+-- guaranteed non-nil initial selection unless the caller explicitly passes
+-- Default = nil with an empty Options list.
 function Components.RadioGroup(parent, theme, connMgr, opts)
     local options = opts.Options or {}
     local selected = opts.Default or options[1]
@@ -933,6 +963,11 @@ function Components.RadioGroup(parent, theme, connMgr, opts)
         end
     end
     local function select(text)
+        -- No-op re-select guard: clicking the already-selected row must
+        -- not clear the selection (unlike Dropdown). Only a genuinely
+        -- different option — or an explicit programmatic self:Set(nil) —
+        -- changes `selected`.
+        if text == selected then return end
         selected = text
         restyleRows()
         if opts.Callback then opts.Callback(text) end
@@ -977,7 +1012,7 @@ function Components.RadioGroup(parent, theme, connMgr, opts)
         lbl.Parent = row
 
         connMgr:Track(row.MouseButton1Click:Connect(function()
-            select(text == selected and nil or text)
+            select(text)
         end))
         table.insert(rows, { ring = ring, dot = dot, label = lbl, text = text })
     end
@@ -985,9 +1020,15 @@ function Components.RadioGroup(parent, theme, connMgr, opts)
     local self = { Instance = container }
     function self:Get() return selected end
     -- Programmatically select an option (used by Window:LoadConfig).
+    -- Passing nil explicitly still clears the selection (e.g. to restore a
+    -- config that recorded "nothing selected" before this fix existed);
+    -- everyday user interaction can only move between real options.
     function self:Set(v)
         if v == nil then
-            select(nil)
+            if selected == nil then return end
+            selected = nil
+            restyleRows()
+            if opts.Callback then opts.Callback(nil) end
             return
         end
         local found = false
@@ -1414,6 +1455,11 @@ end
 -- children, so the list reflows automatically with no manual
 -- repositioning needed). opts.SearchPlaceholder overrides the placeholder
 -- text. The filter clears whenever the dropdown closes.
+--
+-- Deselect-on-reclick is intentionally KEPT for Dropdown (unlike
+-- RadioGroup): clicking the currently-selected option clears the
+-- selection, since "nothing chosen" is a normal, useful state for an
+-- optional dropdown filter/setting.
 function Components.Dropdown(parent, theme, connMgr, opts)
     local optionHeight = 32
     local searchable = opts.Searchable == true
@@ -1438,16 +1484,26 @@ function Components.Dropdown(parent, theme, connMgr, opts)
     options = opts.Options or {}
     selected = opts.Default or options[1]
 
+    -- Robustness: don't mutate the caller's own opts.OnToggle in place.
+    -- Read it once into a local and build a small wrapper around it, so the
+    -- `opts` table the caller passed in is left exactly as they gave it —
+    -- relevant if they keep a reference to it or reuse it elsewhere.
+    local userOnToggle = opts.OnToggle
+    local function fireOnToggle(isOpen)
+        if userOnToggle then userOnToggle(isOpen) end
+    end
+
     local exp = Components.ExpandableHeader(parent, theme, connMgr, {
         Text = opts.Text or "Chọn mục:",
         LayoutOrder = opts.LayoutOrder,
         BodyHeight = bodyHeightFor(#options),
-        -- Proxy so ExpandableHeader always calls whatever opts.OnToggle
-        -- currently is, looked up at call time — the searchable block below
-        -- reassigns opts.OnToggle *after* this header is built, so without
-        -- this indirection ExpandableHeader would keep calling `nil`
-        -- forever and the "clear filter on close" behavior would never fire.
-        OnToggle = function(isOpen) if opts.OnToggle then opts.OnToggle(isOpen) end end,
+        -- Proxy so ExpandableHeader always calls whatever the current
+        -- toggle handler is (fireOnToggle indirects through userOnToggle,
+        -- which the searchable block below reassigns) — without this
+        -- indirection ExpandableHeader would keep calling the ORIGINAL
+        -- handler only, and the "clear filter on close" wrapper added
+        -- below would never run.
+        OnToggle = function(isOpen) fireOnToggle(isOpen) end,
     })
 
     local valueLabel = Instance.new("TextLabel")
@@ -1557,6 +1613,8 @@ function Components.Dropdown(parent, theme, connMgr, opts)
                 TweenService:Create(btn, TweenInfo.new(0.18, EASE, EASE_OUT), { BackgroundColor3 = baseColorFor(text) }):Play()
             end))
             rowConnMgr:Track(btn.MouseButton1Click:Connect(function()
+                -- Deselect-on-reclick kept for Dropdown by design (see note
+                -- above the factory function).
                 select(text == selected and nil or text)
             end))
 
@@ -1572,14 +1630,18 @@ function Components.Dropdown(parent, theme, connMgr, opts)
             applyFilter(searchBox.Text)
         end))
         -- Clear the filter (and refocus the list) whenever the dropdown
-        -- closes, so reopening it always starts from the full list.
-        local origToggle = opts.OnToggle
-        opts.OnToggle = function(isOpen)
+        -- closes, so reopening it always starts from the full list. Wraps
+        -- the ORIGINAL caller-provided callback (captured above as
+        -- userOnToggle) into a new function and reassigns the local
+        -- `userOnToggle` — not opts.OnToggle — so the caller's own opts
+        -- table is never touched.
+        local originalOnToggle = userOnToggle
+        userOnToggle = function(isOpen)
             if not isOpen then
                 searchBox.Text = ""
                 applyFilter("")
             end
-            if origToggle then origToggle(isOpen) end
+            if originalOnToggle then originalOnToggle(isOpen) end
         end
     end
 
@@ -1676,12 +1738,17 @@ function Components.MultiDropdown(parent, theme, connMgr, opts)
         return searchable and (base + SEARCH_ROW_HEIGHT) or base
     end
 
+    -- Same "don't mutate the caller's opts.OnToggle" fix as Dropdown above.
+    local userOnToggle = opts.OnToggle
+    local function fireOnToggle(isOpen)
+        if userOnToggle then userOnToggle(isOpen) end
+    end
+
     local exp = Components.ExpandableHeader(parent, theme, connMgr, {
         Text = opts.Text or "Chọn nhiều:",
         LayoutOrder = opts.LayoutOrder,
         BodyHeight = bodyHeightFor(#options),
-        -- Same OnToggle proxy fix as Dropdown above.
-        OnToggle = function(isOpen) if opts.OnToggle then opts.OnToggle(isOpen) end end,
+        OnToggle = function(isOpen) fireOnToggle(isOpen) end,
     })
 
     local function summaryText()
@@ -1822,13 +1889,13 @@ function Components.MultiDropdown(parent, theme, connMgr, opts)
         connMgr:Track(searchBox:GetPropertyChangedSignal("Text"):Connect(function()
             applyFilter(searchBox.Text)
         end))
-        local origToggle = opts.OnToggle
-        opts.OnToggle = function(isOpen)
+        local originalOnToggle = userOnToggle
+        userOnToggle = function(isOpen)
             if not isOpen then
                 searchBox.Text = ""
                 applyFilter("")
             end
-            if origToggle then origToggle(isOpen) end
+            if originalOnToggle then originalOnToggle(isOpen) end
         end
     end
 
@@ -2951,7 +3018,16 @@ function Components.TableList(parent, theme, connMgr, opts)
                 check.Size = UDim2.new(0, 18, 0, 18)
                 check.Parent = holder
                 Utils.AddCorner(check, UDim.new(0, 4))
-                local mark = Instance.new("TextLabel")
+                -- FIX: this used to be `local mark = Instance.new(...)`,
+                -- which shadowed the OUTER `mark` declared above (in
+                -- `local check, mark`) with a brand-new block-scoped
+                -- variable. The outer `mark` stayed nil forever, so the
+                -- MouseButton1Click handler below's
+                -- `TweenService:Create(mark, ...)` threw on every click —
+                -- which meant the subsequent `item.OnToggle(toggled)` call
+                -- never ran. Assigning to the outer `mark` (no `local`)
+                -- fixes both the error and the dead callback.
+                mark = Instance.new("TextLabel")
                 mark.Size = UDim2.new(1, 0, 1, 0)
                 mark.BackgroundTransparency = 1
                 mark.Text = "✓"
