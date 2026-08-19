@@ -1,6 +1,6 @@
 --[[
     ============================================================
-    Selenix UI Library — Modular Rewrite (FIXED + Keybind)
+    Selenix UI Library — Modular Rewrite (FIXED + Keybind + Extras)
     ============================================================
     Same visual/behavioural feature set as the original monolithic
     script, reorganized into independent modules:
@@ -10,8 +10,9 @@
         Theme      -> holds the current {Color, Accent}, notifies subscribers on change
         Window     -> chrome: loading screen, titlebar, drag, resize, minimize
         Components -> factory functions for each control (Button, Label, Toggle, Slider,
-                       Textbox, Dropdown, MultiDropdown, ColorPicker, ThemeGrid, GradientPicker,
-                       Keybind, Notification)
+                       NumberStepper, Textbox, Dropdown, MultiDropdown, RadioGroup,
+                       ColorPicker, ThemeGrid, GradientPicker, Keybind, Accordion,
+                       TableList, Notification)
         Tab        -> a page + its tab button; exposes Tab:AddXxx(opts) which delegates to Components
         Config     -> Flags + SaveConfig/LoadConfig (writefile/readfile via executor)
 
@@ -37,12 +38,35 @@
         growing pile of dead connections into the window's shared
         ConnectionManager every time :Refresh() is called (e.g. every
         Save/Delete in CreateConfigList).
-      * New: Components.Keybind + TabMeta:CreateKeybind, following the
+      * Components.Keybind + TabMeta:CreateKeybind, following the
         same {Instance, Get, Set, ApplyTheme} contract as Toggle/Slider/
         Textbox, so it auto-registers into SaveConfig/LoadConfig via
         opts.Flag. Includes a per-window "only one Keybind capturing at a
         time" guard (keybindListening) so rebinding one Keybind can't
         spuriously fire another Keybind's Pressed() callback.
+      * Fix: Toggle:Set / Textbox:Set / Keybind:Set now fire opts.Callback,
+        so Window:LoadConfig actually rewires consumer-side logic instead
+        of only repainting the control.
+      * Fix: Slider Min > Max is now swapped instead of falling back to a
+        range of 1 (which produced silently-wrong alpha math).
+      * New: Components.NumberStepper — textbox + -/+ buttons, easier to
+        drive precisely on touch than dragging Slider.
+      * New: Components.RadioGroup — always-expanded single-select list,
+        for 2-4 option choices that don't need Dropdown's collapse.
+      * New: Components.Accordion (+ AccordionMeta) — reuses
+        ExpandableHeader but self-measures its body height from the
+        content UIListLayout instead of a fixed BodyHeight, so any mix of
+        child controls can be nested inside and it still expands/collapses
+        to the right size.
+      * New: Components.TableList — scrollable row list with an optional
+        per-row toggle (checkbox) or click callback, for ESP-style
+        per-entity lists. :Refresh(newItems) rebuilds cheaply via its own
+        rowConnMgr (same leak-avoidance pattern as Dropdown/MultiDropdown).
+      * New: TabMeta:CreateSearchBar — filters every control created in
+        that tab (via a generic wrapper around every TabMeta:CreateXxx
+        that tags obj.Instance with a searchable attribute) by Text/Title,
+        case-insensitive substring match, toggling Visible so
+        UIListLayout reflows automatically.
     ============================================================
 ]]
 
@@ -724,6 +748,246 @@ function Components.Slider(parent, theme, connMgr, opts)
     return self
 end
 
+-- ---------- NumberStepper ----------
+-- Textbox nhập số trực tiếp + nút -/+ bước theo opts.Step. Dễ thao tác trên
+-- Android hơn Slider (kéo tay chính xác khó), phù hợp cho giá trị rời rạc
+-- (số lượng, index, iteration count...).
+function Components.NumberStepper(parent, theme, connMgr, opts)
+    local min, max = opts.Min or 0, opts.Max or 100
+    if min > max then min, max = max, min end
+    local step = opts.Step or 1
+    local decimals = math.max(math.floor(opts.Decimals or 0), 0)
+    local suffix = opts.Suffix or ""
+
+    local function roundTo(n)
+        local mult = 10 ^ decimals
+        return math.round(n * mult) / mult
+    end
+    local function fmt(n)
+        if decimals <= 0 then return tostring(math.floor(n + 0.5)) end
+        return string.format("%." .. decimals .. "f", n)
+    end
+
+    local value = roundTo(math.clamp(opts.Default or min, min, max))
+
+    local frame = Instance.new("Frame")
+    frame.Size = opts.Size or UDim2.new(1, 0, 0, 40)
+    frame.LayoutOrder = opts.LayoutOrder or 0
+    frame.Parent = parent
+    Utils.AddCorner(frame, UDim.new(0, 8))
+
+    local label = Instance.new("TextLabel")
+    label.Size = UDim2.new(1, -160, 1, 0)
+    label.Position = UDim2.new(0, 10, 0, 0)
+    label.BackgroundTransparency = 1
+    label.Text = opts.Text or "Giá trị"
+    label.TextColor3 = Color3.fromRGB(255, 255, 255)
+    label.TextXAlignment = Enum.TextXAlignment.Left
+    label.Font = Enum.Font.GothamBold
+    label.TextSize = 15
+    label.Parent = frame
+
+    local function makeStepBtn(xOffsetFromRight, text)
+        local b = Instance.new("TextButton")
+        b.AnchorPoint = Vector2.new(1, 0.5)
+        b.Position = UDim2.new(1, xOffsetFromRight, 0.5, 0)
+        b.Size = UDim2.new(0, 26, 0, 26)
+        b.Text = text
+        b.TextColor3 = Color3.fromRGB(255, 255, 255)
+        b.Font = Enum.Font.GothamBold
+        b.TextSize = 16
+        b.AutoButtonColor = false
+        b.Parent = frame
+        Utils.AddCorner(b, UDim.new(0, 6))
+        Animator.AddThickenStroke(b, connMgr)
+        return b
+    end
+
+    local plusBtn = makeStepBtn(-10, "+")
+    local box = Instance.new("TextBox")
+    box.AnchorPoint = Vector2.new(1, 0.5)
+    box.Position = UDim2.new(1, -42, 0.5, 0)
+    box.Size = UDim2.new(0, 60, 0, 28)
+    box.Text = fmt(value) .. suffix
+    box.TextColor3 = Color3.fromRGB(255, 255, 255)
+    box.Font = Enum.Font.Gotham
+    box.TextSize = 14
+    box.ClearTextOnFocus = false
+    box.Parent = frame
+    Utils.AddCorner(box, UDim.new(0, 6))
+    local minusBtn = makeStepBtn(-108, "−")
+
+    local function setValue(v)
+        v = roundTo(math.clamp(v, min, max))
+        value = v
+        if not box:IsFocused() then box.Text = fmt(value) .. suffix end
+        if opts.Callback then opts.Callback(value) end
+    end
+
+    connMgr:Track(minusBtn.MouseButton1Click:Connect(function() setValue(value - step) end))
+    connMgr:Track(plusBtn.MouseButton1Click:Connect(function() setValue(value + step) end))
+    connMgr:Track(box.FocusLost:Connect(function()
+        local numStr = box.Text:gsub(suffix .. "$", ""):gsub("[^%d%.%-]", "")
+        local n = tonumber(numStr)
+        if n then setValue(n) else box.Text = fmt(value) .. suffix end
+    end))
+
+    local self = { Instance = frame }
+    function self:Get() return value end
+    -- Programmatically set the value (used by Window:LoadConfig).
+    function self:Set(v) setValue(v) end
+    function self:ApplyTheme(color, accent, isInitial)
+        local panelBg = Utils.Brighten(color, 1.2)
+        local textColor = Utils.GetTextColorFor(panelBg, accent)
+        local darkBg = Utils.Darken(color, 0.8)
+        local boxTextColor = Utils.GetTextColorFor(darkBg, accent)
+        if isInitial then
+            frame.BackgroundColor3 = panelBg
+            label.TextColor3 = textColor
+            box.BackgroundColor3 = darkBg
+            box.TextColor3 = boxTextColor
+            minusBtn.BackgroundColor3 = darkBg
+            plusBtn.BackgroundColor3 = darkBg
+        else
+            TweenService:Create(frame, THEME_TWEEN_INFO, { BackgroundColor3 = panelBg }):Play()
+            TweenService:Create(label, THEME_TWEEN_INFO, { TextColor3 = textColor }):Play()
+            TweenService:Create(box, THEME_TWEEN_INFO, { BackgroundColor3 = darkBg, TextColor3 = boxTextColor }):Play()
+            TweenService:Create(minusBtn, THEME_TWEEN_INFO, { BackgroundColor3 = darkBg }):Play()
+            TweenService:Create(plusBtn, THEME_TWEEN_INFO, { BackgroundColor3 = darkBg }):Play()
+        end
+    end
+    theme:Subscribe(function(c, a, initial) self:ApplyTheme(c, a, initial) end)
+    return self
+end
+
+-- ---------- RadioGroup ----------
+-- Chọn 1-trong-N hiển thị luôn cả list (không cần mở/đóng như Dropdown),
+-- hợp khi chỉ 2-4 lựa chọn.
+function Components.RadioGroup(parent, theme, connMgr, opts)
+    local options = opts.Options or {}
+    local selected = opts.Default or options[1]
+    local optionHeight = 34
+    local titleHeight = (opts.Text and opts.Text ~= "") and 24 or 0
+
+    local container = Instance.new("Frame")
+    container.Size = opts.Size or UDim2.new(1, 0, 0,
+        titleHeight + (#options * optionHeight) + math.max(#options - 1, 0) * 6 + 12)
+    container.LayoutOrder = opts.LayoutOrder or 0
+    container.Parent = parent
+    Utils.AddCorner(container, UDim.new(0, 8))
+
+    local titleLabel
+    if titleHeight > 0 then
+        titleLabel = Instance.new("TextLabel")
+        titleLabel.Size = UDim2.new(1, -20, 0, titleHeight)
+        titleLabel.Position = UDim2.new(0, 10, 0, 6)
+        titleLabel.BackgroundTransparency = 1
+        titleLabel.Text = opts.Text
+        titleLabel.TextXAlignment = Enum.TextXAlignment.Left
+        titleLabel.Font = Enum.Font.GothamBold
+        titleLabel.TextSize = 15
+        titleLabel.Parent = container
+    end
+
+    local list = Instance.new("Frame")
+    list.Size = UDim2.new(1, -12, 0, 0)
+    list.Position = UDim2.new(0, 6, 0, titleHeight + 6)
+    list.AutomaticSize = Enum.AutomaticSize.Y
+    list.BackgroundTransparency = 1
+    list.Parent = container
+    local layout = Instance.new("UIListLayout")
+    layout.Padding = UDim.new(0, 6)
+    layout.Parent = list
+
+    local rows = {}
+    local function restyleRows()
+        for _, row in ipairs(rows) do
+            local isSel = (row.text == selected)
+            TweenService:Create(row.ring, TweenInfo.new(0.2, EASE, EASE_OUT), {
+                BackgroundColor3 = isSel and theme.Accent or Utils.Darken(theme.Color, 0.75)
+            }):Play()
+            TweenService:Create(row.dot, TweenInfo.new(0.2, EASE, EASE_OUT), {
+                BackgroundTransparency = isSel and 0 or 1
+            }):Play()
+        end
+    end
+    local function select(text)
+        selected = text
+        restyleRows()
+        if opts.Callback then opts.Callback(text) end
+    end
+
+    for i, text in ipairs(options) do
+        local row = Instance.new("TextButton")
+        row.Size = UDim2.new(1, 0, 0, optionHeight)
+        row.LayoutOrder = i
+        row.BackgroundTransparency = 1
+        row.Text = ""
+        row.AutoButtonColor = false
+        row.Parent = list
+        Animator.AddThickenStroke(row, connMgr)
+        Utils.AddCorner(row, UDim.new(0, 6))
+
+        local ring = Instance.new("Frame")
+        ring.AnchorPoint = Vector2.new(0, 0.5)
+        ring.Position = UDim2.new(0, 8, 0.5, 0)
+        ring.Size = UDim2.new(0, 20, 0, 20)
+        ring.BackgroundColor3 = Utils.Darken(theme.Color, 0.75)
+        ring.Parent = row
+        Utils.AddCorner(ring, UDim.new(1, 0))
+
+        local dot = Instance.new("Frame")
+        dot.AnchorPoint = Vector2.new(0.5, 0.5)
+        dot.Position = UDim2.new(0.5, 0, 0.5, 0)
+        dot.Size = UDim2.new(0, 10, 0, 10)
+        dot.BackgroundColor3 = Color3.fromRGB(255, 255, 255)
+        dot.BackgroundTransparency = (text == selected) and 0 or 1
+        dot.Parent = ring
+        Utils.AddCorner(dot, UDim.new(1, 0))
+
+        local lbl = Instance.new("TextLabel")
+        lbl.Size = UDim2.new(1, -42, 1, 0)
+        lbl.Position = UDim2.new(0, 36, 0, 0)
+        lbl.BackgroundTransparency = 1
+        lbl.Text = text
+        lbl.TextXAlignment = Enum.TextXAlignment.Left
+        lbl.Font = Enum.Font.Gotham
+        lbl.TextSize = 14
+        lbl.Parent = row
+
+        connMgr:Track(row.MouseButton1Click:Connect(function() select(text) end))
+        table.insert(rows, { ring = ring, dot = dot, label = lbl, text = text })
+    end
+
+    local self = { Instance = container }
+    function self:Get() return selected end
+    -- Programmatically select an option (used by Window:LoadConfig).
+    function self:Set(v)
+        local found = false
+        for _, t in ipairs(options) do if t == v then found = true break end end
+        if not found then return end
+        select(v)
+    end
+    function self:ApplyTheme(color, accent, isInitial)
+        local panelBg = Utils.Brighten(color, 1.2)
+        local textColor = Utils.GetTextColorFor(panelBg, accent)
+        if isInitial then
+            container.BackgroundColor3 = panelBg
+            if titleLabel then titleLabel.TextColor3 = textColor end
+            for _, row in ipairs(rows) do row.label.TextColor3 = textColor end
+        else
+            TweenService:Create(container, THEME_TWEEN_INFO, { BackgroundColor3 = panelBg }):Play()
+            if titleLabel then TweenService:Create(titleLabel, THEME_TWEEN_INFO, { TextColor3 = textColor }):Play() end
+            for _, row in ipairs(rows) do
+                TweenService:Create(row.label, THEME_TWEEN_INFO, { TextColor3 = textColor }):Play()
+            end
+        end
+        restyleRows()
+    end
+    theme:Subscribe(function(c, a, initial) self:ApplyTheme(c, a, initial) end)
+    return self
+end
+
 -- ---------- Textbox ----------
 function Components.Textbox(parent, theme, connMgr, opts)
     local frame = Instance.new("Frame")
@@ -1013,8 +1277,8 @@ end
 
 -- ---------- ExpandableHeader ----------
 -- Shared "header row that expands into a body panel" used by Dropdown,
--- MultiDropdown and ColorPicker. Collapses three near-identical blocks
--- from the original script into one reusable piece.
+-- MultiDropdown, ColorPicker, and Accordion. Collapses several near-
+-- identical blocks from the original script into one reusable piece.
 function Components.ExpandableHeader(parent, theme, connMgr, opts)
     local closedHeight = opts.ClosedHeight or 46
     local bodyHeight = opts.BodyHeight or 200
@@ -2431,6 +2695,271 @@ function Components.Keybind(parent, theme, connMgr, opts)
     return self
 end
 
+-- ---------- Accordion ----------
+-- Section xổ/thu dùng lại ExpandableHeader, nhưng thay vì fixed BodyHeight
+-- thì tự đo chiều cao nội dung bên trong qua UIListLayout.AbsoluteContentSize
+-- mỗi khi có control mới được thêm, rồi gọi exp.SetBodyHeight để cập nhật.
+local AccordionMeta = {}
+AccordionMeta.__index = AccordionMeta
+
+function Components.Accordion(parent, theme, connMgr, opts)
+    local exp = Components.ExpandableHeader(parent, theme, connMgr, {
+        Text = opts.Text or "Nhóm",
+        LayoutOrder = opts.LayoutOrder,
+        BodyHeight = 0,
+    })
+
+    local body = exp.Body
+    local layout = Instance.new("UIListLayout")
+    layout.SortOrder = Enum.SortOrder.LayoutOrder
+    layout.Padding = UDim.new(0, 8)
+    layout.Parent = body
+    Utils.AddPadding(body, UDim.new(0, 6), UDim.new(0, 6), UDim.new(0, 4), UDim.new(0, 10))
+
+    local function recompute()
+        exp.SetBodyHeight(layout.AbsoluteContentSize.Y + 14)
+    end
+    connMgr:Track(layout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(recompute))
+
+    if opts.DefaultOpen then
+        task.defer(function()
+            RunService.Heartbeat:Wait()
+            recompute()
+            exp.SetOpen(true)
+        end)
+    end
+
+    local self = setmetatable({ Instance = exp.Container }, AccordionMeta)
+    self._body, self._theme, self._connMgr, self._order = body, theme, connMgr, 0
+
+    function self:ApplyTheme(color, accent, isInitial)
+        local panelBg = Utils.Brighten(color, 1.2)
+        local headerTextColor = Utils.GetTextColorFor(panelBg, accent)
+        if isInitial then
+            exp.Header.BackgroundColor3 = panelBg
+            exp.TitleLabel.TextColor3 = headerTextColor
+        else
+            TweenService:Create(exp.Header, THEME_TWEEN_INFO, { BackgroundColor3 = panelBg }):Play()
+            TweenService:Create(exp.TitleLabel, THEME_TWEEN_INFO, { TextColor3 = headerTextColor }):Play()
+        end
+    end
+    theme:Subscribe(function(c, a, initial) self:ApplyTheme(c, a, initial) end)
+    return self
+end
+
+-- Sinh AccordionMeta:CreateToggle/Slider/... bằng bảng ánh xạ thay vì chép
+-- tay 12 hàm gần giống hệt TabMeta — cùng tinh thần "gom logic lặp lại"
+-- như ExpandableHeader đã làm cho Dropdown/MultiDropdown/ColorPicker.
+local ACCORDION_FACTORY_MAP = {
+    CreateLabel = { fn = "Label" },
+    CreateButton = { fn = "Button" },
+    CreateToggle = { fn = "Toggle", flag = true },
+    CreateSlider = { fn = "Slider", flag = true },
+    CreateNumberStepper = { fn = "NumberStepper", flag = true },
+    CreateTextbox = { fn = "Textbox", flag = true },
+    CreateDropdown = { fn = "Dropdown", flag = true },
+    CreateMultiDropdown = { fn = "MultiDropdown", flag = true },
+    CreateRadioGroup = { fn = "RadioGroup", flag = true },
+    CreateColorPicker = { fn = "ColorPicker", flag = true },
+    CreateKeybind = { fn = "Keybind", flag = true },
+    CreateDivider = { fn = "Divider" },
+}
+for methodName, info in pairs(ACCORDION_FACTORY_MAP) do
+    AccordionMeta[methodName] = function(self, opts)
+        opts = opts or {}
+        self._order = self._order + 1
+        opts.LayoutOrder = self._order
+        local obj = Components[info.fn](self._body, self._theme, self._connMgr, opts)
+        if info.flag and self._window then self._window:_registerFlag(opts.Flag, obj) end
+        return obj
+    end
+end
+
+-- ---------- TableList ----------
+-- Danh sách cuộn được, mỗi dòng có Text/SubText + checkbox riêng (vd: bật
+-- ESP cho từng player). opts.Items = { { Text, SubText, Toggled, OnToggle(state), OnClick } }.
+-- :Refresh(newItems) rebuild toàn bộ (khi player join/leave), dùng lại
+-- pattern rowConnMgr như Dropdown/MultiDropdown để không leak connection.
+function Components.TableList(parent, theme, connMgr, opts)
+    local items = opts.Items or {}
+    local rowHeight = opts.RowHeight or 34
+    local maxVisible = opts.MaxVisibleRows or 5
+    local hasHeader = opts.Text and opts.Text ~= ""
+    local headerHeight = hasHeader and 30 or 0
+    local rowConnMgr = ConnectionManager.new()
+
+    local container = Instance.new("Frame")
+    container.LayoutOrder = opts.LayoutOrder or 0
+    container.Parent = parent
+    Utils.AddCorner(container, UDim.new(0, 8))
+
+    local headerLabel
+    if hasHeader then
+        headerLabel = Instance.new("TextLabel")
+        headerLabel.Size = UDim2.new(1, -20, 0, headerHeight)
+        headerLabel.Position = UDim2.new(0, 10, 0, 4)
+        headerLabel.BackgroundTransparency = 1
+        headerLabel.Text = opts.Text
+        headerLabel.TextXAlignment = Enum.TextXAlignment.Left
+        headerLabel.Font = Enum.Font.GothamBold
+        headerLabel.TextSize = 14
+        headerLabel.Parent = container
+    end
+
+    local scroller = Instance.new("ScrollingFrame")
+    scroller.Position = UDim2.new(0, 6, 0, headerHeight + 4)
+    scroller.BackgroundTransparency = 1
+    scroller.BorderSizePixel = 0
+    scroller.ScrollBarThickness = 4
+    scroller.CanvasSize = UDim2.new(0, 0, 0, 0)
+    scroller.AutomaticCanvasSize = Enum.AutomaticSize.Y
+    scroller.Parent = container
+    local listLayout = Instance.new("UIListLayout")
+    listLayout.Padding = UDim.new(0, 4)
+    listLayout.Parent = scroller
+
+    local emptyLabel = Instance.new("TextLabel")
+    emptyLabel.Size = UDim2.new(1, 0, 0, rowHeight)
+    emptyLabel.BackgroundTransparency = 1
+    emptyLabel.Text = opts.EmptyText or "Không có mục nào"
+    emptyLabel.TextXAlignment = Enum.TextXAlignment.Left
+    emptyLabel.Font = Enum.Font.Gotham
+    emptyLabel.TextSize = 13
+    emptyLabel.Parent = scroller
+    Utils.AddPadding(emptyLabel, UDim.new(0, 8))
+
+    local rows = {}
+    local function updateContainerHeight()
+        local scrollH = math.max(math.min(#items, maxVisible), 1) * (rowHeight + 4)
+        scroller.Size = UDim2.new(1, -12, 0, scrollH)
+        container.Size = UDim2.new(1, 0, 0, headerHeight + scrollH + 10)
+    end
+
+    local function rebuild()
+        rowConnMgr:DisconnectAll()
+        for _, row in ipairs(rows) do row.holder:Destroy() end
+        table.clear(rows)
+        emptyLabel.Visible = (#items == 0)
+
+        for i, item in ipairs(items) do
+            local holder = Instance.new("TextButton")
+            holder.Size = UDim2.new(1, 0, 0, rowHeight)
+            holder.LayoutOrder = i
+            holder.Text = ""
+            holder.AutoButtonColor = false
+            holder.Parent = scroller
+            Utils.AddCorner(holder, UDim.new(0, 6))
+            Animator.AddThickenStroke(holder, rowConnMgr)
+
+            local hasToggle = item.OnToggle ~= nil
+            local toggled = item.Toggled and true or false
+            local check
+
+            if hasToggle then
+                check = Instance.new("Frame")
+                check.AnchorPoint = Vector2.new(0, 0.5)
+                check.Position = UDim2.new(0, 8, 0.5, 0)
+                check.Size = UDim2.new(0, 18, 0, 18)
+                check.Parent = holder
+                Utils.AddCorner(check, UDim.new(0, 4))
+                local mark = Instance.new("TextLabel")
+                mark.Size = UDim2.new(1, 0, 1, 0)
+                mark.BackgroundTransparency = 1
+                mark.Text = "✓"
+                mark.TextColor3 = Color3.fromRGB(255, 255, 255)
+                mark.Font = Enum.Font.GothamBold
+                mark.TextSize = 13
+                mark.TextTransparency = toggled and 0 or 1
+                mark.Parent = check
+                check.Mark = mark
+            end
+
+            local textLabel = Instance.new("TextLabel")
+            textLabel.Position = UDim2.new(0, hasToggle and 36 or 10, 0, 0)
+            textLabel.Size = UDim2.new(1, hasToggle and -130 or -104, 1, 0)
+            textLabel.BackgroundTransparency = 1
+            textLabel.Text = item.Text or ""
+            textLabel.TextXAlignment = Enum.TextXAlignment.Left
+            textLabel.Font = Enum.Font.Gotham
+            textLabel.TextSize = 14
+            textLabel.TextTruncate = Enum.TextTruncate.AtEnd
+            textLabel.Parent = holder
+
+            local subLabel
+            if item.SubText then
+                subLabel = Instance.new("TextLabel")
+                subLabel.AnchorPoint = Vector2.new(1, 0.5)
+                subLabel.Position = UDim2.new(1, -10, 0.5, 0)
+                subLabel.Size = UDim2.new(0, 80, 1, 0)
+                subLabel.BackgroundTransparency = 1
+                subLabel.Text = item.SubText
+                subLabel.TextXAlignment = Enum.TextXAlignment.Right
+                subLabel.Font = Enum.Font.Gotham
+                subLabel.TextSize = 13
+                subLabel.Parent = holder
+            end
+
+            if hasToggle then
+                rowConnMgr:Track(holder.MouseButton1Click:Connect(function()
+                    toggled = not toggled
+                    rows[i].toggled = toggled
+                    TweenService:Create(check.Mark, TweenInfo.new(0.2, EASE, EASE_OUT), { TextTransparency = toggled and 0 or 1 }):Play()
+                    TweenService:Create(check, TweenInfo.new(0.2, EASE, EASE_OUT), {
+                        BackgroundColor3 = toggled and theme.Accent or Utils.Darken(theme.Color, 0.75)
+                    }):Play()
+                    item.OnToggle(toggled)
+                end))
+            elseif item.OnClick then
+                rowConnMgr:Track(holder.MouseButton1Click:Connect(function() item.OnClick() end))
+            end
+
+            table.insert(rows, { holder = holder, check = check, textLabel = textLabel, subLabel = subLabel, toggled = toggled })
+        end
+        updateContainerHeight()
+    end
+    rebuild()
+
+    local self = { Instance = container }
+    -- Rebuilds the row list from a new Items array (e.g. player join/leave).
+    function self:Refresh(newItems)
+        items = newItems or {}
+        rebuild()
+    end
+    function self:Destroy() rowConnMgr:DisconnectAll() end
+    function self:ApplyTheme(color, accent, isInitial)
+        local panelBg = Utils.Brighten(color, 1.2)
+        local textColor = Utils.GetTextColorFor(panelBg, accent)
+        local darkBg = Utils.Darken(color, 0.75)
+        local rowBg = Utils.Darken(color, 0.85)
+        local subColor = Utils.GetTextColorFor(rowBg, accent)
+        if isInitial then
+            container.BackgroundColor3 = panelBg
+            if headerLabel then headerLabel.TextColor3 = textColor end
+            emptyLabel.TextColor3 = subColor
+            for _, row in ipairs(rows) do
+                row.holder.BackgroundColor3 = rowBg
+                row.textLabel.TextColor3 = textColor
+                if row.subLabel then row.subLabel.TextColor3 = subColor end
+                if row.check then row.check.BackgroundColor3 = row.toggled and accent or darkBg end
+            end
+        else
+            TweenService:Create(container, THEME_TWEEN_INFO, { BackgroundColor3 = panelBg }):Play()
+            if headerLabel then TweenService:Create(headerLabel, THEME_TWEEN_INFO, { TextColor3 = textColor }):Play() end
+            TweenService:Create(emptyLabel, THEME_TWEEN_INFO, { TextColor3 = subColor }):Play()
+            for _, row in ipairs(rows) do
+                TweenService:Create(row.holder, THEME_TWEEN_INFO, { BackgroundColor3 = rowBg }):Play()
+                TweenService:Create(row.textLabel, THEME_TWEEN_INFO, { TextColor3 = textColor }):Play()
+                if row.subLabel then TweenService:Create(row.subLabel, THEME_TWEEN_INFO, { TextColor3 = subColor }):Play() end
+                if row.check then
+                    TweenService:Create(row.check, THEME_TWEEN_INFO, { BackgroundColor3 = row.toggled and accent or darkBg }):Play()
+                end
+            end
+        end
+    end
+    theme:Subscribe(function(c, a, initial) self:ApplyTheme(c, a, initial) end)
+    return self
+end
+
 local NOTIF_TYPES = {
     success = { Color3.fromRGB(60, 200, 120), "✓" },
     error   = { Color3.fromRGB(220, 70, 70),  "×" },
@@ -3838,6 +4367,32 @@ function TabMeta:CreateKeybind(opts)
     self._window:_registerFlag(opts.Flag, obj)
     return obj
 end
+function TabMeta:CreateNumberStepper(opts)
+    opts = opts or {}
+    opts.LayoutOrder = nextOrder(self)
+    local obj = Components.NumberStepper(self._page, self._theme, self._connMgr, opts)
+    self._window:_registerFlag(opts.Flag, obj)
+    return obj
+end
+function TabMeta:CreateRadioGroup(opts)
+    opts = opts or {}
+    opts.LayoutOrder = nextOrder(self)
+    local obj = Components.RadioGroup(self._page, self._theme, self._connMgr, opts)
+    self._window:_registerFlag(opts.Flag, obj)
+    return obj
+end
+function TabMeta:CreateAccordion(opts)
+    opts = opts or {}
+    opts.LayoutOrder = nextOrder(self)
+    local acc = Components.Accordion(self._page, self._theme, self._connMgr, opts)
+    acc._window = self._window
+    return acc
+end
+function TabMeta:CreateTableList(opts)
+    opts = opts or {}
+    opts.LayoutOrder = nextOrder(self)
+    return Components.TableList(self._page, self._theme, self._connMgr, opts)
+end
 
 function TabMeta:CreateConfigList(opts)
     opts = opts or {}
@@ -3922,6 +4477,88 @@ function TabMeta:CreateConfigList(opts)
     end
 
     return { Dropdown = dropdown, NameBox = nameBox, Refresh = refreshList }
+end
+
+-- Bọc mọi TabMeta:CreateXxx hiện có (được định nghĩa phía trên, kể cả
+-- CreateConfigList) để tự gắn attribute chứa text tìm kiếm lên obj.Instance
+-- và đăng ký vào self._searchEntries — nhờ vậy CreateSearchBar không cần
+-- từng factory biết gì về search cả. Phải nằm SAU toàn bộ định nghĩa
+-- TabMeta:CreateXxx gốc vì nó snapshot pairs(TabMeta) tại thời điểm chạy.
+for methodName, fn in pairs(TabMeta) do
+    if methodName:sub(1, 6) == "Create" then
+        TabMeta[methodName] = function(self, opts, ...)
+            local obj = fn(self, opts, ...)
+            if obj and obj.Instance then
+                local searchText = (opts and (opts.Text or opts.Title)) or ""
+                obj.Instance:SetAttribute("SelenixSearchText", tostring(searchText):lower())
+                self._searchEntries = self._searchEntries or {}
+                table.insert(self._searchEntries, obj.Instance)
+            end
+            return obj
+        end
+    end
+end
+
+-- ---------- Global SearchBar ----------
+-- Đặt đầu tab, lọc mọi control TRONG TAB ĐÓ theo Text/Title (không phân
+-- biệt hoa thường), ẩn/hiện qua Visible — UIListLayout của page tự reflow.
+-- Định nghĩa SAU khối wrap ở trên nên bản thân nó không bị wrap / không tự
+-- đăng ký làm search entry của chính nó.
+function TabMeta:CreateSearchBar(opts)
+    opts = opts or {}
+    opts.LayoutOrder = nextOrder(self)
+    local tab = self
+
+    local frame = Instance.new("Frame")
+    frame.Size = opts.Size or UDim2.new(1, 0, 0, 40)
+    frame.LayoutOrder = opts.LayoutOrder
+    frame.Parent = self._page
+    Utils.AddCorner(frame, UDim.new(0, 8))
+
+    local box = Instance.new("TextBox")
+    box.Size = UDim2.new(1, -20, 1, 0)
+    box.Position = UDim2.new(0, 10, 0, 0)
+    box.Text = ""
+    box.PlaceholderText = opts.Placeholder or "Tìm kiếm..."
+    box.PlaceholderColor3 = Color3.fromRGB(150, 150, 160)
+    box.TextColor3 = Color3.fromRGB(255, 255, 255)
+    box.Font = Enum.Font.Gotham
+    box.TextSize = 14
+    box.ClearTextOnFocus = false
+    box.TextXAlignment = Enum.TextXAlignment.Left
+    box.Parent = frame
+    Utils.AddCorner(box, UDim.new(0, 6))
+    Utils.AddPadding(box, UDim.new(0, 10))
+
+    local function applyFilter(query)
+        query = query:lower()
+        for _, inst in ipairs(tab._searchEntries or {}) do
+            if inst.Parent then
+                local text = inst:GetAttribute("SelenixSearchText") or ""
+                inst.Visible = (query == "") or text:find(query, 1, true) ~= nil
+            end
+        end
+    end
+    self._connMgr:Track(box:GetPropertyChangedSignal("Text"):Connect(function()
+        applyFilter(box.Text)
+    end))
+
+    local self2 = { Instance = frame }
+    function self2:ApplyTheme(color, accent, isInitial)
+        local panelBg = Utils.Brighten(color, 1.2)
+        local darkBg = Utils.Darken(color, 0.8)
+        local textColor = Utils.GetTextColorFor(darkBg, accent)
+        if isInitial then
+            frame.BackgroundColor3 = panelBg
+            box.BackgroundColor3 = darkBg
+            box.TextColor3 = textColor
+        else
+            TweenService:Create(frame, THEME_TWEEN_INFO, { BackgroundColor3 = panelBg }):Play()
+            TweenService:Create(box, THEME_TWEEN_INFO, { BackgroundColor3 = darkBg, TextColor3 = textColor }):Play()
+        end
+    end
+    self._theme:Subscribe(function(c, a, initial) self2:ApplyTheme(c, a, initial) end)
+    return self2
 end
 
 local Library = {}
