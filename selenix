@@ -246,6 +246,32 @@ function Utils.MakeRounder(decimals)
     return roundTo, fmt
 end
 
+-- Shared substring filter used by Dropdown/MultiDropdown's Searchable
+-- mode. `rows` is an array of {btn = TextButton, text = string, ...};
+-- toggles each row's Visible based on a case-insensitive substring match
+-- against `query` (empty query shows everything). Both components
+-- previously carried a byte-identical copy of this loop.
+function Utils.FilterRowsByText(rows, query)
+    query = (query or ""):lower()
+    for _, row in ipairs(rows) do
+        row.btn.Visible = (query == "") or row.text:lower():find(query, 1, true) ~= nil
+    end
+end
+
+-- Roblox has no single "pointer" UserInputType — mouse and touch each need
+-- their own check everywhere a drag needs to work with both. This pair of
+-- one-line checks was duplicated inline across Slider's drag/bar handlers
+-- and ColorPicker's SV/Hue/BW bars; centralizing them means "what counts
+-- as a drag start" and "what counts as a drag move" are each defined once.
+function Utils.IsPointerDown(input)
+    return input.UserInputType == Enum.UserInputType.MouseButton1
+        or input.UserInputType == Enum.UserInputType.Touch
+end
+function Utils.IsPointerMove(input)
+    return input.UserInputType == Enum.UserInputType.MouseMovement
+        or input.UserInputType == Enum.UserInputType.Touch
+end
+
 function Utils.AddCorner(parent, radius)
     local c = Instance.new("UICorner")
     c.CornerRadius = radius or UDim.new(0, 8)
@@ -413,6 +439,20 @@ end
 
 function Animator.Tween(obj, props, duration, style, dir)
     return TweenService:Create(obj, TweenInfo.new(duration or 0.3, style or EASE, dir or EASE_OUT), props)
+end
+
+-- Plays the same {instance, props} tween on every entry in one call, all
+-- sharing one duration/style/dir. Components.Notification's Dismiss() used
+-- to fire ~10 near-identical `Animator.Tween(x, {...}, 0.18, EASE, EASE_IN):Play()`
+-- calls back to back for its fade-out; this collapses that into one data
+-- table + one loop, the same shape Animator.ApplyTheme already uses for
+-- theme-change tweens. Returns nothing — fire-and-forget, matching how the
+-- original calls were used (only the outer slide/collapse tweens below are
+-- gated on .Completed).
+function Animator.TweenAll(entries, duration, style, dir)
+    for _, entry in ipairs(entries) do
+        Animator.Tween(entry[1], entry[2], duration, style, dir):Play()
+    end
 end
 
 -- Shared "snap on first paint, tween on every theme change afterwards"
@@ -783,23 +823,23 @@ function Components.Slider(parent, theme, connMgr, opts)
     end
 
     connMgr:Track(drag.InputBegan:Connect(function(input)
-        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+        if Utils.IsPointerDown(input) then
             dragging = true
         end
     end))
     connMgr:Track(bar.InputBegan:Connect(function(input)
-        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+        if Utils.IsPointerDown(input) then
             dragging = true
             update(input.Position)
         end
     end))
     connMgr:Track(UserInputService.InputEnded:Connect(function(input)
-        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+        if Utils.IsPointerDown(input) then
             dragging = false
         end
     end))
     connMgr:Track(UserInputService.InputChanged:Connect(function(input)
-        if dragging and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+        if dragging and Utils.IsPointerMove(input) then
             update(input.Position)
         end
     end))
@@ -1457,6 +1497,35 @@ function Components.ExpandableHeader(parent, theme, connMgr, opts)
     }
 end
 
+-- Shared "filter TextBox row" used by Dropdown/MultiDropdown's
+-- opts.Searchable mode — both previously hand-built an identical
+-- TextBox-in-a-Frame here (~15 duplicate lines each). Returns the
+-- TextBox; the caller wires up its own GetPropertyChangedSignal("Text")
+-- filter connection since Dropdown and MultiDropdown filter different
+-- row-array shapes.
+local function makeSearchBox(bodyParent, placeholder)
+    local searchHolder = Instance.new("Frame")
+    searchHolder.Size = UDim2.new(1, 0, 0, 28)
+    searchHolder.LayoutOrder = 0
+    searchHolder.BackgroundTransparency = 1
+    searchHolder.Parent = bodyParent
+
+    local searchBox = Instance.new("TextBox")
+    searchBox.Size = UDim2.new(1, 0, 1, 0)
+    searchBox.Text = ""
+    searchBox.PlaceholderText = placeholder or "Tìm kiếm..."
+    searchBox.PlaceholderColor3 = Color3.fromRGB(150, 150, 160)
+    searchBox.TextColor3 = Color3.fromRGB(255, 255, 255)
+    searchBox.Font = Enum.Font.Gotham
+    searchBox.TextSize = 13
+    searchBox.ClearTextOnFocus = false
+    searchBox.TextXAlignment = Enum.TextXAlignment.Left
+    searchBox.Parent = searchHolder
+    Utils.AddPadding(searchBox, UDim.new(0, 10), UDim.new(0, 10))
+    Utils.AddCorner(searchBox, UDim.new(0, 6))
+    return searchBox
+end
+
 -- ---------- Dropdown (single select) ----------
 -- Supports opts.Searchable = true, which adds a filter TextBox above the
 -- option list. Typing filters rows by a case-insensitive substring match
@@ -1513,27 +1582,7 @@ function Components.Dropdown(parent, theme, connMgr, opts)
 
     local searchBox
     if searchable then
-        local searchHolder = Instance.new("Frame")
-        searchHolder.Size = UDim2.new(1, 0, 0, 28)
-        searchHolder.LayoutOrder = 0
-        searchHolder.BackgroundTransparency = 1
-        searchHolder.Parent = exp.Body
-
-        searchBox = Instance.new("TextBox")
-        searchBox.Size = UDim2.new(1, 0, 1, 0)
-        searchBox.Text = ""
-        searchBox.PlaceholderText = opts.SearchPlaceholder or "Tìm kiếm..."
-        searchBox.PlaceholderColor3 = Color3.fromRGB(150, 150, 160)
-        searchBox.TextColor3 = Color3.fromRGB(255, 255, 255)
-        searchBox.Font = Enum.Font.Gotham
-        searchBox.TextSize = 13
-        searchBox.ClearTextOnFocus = false
-        searchBox.TextXAlignment = Enum.TextXAlignment.Left
-        searchBox.Parent = searchHolder
-        Utils.AddPadding(searchBox, UDim.new(0, 10), UDim.new(0, 10))
-        Utils.AddCorner(searchBox, UDim.new(0, 6))
-
-        exp._searchHolder = searchHolder
+        searchBox = makeSearchBox(exp.Body, opts.SearchPlaceholder)
     end
 
     local list = Instance.new("Frame")
@@ -1563,10 +1612,7 @@ function Components.Dropdown(parent, theme, connMgr, opts)
     end
 
     local function applyFilter(query)
-        query = (query or ""):lower()
-        for _, row in ipairs(optionButtons) do
-            row.btn.Visible = (query == "") or row.text:lower():find(query, 1, true) ~= nil
-        end
+        Utils.FilterRowsByText(optionButtons, query)
     end
 
     -- THÊM: đọc option AllowDeselect, mặc định true (giống hành vi cũ)
@@ -1616,6 +1662,11 @@ function Components.Dropdown(parent, theme, connMgr, opts)
     rebuildOptions()
 
     if searchable then
+        -- Setting searchBox.Text below already fires this same connection
+        -- (Roblox property-changed signals fire synchronously), which in
+        -- turn calls applyFilter — so closing the dropdown no longer needs
+        -- its own separate applyFilter("") call the way the original code
+        -- had; clearing the Text is enough to clear the filter too.
         connMgr:Track(searchBox:GetPropertyChangedSignal("Text"):Connect(function()
             applyFilter(searchBox.Text)
         end))
@@ -1623,7 +1674,6 @@ function Components.Dropdown(parent, theme, connMgr, opts)
         userOnToggle = function(isOpen)
             if not isOpen then
                 searchBox.Text = ""
-                applyFilter("")
             end
             if originalOnToggle then originalOnToggle(isOpen) end
         end
@@ -1735,25 +1785,7 @@ function Components.MultiDropdown(parent, theme, connMgr, opts)
 
     local searchBox
     if searchable then
-        local searchHolder = Instance.new("Frame")
-        searchHolder.Size = UDim2.new(1, 0, 0, 28)
-        searchHolder.LayoutOrder = 0
-        searchHolder.BackgroundTransparency = 1
-        searchHolder.Parent = exp.Body
-
-        searchBox = Instance.new("TextBox")
-        searchBox.Size = UDim2.new(1, 0, 1, 0)
-        searchBox.Text = ""
-        searchBox.PlaceholderText = opts.SearchPlaceholder or "Tìm kiếm..."
-        searchBox.PlaceholderColor3 = Color3.fromRGB(150, 150, 160)
-        searchBox.TextColor3 = Color3.fromRGB(255, 255, 255)
-        searchBox.Font = Enum.Font.Gotham
-        searchBox.TextSize = 13
-        searchBox.ClearTextOnFocus = false
-        searchBox.TextXAlignment = Enum.TextXAlignment.Left
-        searchBox.Parent = searchHolder
-        Utils.AddPadding(searchBox, UDim.new(0, 10), UDim.new(0, 10))
-        Utils.AddCorner(searchBox, UDim.new(0, 6))
+        searchBox = makeSearchBox(exp.Body, opts.SearchPlaceholder)
     end
 
     local list = Instance.new("Frame")
@@ -1789,10 +1821,7 @@ function Components.MultiDropdown(parent, theme, connMgr, opts)
     end
 
     local function applyFilter(query)
-        query = (query or ""):lower()
-        for _, row in ipairs(rows) do
-            row.btn.Visible = (query == "") or row.text:lower():find(query, 1, true) ~= nil
-        end
+        Utils.FilterRowsByText(rows, query)
     end
 
     -- Rebuilds the option rows in `list` from the `options` array. Used both
@@ -1845,6 +1874,9 @@ function Components.MultiDropdown(parent, theme, connMgr, opts)
     rebuildRows()
 
     if searchable then
+        -- Same redundant-call removal as Dropdown above: Text = "" already
+        -- fires this connection synchronously, so it clears the filter on
+        -- its own without a second explicit applyFilter("") call.
         connMgr:Track(searchBox:GetPropertyChangedSignal("Text"):Connect(function()
             applyFilter(searchBox.Text)
         end))
@@ -1852,7 +1884,6 @@ function Components.MultiDropdown(parent, theme, connMgr, opts)
         userOnToggle = function(isOpen)
             if not isOpen then
                 searchBox.Text = ""
-                applyFilter("")
             end
             if originalOnToggle then originalOnToggle(isOpen) end
         end
@@ -2253,7 +2284,14 @@ function Components.ColorPicker(parent, theme, connMgr, opts)
         end))
     end
 
-    -- Drag handling for SV box / hue bar / bw bar
+    -- Drag handling for SV box / hue bar / bw bar. All three follow the
+    -- same shape — InputBegan sets which bar is active and does an
+    -- immediate update, InputChanged re-runs that same update while
+    -- dragging — previously duplicated three times over with only the
+    -- updateXxx function and the "sv"/"hue"/"bw" tag changing. Now driven
+    -- by one small dispatch table (dragUpdaters) plus one shared
+    -- bindDragStart helper instead of three near-identical InputBegan
+    -- blocks and a three-way if/elseif in InputChanged.
     local activeDrag = nil
     local function updateSV(pos)
         local absPos, absSize = sv.AbsolutePosition, sv.AbsoluteSize
@@ -2271,32 +2309,26 @@ function Components.ColorPicker(parent, theme, connMgr, opts)
         val = math.clamp((pos.X - absPos.X) / absSize.X, 0, 1)
         refresh()
     end
+    local dragUpdaters = { sv = updateSV, hue = updateHue, bw = updateBW }
 
-    connMgr:Track(sv.InputBegan:Connect(function(input)
-        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
-            activeDrag = "sv"; updateSV(input.Position)
-        end
-    end))
-    connMgr:Track(hueBar.InputBegan:Connect(function(input)
-        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
-            activeDrag = "hue"; updateHue(input.Position)
-        end
-    end))
-    connMgr:Track(bwBar.InputBegan:Connect(function(input)
-        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
-            activeDrag = "bw"; updateBW(input.Position)
-        end
-    end))
+    local function bindDragStart(bar, key, updateFn)
+        connMgr:Track(bar.InputBegan:Connect(function(input)
+            if Utils.IsPointerDown(input) then
+                activeDrag = key
+                updateFn(input.Position)
+            end
+        end))
+    end
+    bindDragStart(sv, "sv", updateSV)
+    bindDragStart(hueBar, "hue", updateHue)
+    bindDragStart(bwBar, "bw", updateBW)
+
     connMgr:Track(UserInputService.InputEnded:Connect(function(input)
-        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
-            activeDrag = nil
-        end
+        if Utils.IsPointerDown(input) then activeDrag = nil end
     end))
     connMgr:Track(UserInputService.InputChanged:Connect(function(input)
-        if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then
-            if activeDrag == "sv" then updateSV(input.Position)
-            elseif activeDrag == "hue" then updateHue(input.Position)
-            elseif activeDrag == "bw" then updateBW(input.Position) end
+        if activeDrag and Utils.IsPointerMove(input) then
+            dragUpdaters[activeDrag](input.Position)
         end
     end))
 
@@ -3679,18 +3711,25 @@ function Components.Notification(parent, theme, connMgr, opts)
         -- directly inside the list-managed container), so this Position
         -- tween is free to run without a UIListLayout recompute snapping
         -- it back mid-flight.
-        Animator.Tween(cardScale, { Scale = 0.94 }, 0.28, EASE, EASE_IN):Play()
-        Animator.Tween(stroke, { Transparency = 1 }, 0.22, EASE, EASE_IN):Play()
-        Animator.Tween(accentBar, { BackgroundTransparency = 1 }, 0.22, EASE, EASE_IN):Play()
-        Animator.Tween(titleLabel, { TextTransparency = 1 }, 0.18, EASE, EASE_IN):Play()
-        Animator.Tween(bodyLabel, { TextTransparency = 1 }, 0.18, EASE, EASE_IN):Play()
-        Animator.Tween(icon, { TextTransparency = 1 }, 0.18, EASE, EASE_IN):Play()
-        Animator.Tween(iconHolder, { BackgroundTransparency = 1 }, 0.18, EASE, EASE_IN):Play()
-        Animator.Tween(closeBtn, { TextTransparency = 1 }, 0.18, EASE, EASE_IN):Play()
+        Animator.TweenAll({
+            { titleLabel, { TextTransparency = 1 } },
+            { bodyLabel, { TextTransparency = 1 } },
+            { icon, { TextTransparency = 1 } },
+            { iconHolder, { BackgroundTransparency = 1 } },
+            { closeBtn, { TextTransparency = 1 } },
+        }, 0.18, EASE, EASE_IN)
         if timerLabel then Animator.Tween(timerLabel, { TextTransparency = 1 }, 0.18, EASE, EASE_IN):Play() end
         if actionBtn then
             Animator.Tween(actionBtn, { BackgroundTransparency = 1 }, 0.18, EASE, EASE_IN):Play()
         end
+        -- cardScale keeps its own slightly-longer 0.28s duration (the
+        -- original had it separate from stroke/accentBar's 0.22s), so it
+        -- stays a standalone call rather than joining the batch above.
+        Animator.Tween(cardScale, { Scale = 0.94 }, 0.28, EASE, EASE_IN):Play()
+        Animator.TweenAll({
+            { stroke, { Transparency = 1 } },
+            { accentBar, { BackgroundTransparency = 1 } },
+        }, 0.22, EASE, EASE_IN)
 
         -- Gated on each tween's own Completed event so the slide-up ->
         -- collapse -> destroy sequence always lines up with the actual
@@ -3849,6 +3888,24 @@ local function clampFramePosition(pos, size, anchor)
     local x = math.clamp(pos.X.Offset, minX, maxX)
     local y = math.clamp(pos.Y.Offset, minY, maxY)
     return UDim2.new(pos.X.Scale, x, pos.Y.Scale, y)
+end
+
+-- Changes a frame's AnchorPoint while keeping its on-screen position
+-- unchanged. _setupResize needs this for a center<->top-left round trip
+-- (so resizing grows/shrinks from the top-left corner instead of from the
+-- center) and _setupMinimize needs it for a center<->top-center round trip
+-- (so minimizing collapses toward the titlebar instead of toward the
+-- middle) — four call sites previously each hand-derived their own offset
+-- math for one specific anchor pair. One formula covers every pair: the
+-- position offset shifts by (newAnchor - oldAnchor) * size, read from
+-- whatever frame.AnchorPoint currently is rather than assuming which pair
+-- is being converted.
+local function reanchorFrame(frame, newAnchor)
+    local size, pos, oldAnchor = frame.Size, frame.Position, frame.AnchorPoint
+    local dx = (newAnchor.X - oldAnchor.X) * size.X.Offset
+    local dy = (newAnchor.Y - oldAnchor.Y) * size.Y.Offset
+    frame.AnchorPoint = newAnchor
+    frame.Position = UDim2.new(pos.X.Scale, pos.X.Offset + dx, pos.Y.Scale, pos.Y.Offset + dy)
 end
 
 function Window.new(config)
@@ -4231,7 +4288,7 @@ function Window:_setupDrag(titleBar, mainFrame)
 
     connMgr:Track(titleBar.InputBegan:Connect(function(input)
         if self._titleDragging or self._resizing or self._animating then return end
-        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+        if Utils.IsPointerDown(input) then
             self._titleDragging = true
             activeInput = input
             dragStart = input.Position
@@ -4239,8 +4296,7 @@ function Window:_setupDrag(titleBar, mainFrame)
         end
     end))
     connMgr:Track(UserInputService.InputChanged:Connect(function(input)
-        if self._titleDragging and input == activeInput
-            and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+        if self._titleDragging and input == activeInput and Utils.IsPointerMove(input) then
             local delta = input.Position - dragStart
             local newPos = UDim2.new(
                 startPos.X.Scale, startPos.X.Offset + delta.X,
@@ -4282,23 +4338,6 @@ function Window:_setupResize(mainFrame, originalSize)
     handle.Parent = mainFrame
     self._resizeHandle = handle
 
-    local function anchorTopLeftForResize()
-        local size, pos = mainFrame.Size, mainFrame.Position
-        mainFrame.AnchorPoint = Vector2.new(0, 0)
-        mainFrame.Position = UDim2.new(
-            pos.X.Scale, pos.X.Offset - size.X.Offset / 2,
-            pos.Y.Scale, pos.Y.Offset - size.Y.Offset / 2
-        )
-    end
-    local function anchorCenterAfterResize()
-        local size, pos = mainFrame.Size, mainFrame.Position
-        mainFrame.AnchorPoint = Vector2.new(0.5, 0.5)
-        mainFrame.Position = UDim2.new(
-            pos.X.Scale, pos.X.Offset + size.X.Offset / 2,
-            pos.Y.Scale, pos.Y.Offset + size.Y.Offset / 2
-        )
-    end
-
     local contentGroup = self._contentGroup
 
     local activeInput, dragStart, startSize
@@ -4309,19 +4348,18 @@ function Window:_setupResize(mainFrame, originalSize)
     local cachedMaxW, cachedMaxH
     connMgr:Track(handle.InputBegan:Connect(function(input)
         if self._resizing or self._titleDragging or self._minimized or self._animating then return end
-        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+        if Utils.IsPointerDown(input) then
             self._resizing = true
             activeInput = input
             dragStart = input.Position
-            anchorTopLeftForResize()
+            reanchorFrame(mainFrame, Vector2.new(0, 0))
             startSize = mainFrame.Size
             cachedMaxW, cachedMaxH = maxSize()
             contentGroup.Visible = false
         end
     end))
     connMgr:Track(UserInputService.InputChanged:Connect(function(input)
-        if self._resizing and input == activeInput
-            and (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) then
+        if self._resizing and input == activeInput and Utils.IsPointerMove(input) then
             local delta = input.Position - dragStart
             local w = math.clamp(startSize.X.Offset + delta.X, MIN_WINDOW_W, cachedMaxW)
             local h = math.clamp(startSize.Y.Offset + delta.Y, MIN_WINDOW_H, cachedMaxH)
@@ -4333,7 +4371,7 @@ function Window:_setupResize(mainFrame, originalSize)
             self._resizing = false
             activeInput = nil
             self._currentTargetSize = mainFrame.Size
-            anchorCenterAfterResize()
+            reanchorFrame(mainFrame, Vector2.new(0.5, 0.5))
             contentGroup.Visible = true
         end
     end))
@@ -4355,19 +4393,6 @@ function Window:_setupMinimize(mainFrame, minimizeBtn)
     local CONTENT_FADE_OUT_TIME = 0.22
     local CONTENT_FADE_IN_TIME = 0.28
 
-    local function anchorTopCenter()
-        local size, pos = mainFrame.Size, mainFrame.Position
-        local topY = pos.Y.Offset - size.Y.Offset / 2
-        mainFrame.AnchorPoint = Vector2.new(0.5, 0)
-        mainFrame.Position = UDim2.new(pos.X.Scale, pos.X.Offset, pos.Y.Scale, topY)
-    end
-    local function anchorCenter()
-        local size, pos = mainFrame.Size, mainFrame.Position
-        local centerY = pos.Y.Offset + size.Y.Offset / 2
-        mainFrame.AnchorPoint = Vector2.new(0.5, 0.5)
-        mainFrame.Position = UDim2.new(pos.X.Scale, pos.X.Offset, pos.Y.Scale, centerY)
-    end
-
     connMgr:Track(minimizeBtn.MouseButton1Click:Connect(function()
         if self._animating then return end
         self._animating = true
@@ -4388,7 +4413,7 @@ function Window:_setupMinimize(mainFrame, minimizeBtn)
                 self._tabContainer.Visible = false
                 for _, p in ipairs(self._pages) do p.Visible = false end
 
-                anchorTopCenter()
+                reanchorFrame(mainFrame, Vector2.new(0.5, 0))
                 local currentW = mainFrame.Size.X.Offset
                 local shrink = Animator.Tween(mainFrame, {
                     Size = UDim2.new(0, currentW, 0, MINIMIZED_HEIGHT)
@@ -4418,7 +4443,7 @@ function Window:_setupMinimize(mainFrame, minimizeBtn)
                 BottomRightRadius = UDim.new(0, 0),
             }, SIZE_TWEEN_TIME):Play()
             grow.Completed:Connect(function()
-                anchorCenter()
+                reanchorFrame(mainFrame, Vector2.new(0.5, 0.5))
                 if self._minimized then self._animating = false; return end
 
                 Animator.FadeCanvasGroup(contentGroup, 0, CONTENT_FADE_IN_TIME, connMgr, function()
