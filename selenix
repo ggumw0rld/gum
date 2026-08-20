@@ -1366,46 +1366,67 @@ function Components.Paragraph(parent, theme, connMgr, opts)
     body.Parent = bodyClip
 
     local COLLAPSE_DURATION = 0.3
+    -- Guards the live-sync listener below from fighting the click-triggered
+    -- expand/collapse tween (both would otherwise write to bodyClip.Size at
+    -- the same time).
+    local animating = false
 
-    -- Sets bodyClip's height instantly to match the body's current natural
-    -- height (used for the initial paint, so a DefaultOpen=true paragraph
-    -- doesn't play an opening animation the moment it's created).
-    local function snapToNatural(isOpen)
-        bodyClip.Size = UDim2.new(1, 0, 0, isOpen and body.AbsoluteSize.Y or 0)
+    -- FIX: bodyClip's height used to be written exactly ONCE — either by
+    -- the deferred priming below, or at the moment the user clicked to
+    -- expand/collapse — and never touched again after that. `body` always
+    -- keeps AutomaticSize = Y and re-wraps whenever its available width
+    -- changes (window resize via the resize handle, minimize/restore,
+    -- viewport rotation, a parent layout change, ...), so its real height
+    -- could grow AFTER that one-time snapshot while bodyClip's fixed pixel
+    -- height stayed stale, silently cropping whatever new lines the
+    -- rewrap added. Subscribing to body's AbsoluteSize keeps the clip
+    -- height continuously correct instead of a single snapshot that goes
+    -- stale — and as a side benefit, it no longer depends on guessing how
+    -- many Heartbeat frames text-wrapping needs to converge (see the
+    -- priming defer below): whatever frame it settles on, this listener
+    -- catches the final value.
+    local function syncClipHeight()
+        if open and not animating then
+            bodyClip.Size = UDim2.new(1, 0, 0, body.AbsoluteSize.Y)
+        end
     end
+    connMgr:Track(body:GetPropertyChangedSignal("AbsoluteSize"):Connect(syncClipHeight))
 
     if collapsible then
-        -- Body text needs a render step (or two) before AbsoluteSize.Y
-        -- reflects the actual wrapped height, so the very first paint is
-        -- deferred — matches the pattern used elsewhere in this library
-        -- for AutomaticSize convergence (see Components.Notification,
-        -- which also waits two Heartbeats). One frame was not always
-        -- enough for a multi-line TextLabel to finish wrapping/resizing,
-        -- which cropped the last line of text on first render.
+        -- Two-frame defer still primes the initial paint quickly (avoids
+        -- sitting at 0 height for several frames before the live listener
+        -- above would otherwise catch up on its own).
         task.defer(function()
             RunService.Heartbeat:Wait()
             RunService.Heartbeat:Wait()
-            snapToNatural(open)
+            syncClipHeight()
         end)
 
         connMgr:Track(holder.MouseButton1Click:Connect(function()
             open = not open
+            animating = true
             TweenService:Create(arrow, TweenInfo.new(0.25, EASE, EASE_OUT), { Rotation = open and 180 or 0 }):Play()
             local targetHeight = open and body.AbsoluteSize.Y or 0
-            TweenService:Create(bodyClip, TweenInfo.new(COLLAPSE_DURATION, EASE, EASE_OUT), {
+            local sizeTween = TweenService:Create(bodyClip, TweenInfo.new(COLLAPSE_DURATION, EASE, EASE_OUT), {
                 Size = UDim2.new(1, 0, 0, targetHeight),
-            }):Play()
+            })
+            sizeTween.Completed:Connect(function()
+                animating = false
+                syncClipHeight() -- catches any rewrap (e.g. a resize) that happened mid-animation
+            end)
+            sizeTween:Play()
             TweenService:Create(body, TweenInfo.new(open and COLLAPSE_DURATION * 0.8 or COLLAPSE_DURATION * 0.5, EASE, EASE_OUT), {
                 TextTransparency = open and 0 or 1,
             }):Play()
         end))
     else
-        -- Not collapsible: always fully open, same two-frame defer so the
-        -- clip's height matches the text's real wrapped height immediately.
+        -- Not collapsible: always fully open, same two-frame defer for a
+        -- fast initial paint; syncClipHeight above then keeps it correct
+        -- for the rest of the paragraph's lifetime.
         task.defer(function()
             RunService.Heartbeat:Wait()
             RunService.Heartbeat:Wait()
-            snapToNatural(true)
+            syncClipHeight()
         end)
     end
 
