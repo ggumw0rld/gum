@@ -1685,7 +1685,7 @@ function Components.Dropdown(parent, theme, connMgr, opts)
     end
 
     -- THÊM: đọc option AllowDeselect, mặc định true (giống hành vi cũ)
-    local allowDeselect = opts.AllowDeselect ~= false
+    local allowDeselect = opts.AllowDeselect ~= true
 
     local function rebuildOptions()
         rowConnMgr:DisconnectAll()
