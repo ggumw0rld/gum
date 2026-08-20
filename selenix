@@ -611,7 +611,7 @@ function Components.Label(parent, theme, connMgr, opts)
     label.Text = opts.Text or ""
     label.TextXAlignment = Enum.TextXAlignment.Left
     label.TextYAlignment = Enum.TextYAlignment.Top
-    label.Font = opts.Bold and Enum.Font.GothamBold or Enum.Font.Gotham
+    label.Font = opts.Bold and Enum.Font.BuilderSansBold or Enum.Font.BuilderSans
     label.TextSize = opts.TextSize or 14
     label.TextWrapped = true
     label.Parent = holder
@@ -643,7 +643,7 @@ function Components.Button(parent, theme, connMgr, opts)
     btn.Size = UDim2.new(1, 0, 1, 0)
     btn.Text = opts.Text or "Button"
     btn.TextColor3 = Color3.fromRGB(255, 255, 255)
-    btn.Font = Enum.Font.GothamBold
+    btn.Font = Enum.Font.BuilderSansBold
     btn.TextSize = 16
     btn.TextXAlignment = Enum.TextXAlignment.Left
     btn.Parent = holder
@@ -683,7 +683,7 @@ function Components.Toggle(parent, theme, connMgr, opts)
     label.BackgroundTransparency = 1
     label.TextColor3 = Color3.fromRGB(255, 255, 255)
     label.TextXAlignment = Enum.TextXAlignment.Left
-    label.Font = Enum.Font.GothamBold
+    label.Font = Enum.Font.BuilderSansBold
     label.TextSize = 16
     label.Parent = frame
 
@@ -780,7 +780,7 @@ function Components.Slider(parent, theme, connMgr, opts)
     label.BackgroundTransparency = 1
     label.TextColor3 = Color3.fromRGB(255, 255, 255)
     label.TextXAlignment = Enum.TextXAlignment.Left
-    label.Font = Enum.Font.GothamBold
+    label.Font = Enum.Font.BuilderSansBold
     label.TextSize = 15
     label.Parent = frame
 
@@ -909,7 +909,7 @@ function Components.NumberStepper(parent, theme, connMgr, opts)
     label.Text = opts.Text or "Giá trị"
     label.TextColor3 = Color3.fromRGB(255, 255, 255)
     label.TextXAlignment = Enum.TextXAlignment.Left
-    label.Font = Enum.Font.GothamBold
+    label.Font = Enum.Font.BuilderSansBold
     label.TextSize = 15
     label.Parent = frame
 
@@ -920,7 +920,7 @@ function Components.NumberStepper(parent, theme, connMgr, opts)
         b.Size = UDim2.new(0, 26, 0, 26)
         b.Text = text
         b.TextColor3 = Color3.fromRGB(255, 255, 255)
-        b.Font = Enum.Font.GothamBold
+        b.Font = Enum.Font.BuilderSansBold
         b.TextSize = 16
         b.AutoButtonColor = false
         b.Parent = frame
@@ -936,7 +936,7 @@ function Components.NumberStepper(parent, theme, connMgr, opts)
     box.Size = UDim2.new(0, 60, 0, 28)
     box.Text = fmt(value) .. suffix
     box.TextColor3 = Color3.fromRGB(255, 255, 255)
-    box.Font = Enum.Font.Gotham
+    box.Font = Enum.Font.BuilderSans
     box.TextSize = 14
     box.ClearTextOnFocus = false
     box.Parent = frame
@@ -1008,7 +1008,7 @@ function Components.RadioGroup(parent, theme, connMgr, opts)
         titleLabel.BackgroundTransparency = 1
         titleLabel.Text = opts.Text
         titleLabel.TextXAlignment = Enum.TextXAlignment.Left
-        titleLabel.Font = Enum.Font.GothamBold
+        titleLabel.Font = Enum.Font.BuilderSansBold
         titleLabel.TextSize = 15
         titleLabel.Parent = container
     end
@@ -1089,7 +1089,7 @@ function Components.RadioGroup(parent, theme, connMgr, opts)
         lbl.BackgroundTransparency = 1
         lbl.Text = text
         lbl.TextXAlignment = Enum.TextXAlignment.Left
-        lbl.Font = Enum.Font.Gotham
+        lbl.Font = Enum.Font.BuilderSans
         lbl.TextSize = 14
         lbl.Parent = row
 
@@ -1143,7 +1143,7 @@ function Components.Textbox(parent, theme, connMgr, opts)
     label.Text = opts.Text or "Nhập:"
     label.TextColor3 = Color3.fromRGB(255, 255, 255)
     label.TextXAlignment = Enum.TextXAlignment.Left
-    label.Font = Enum.Font.GothamBold
+    label.Font = Enum.Font.BuilderSansBold
     label.TextSize = 15
     label.Parent = frame
 
@@ -1155,7 +1155,7 @@ function Components.Textbox(parent, theme, connMgr, opts)
     box.PlaceholderText = opts.Placeholder or "Nhập nội dung..."
     box.PlaceholderColor3 = Color3.fromRGB(150, 150, 160)
     box.TextColor3 = Color3.fromRGB(255, 255, 255)
-    box.Font = Enum.Font.Gotham
+    box.Font = Enum.Font.BuilderSans
     box.TextSize = 14
     box.ClearTextOnFocus = false
     box.ClipsDescendants = true
@@ -1214,7 +1214,7 @@ function Components.Divider(parent, theme, connMgr, opts)
         label.BackgroundTransparency = 1
         label.Text = opts.Text
         label.TextXAlignment = Enum.TextXAlignment.Left
-        label.Font = Enum.Font.GothamBold
+        label.Font = Enum.Font.BuilderSansBold
         label.TextSize = 13
         label.Parent = holder
         Utils.AddPadding(label, UDim.new(0, 2))
@@ -1293,7 +1293,7 @@ function Components.Paragraph(parent, theme, connMgr, opts)
     titleLabel.BackgroundTransparency = 1
     titleLabel.Text = opts.Title or ""
     titleLabel.TextXAlignment = Enum.TextXAlignment.Left
-    titleLabel.Font = Enum.Font.GothamBold
+    titleLabel.Font = Enum.Font.BuilderSansBold
     titleLabel.TextSize = 15
     titleLabel.Parent = titleRow
 
@@ -1306,7 +1306,7 @@ function Components.Paragraph(parent, theme, connMgr, opts)
         arrow.BackgroundTransparency = 1
         arrow.Text = "▾"
         arrow.Rotation = open and 180 or 0
-        arrow.Font = Enum.Font.GothamBold
+        arrow.Font = Enum.Font.BuilderSansBold
         arrow.TextSize = 14
         arrow.Parent = titleRow
     end
@@ -1333,7 +1333,7 @@ function Components.Paragraph(parent, theme, connMgr, opts)
     body.TextWrapped = true
     body.TextXAlignment = Enum.TextXAlignment.Left
     body.TextYAlignment = Enum.TextYAlignment.Top
-    body.Font = Enum.Font.Gotham
+    body.Font = Enum.Font.BuilderSans
     body.TextSize = 13
     body.TextTransparency = open and 0 or 1
     body.Parent = bodyClip
@@ -1429,7 +1429,7 @@ function Components.ExpandableHeader(parent, theme, connMgr, opts)
     titleLabel.Text = opts.Text or ""
     titleLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
     titleLabel.TextXAlignment = Enum.TextXAlignment.Left
-    titleLabel.Font = Enum.Font.GothamBold
+    titleLabel.Font = Enum.Font.BuilderSansBold
     titleLabel.TextSize = 15
     titleLabel.Parent = header
 
@@ -1440,7 +1440,7 @@ function Components.ExpandableHeader(parent, theme, connMgr, opts)
     arrow.BackgroundTransparency = 1
     arrow.Text = "▾"
     arrow.TextColor3 = Color3.fromRGB(255, 255, 255)
-    arrow.Font = Enum.Font.GothamBold
+    arrow.Font = Enum.Font.BuilderSansBold
     arrow.TextSize = 16
     arrow.Parent = header
 
@@ -1516,7 +1516,7 @@ local function makeSearchBox(bodyParent, placeholder)
     searchBox.PlaceholderText = placeholder or "Tìm kiếm..."
     searchBox.PlaceholderColor3 = Color3.fromRGB(150, 150, 160)
     searchBox.TextColor3 = Color3.fromRGB(255, 255, 255)
-    searchBox.Font = Enum.Font.Gotham
+    searchBox.Font = Enum.Font.BuilderSans
     searchBox.TextSize = 13
     searchBox.ClearTextOnFocus = false
     searchBox.TextXAlignment = Enum.TextXAlignment.Left
@@ -1575,7 +1575,7 @@ function Components.Dropdown(parent, theme, connMgr, opts)
     valueLabel.Text = selected or ""
     valueLabel.TextColor3 = Color3.fromRGB(190, 190, 200)
     valueLabel.TextXAlignment = Enum.TextXAlignment.Right
-    valueLabel.Font = Enum.Font.Gotham
+    valueLabel.Font = Enum.Font.BuilderSans
     valueLabel.TextSize = 14
     valueLabel.TextTruncate = Enum.TextTruncate.AtEnd
     valueLabel.Parent = exp.Header
@@ -1631,7 +1631,7 @@ function Components.Dropdown(parent, theme, connMgr, opts)
             btn.Text = text
             btn.TextXAlignment = Enum.TextXAlignment.Left
             btn.TextColor3 = Color3.fromRGB(255, 255, 255)
-            btn.Font = Enum.Font.Gotham
+            btn.Font = Enum.Font.BuilderSans
             btn.TextSize = 14
             btn.Parent = list
             Utils.AddCorner(btn, UDim.new(0, 6))
@@ -1778,7 +1778,7 @@ function Components.MultiDropdown(parent, theme, connMgr, opts)
     valueLabel.Text = summaryText()
     valueLabel.TextColor3 = Color3.fromRGB(190, 190, 200)
     valueLabel.TextXAlignment = Enum.TextXAlignment.Right
-    valueLabel.Font = Enum.Font.Gotham
+    valueLabel.Font = Enum.Font.BuilderSans
     valueLabel.TextSize = 14
     valueLabel.TextTruncate = Enum.TextTruncate.AtEnd
     valueLabel.Parent = exp.Header
@@ -1839,7 +1839,7 @@ function Components.MultiDropdown(parent, theme, connMgr, opts)
             btn.Text = "   " .. text
             btn.TextXAlignment = Enum.TextXAlignment.Left
             btn.TextColor3 = Color3.fromRGB(255, 255, 255)
-            btn.Font = Enum.Font.Gotham
+            btn.Font = Enum.Font.BuilderSans
             btn.TextSize = 14
             btn.Parent = list
             Utils.AddCorner(btn, UDim.new(0, 6))
@@ -1852,7 +1852,7 @@ function Components.MultiDropdown(parent, theme, connMgr, opts)
             check.BackgroundTransparency = 1
             check.Text = "✓"
             check.TextColor3 = Color3.fromRGB(255, 255, 255)
-            check.Font = Enum.Font.GothamBold
+            check.Font = Enum.Font.BuilderSansBold
             check.TextSize = 16
             check.TextTransparency = selectedSet[text] and 0 or 1
             check.Parent = btn
@@ -1978,7 +1978,7 @@ function Components.ColorPicker(parent, theme, connMgr, opts)
     hexLabel.Text = Utils.ToHex(current())
     hexLabel.TextColor3 = Color3.fromRGB(190, 190, 200)
     hexLabel.TextXAlignment = Enum.TextXAlignment.Right
-    hexLabel.Font = Enum.Font.Gotham
+    hexLabel.Font = Enum.Font.BuilderSans
     hexLabel.TextSize = 14
     hexLabel.Parent = exp.Header
 
@@ -2112,7 +2112,7 @@ function Components.ColorPicker(parent, theme, connMgr, opts)
     hexRowLabel.BackgroundTransparency = 1
     hexRowLabel.Text = "HEX:"
     hexRowLabel.TextColor3 = Color3.fromRGB(200, 200, 210)
-    hexRowLabel.Font = Enum.Font.GothamBold
+    hexRowLabel.Font = Enum.Font.BuilderSansBold
     hexRowLabel.TextSize = 14
     hexRowLabel.TextXAlignment = Enum.TextXAlignment.Left
     hexRowLabel.Parent = hexRow
@@ -2123,7 +2123,7 @@ function Components.ColorPicker(parent, theme, connMgr, opts)
     hexBox.BackgroundColor3 = Color3.fromRGB(20, 20, 25)
     hexBox.Text = Utils.ToHex(current())
     hexBox.TextColor3 = Color3.fromRGB(255, 255, 255)
-    hexBox.Font = Enum.Font.Gotham
+    hexBox.Font = Enum.Font.BuilderSans
     hexBox.TextSize = 14
     hexBox.ClearTextOnFocus = false
     hexBox.Parent = hexRow
@@ -2185,7 +2185,7 @@ function Components.ColorPicker(parent, theme, connMgr, opts)
         lbl.BackgroundTransparency = 1
         lbl.Text = labelText
         lbl.TextColor3 = Color3.fromRGB(200, 200, 210)
-        lbl.Font = Enum.Font.GothamBold
+        lbl.Font = Enum.Font.BuilderSansBold
         lbl.TextSize = 14
         lbl.TextXAlignment = Enum.TextXAlignment.Left
         lbl.Parent = holder
@@ -2196,7 +2196,7 @@ function Components.ColorPicker(parent, theme, connMgr, opts)
         box.BackgroundColor3 = Color3.fromRGB(20, 20, 25)
         box.Text = "0"
         box.TextColor3 = Color3.fromRGB(255, 255, 255)
-        box.Font = Enum.Font.Gotham
+        box.Font = Enum.Font.BuilderSans
         box.TextSize = 14
         box.ClearTextOnFocus = false
         box.Parent = holder
@@ -2431,7 +2431,7 @@ function Components.ThemeGrid(parent, theme, connMgr, opts)
         check.BackgroundTransparency = 1
         check.Text = "✓"
         check.TextColor3 = Color3.fromRGB(255, 255, 255)
-        check.Font = Enum.Font.GothamBold
+        check.Font = Enum.Font.BuilderSansBold
         check.TextSize = 20
         check.TextTransparency = (index == selectedIndex) and 0 or 1
         check.ZIndex = 2
@@ -2488,7 +2488,7 @@ function Components.GradientPicker(parent, theme, connMgr, opts)
     toggleLabel.BackgroundTransparency = 1
     toggleLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
     toggleLabel.TextXAlignment = Enum.TextXAlignment.Left
-    toggleLabel.Font = Enum.Font.GothamBold
+    toggleLabel.Font = Enum.Font.BuilderSansBold
     toggleLabel.TextSize = 16
     toggleLabel.Parent = toggleFrame
 
@@ -2593,7 +2593,7 @@ function Components.GradientPicker(parent, theme, connMgr, opts)
         check.BackgroundTransparency = 1
         check.Text = "✓"
         check.TextColor3 = Color3.fromRGB(255, 255, 255)
-        check.Font = Enum.Font.GothamBold
+        check.Font = Enum.Font.BuilderSansBold
         check.TextSize = 20
         check.TextTransparency = 1
         check.ZIndex = 2
@@ -2659,7 +2659,7 @@ function Components.Keybind(parent, theme, connMgr, opts)
     label.Text = opts.Text or "Phím tắt"
     label.TextColor3 = Color3.fromRGB(255, 255, 255)
     label.TextXAlignment = Enum.TextXAlignment.Left
-    label.Font = Enum.Font.GothamBold
+    label.Font = Enum.Font.BuilderSansBold
     label.TextSize = 16
     label.Parent = frame
 
@@ -2668,7 +2668,7 @@ function Components.Keybind(parent, theme, connMgr, opts)
     keyBtn.Position = UDim2.new(1, -10, 0.5, 0)
     keyBtn.Size = UDim2.new(0, 90, 0, 28)
     keyBtn.AutoButtonColor = false
-    keyBtn.Font = Enum.Font.GothamBold
+    keyBtn.Font = Enum.Font.BuilderSansBold
     keyBtn.TextSize = 13
     keyBtn.TextTruncate = Enum.TextTruncate.AtEnd
     keyBtn.Parent = frame
@@ -2907,7 +2907,7 @@ function Components.TableList(parent, theme, connMgr, opts)
         headerLabel.BackgroundTransparency = 1
         headerLabel.Text = opts.Text
         headerLabel.TextXAlignment = Enum.TextXAlignment.Left
-        headerLabel.Font = Enum.Font.GothamBold
+        headerLabel.Font = Enum.Font.BuilderSansBold
         headerLabel.TextSize = 14
         headerLabel.Parent = container
     end
@@ -2929,7 +2929,7 @@ function Components.TableList(parent, theme, connMgr, opts)
     emptyLabel.BackgroundTransparency = 1
     emptyLabel.Text = opts.EmptyText or "Không có mục nào"
     emptyLabel.TextXAlignment = Enum.TextXAlignment.Left
-    emptyLabel.Font = Enum.Font.Gotham
+    emptyLabel.Font = Enum.Font.BuilderSans
     emptyLabel.TextSize = 13
     emptyLabel.Parent = scroller
     Utils.AddPadding(emptyLabel, UDim.new(0, 8))
@@ -2982,7 +2982,7 @@ function Components.TableList(parent, theme, connMgr, opts)
                 mark.BackgroundTransparency = 1
                 mark.Text = "✓"
                 mark.TextColor3 = Color3.fromRGB(255, 255, 255)
-                mark.Font = Enum.Font.GothamBold
+                mark.Font = Enum.Font.BuilderSansBold
                 mark.TextSize = 13
                 mark.TextTransparency = toggled and 0 or 1
                 mark.Parent = check
@@ -2994,7 +2994,7 @@ function Components.TableList(parent, theme, connMgr, opts)
             textLabel.BackgroundTransparency = 1
             textLabel.Text = item.Text or ""
             textLabel.TextXAlignment = Enum.TextXAlignment.Left
-            textLabel.Font = Enum.Font.Gotham
+            textLabel.Font = Enum.Font.BuilderSans
             textLabel.TextSize = 14
             textLabel.TextTruncate = Enum.TextTruncate.AtEnd
             textLabel.Parent = holder
@@ -3008,7 +3008,7 @@ function Components.TableList(parent, theme, connMgr, opts)
                 subLabel.BackgroundTransparency = 1
                 subLabel.Text = item.SubText
                 subLabel.TextXAlignment = Enum.TextXAlignment.Right
-                subLabel.Font = Enum.Font.Gotham
+                subLabel.Font = Enum.Font.BuilderSans
                 subLabel.TextSize = 13
                 subLabel.Parent = holder
             end
@@ -3089,7 +3089,7 @@ function Components.ProgressBar(parent, theme, connMgr, opts)
         label.Position = UDim2.new(0, 10, 0, 4)
         label.BackgroundTransparency = 1
         label.TextXAlignment = Enum.TextXAlignment.Left
-        label.Font = Enum.Font.GothamBold
+        label.Font = Enum.Font.BuilderSansBold
         label.TextSize = 14
         label.Parent = frame
     end
@@ -3165,7 +3165,7 @@ function Components.Tooltip(target, theme, connMgr, opts)
     bubble.Size = UDim2.new(0, 0, 0, 26)
     bubble.AutomaticSize = Enum.AutomaticSize.X
     bubble.Text = opts.Text or ""
-    bubble.Font = Enum.Font.Gotham
+    bubble.Font = Enum.Font.BuilderSans
     bubble.TextSize = 12
     bubble.TextColor3 = Color3.fromRGB(255, 255, 255)
     bubble.BackgroundTransparency = 1
@@ -3291,7 +3291,7 @@ function Components.SegmentedControl(parent, theme, connMgr, opts)
         b.LayoutOrder = i
         b.BackgroundTransparency = 1
         b.Text = text
-        b.Font = Enum.Font.GothamBold
+        b.Font = Enum.Font.BuilderSansBold
         b.TextSize = 13
         b.AutoButtonColor = false
         b.Parent = row
@@ -3367,7 +3367,7 @@ function Components.LogPanel(parent, theme, connMgr, opts)
         headerLabel.BackgroundTransparency = 1
         headerLabel.Text = opts.Text
         headerLabel.TextXAlignment = Enum.TextXAlignment.Left
-        headerLabel.Font = Enum.Font.GothamBold
+        headerLabel.Font = Enum.Font.BuilderSansBold
         headerLabel.TextSize = 13
         headerLabel.Parent = container
     end
@@ -3537,7 +3537,7 @@ function Components.Notification(parent, theme, connMgr, opts)
     icon.BackgroundTransparency = 1
     icon.Text = iconText
     icon.TextColor3 = accentColor
-    icon.Font = Enum.Font.GothamBold
+    icon.Font = Enum.Font.BuilderSansBold
     icon.TextSize = 14
     icon.Parent = iconHolder
 
@@ -3551,7 +3551,7 @@ function Components.Notification(parent, theme, connMgr, opts)
     titleLabel.TextXAlignment = Enum.TextXAlignment.Left
     titleLabel.TextYAlignment = Enum.TextYAlignment.Top
     titleLabel.TextWrapped = true
-    titleLabel.Font = Enum.Font.GothamBold
+    titleLabel.Font = Enum.Font.BuilderSansBold
     titleLabel.TextSize = 15
     titleLabel.Parent = headerRow
 
@@ -3567,7 +3567,7 @@ function Components.Notification(parent, theme, connMgr, opts)
     bodyLabel.TextXAlignment = Enum.TextXAlignment.Left
     bodyLabel.TextYAlignment = Enum.TextYAlignment.Top
     bodyLabel.TextWrapped = true
-    bodyLabel.Font = Enum.Font.Gotham
+    bodyLabel.Font = Enum.Font.BuilderSans
     bodyLabel.TextSize = 13
     bodyLabel.Parent = contentHolder
     Utils.AddPadding(bodyLabel, UDim.new(0, 38))
@@ -3584,7 +3584,7 @@ function Components.Notification(parent, theme, connMgr, opts)
         actionBtn.BackgroundColor3 = accentColor
         actionBtn.Text = opts.Button.Text or "OK"
         actionBtn.TextColor3 = Color3.fromRGB(255, 255, 255)
-        actionBtn.Font = Enum.Font.GothamBold
+        actionBtn.Font = Enum.Font.BuilderSansBold
         actionBtn.TextSize = 13
         actionBtn.AutoButtonColor = false
         actionBtn.Parent = contentHolder
@@ -3606,7 +3606,7 @@ function Components.Notification(parent, theme, connMgr, opts)
     closeBtn.BackgroundTransparency = 1
     closeBtn.Text = "×"
     closeBtn.TextColor3 = Color3.fromRGB(180, 180, 190)
-    closeBtn.Font = Enum.Font.GothamBold
+    closeBtn.Font = Enum.Font.BuilderSansBold
     closeBtn.TextSize = 13
     closeBtn.ZIndex = 2
     closeBtn.Parent = card
@@ -3625,7 +3625,7 @@ function Components.Notification(parent, theme, connMgr, opts)
         timerLabel.Text = tostring(math.ceil(duration))
         timerLabel.TextColor3 = Color3.fromRGB(160, 160, 170)
         timerLabel.TextXAlignment = Enum.TextXAlignment.Right
-        timerLabel.Font = Enum.Font.GothamBold
+        timerLabel.Font = Enum.Font.BuilderSansBold
         timerLabel.TextSize = 12
         timerLabel.ZIndex = 2
         timerLabel.Parent = card
@@ -4026,7 +4026,7 @@ function Window:_buildChrome(title, originalSize)
     titleLabel.Text = title
     titleLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
     titleLabel.TextXAlignment = Enum.TextXAlignment.Left
-    titleLabel.Font = Enum.Font.GothamBold
+    titleLabel.Font = Enum.Font.BuilderSansBold
     titleLabel.TextSize = 18
     titleLabel.Parent = titleBar
 
@@ -4040,7 +4040,7 @@ function Window:_buildChrome(title, originalSize)
         b.Text = text
         b.TextColor3 = Color3.fromRGB(255, 255, 255)
         b.TextSize = 18
-        b.Font = Enum.Font.GothamBold
+        b.Font = Enum.Font.BuilderSansBold
         b.Parent = titleBar
         Utils.AddCorner(b, UDim.new(0, 6))
         Animator.AddHoverEffect(b, connMgr, bgColor, hoverColor, true)
@@ -4175,7 +4175,7 @@ function Window:_buildLoadingScreen(title, mainFrame, mainScale, mainShadow)
     loadingTitle.Text = title
     loadingTitle.TextColor3 = Color3.fromRGB(255, 255, 255)
     loadingTitle.TextXAlignment = Enum.TextXAlignment.Left
-    loadingTitle.Font = Enum.Font.GothamBold
+    loadingTitle.Font = Enum.Font.BuilderSansBold
     loadingTitle.TextSize = 20
     loadingTitle.Parent = loading
 
@@ -4186,7 +4186,7 @@ function Window:_buildLoadingScreen(title, mainFrame, mainScale, mainShadow)
     loadingSubtitle.Text = "Đang khởi tạo..."
     loadingSubtitle.TextColor3 = Color3.fromRGB(180, 180, 190)
     loadingSubtitle.TextXAlignment = Enum.TextXAlignment.Left
-    loadingSubtitle.Font = Enum.Font.Gotham
+    loadingSubtitle.Font = Enum.Font.BuilderSans
     loadingSubtitle.TextSize = 13
     loadingSubtitle.Parent = loading
 
@@ -4332,7 +4332,7 @@ function Window:_setupResize(mainFrame, originalSize)
     handle.Text = "◢"
     handle.TextColor3 = Color3.fromRGB(150, 150, 165)
     handle.TextSize = 16
-    handle.Font = Enum.Font.GothamBold
+    handle.Font = Enum.Font.BuilderSansBold
     handle.ZIndex = 15
     handle.Active = true
     handle.Parent = mainFrame
@@ -4476,7 +4476,7 @@ function Window:CreateTab(name)
     btn.LayoutOrder = index
     btn.BackgroundColor3 = (index == 1) and theme.Accent or Utils.Darken(theme.Color, 0.82)
     btn.Text = name
-    btn.Font = Enum.Font.GothamBold
+    btn.Font = Enum.Font.BuilderSansBold
     btn.TextSize = 15
     btn.AutoButtonColor = false
     btn.Parent = self._tabContainer
@@ -4973,7 +4973,7 @@ function TabMeta:CreateSearchBar(opts)
     box.PlaceholderText = opts.Placeholder or "Tìm kiếm..."
     box.PlaceholderColor3 = Color3.fromRGB(150, 150, 160)
     box.TextColor3 = Color3.fromRGB(255, 255, 255)
-    box.Font = Enum.Font.Gotham
+    box.Font = Enum.Font.BuilderSans
     box.TextSize = 14
     box.ClearTextOnFocus = false
     box.TextXAlignment = Enum.TextXAlignment.Left
