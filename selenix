@@ -115,6 +115,7 @@ local Players = game:GetService("Players")
 local UserInputService = game:GetService("UserInputService")
 local ContentProvider = game:GetService("ContentProvider")
 local HttpService = game:GetService("HttpService")
+local GuiService = game:GetService("GuiService")
 local Player = Players.LocalPlayer
 
 local EASE = Enum.EasingStyle.Quint
@@ -575,9 +576,28 @@ end
 -- theme changes, instead of each component having to hand-roll its own
 -- "initialized" flag (which most of them previously didn't, causing a
 -- visible flash-then-tween on creation — see Components.* ApplyTheme below).
+--
+-- Returns an unsubscribe function. Most components never call it (they live
+-- and die with the whole Window, so the Theme itself goes away with them),
+-- but components with an explicit :Destroy() that can be torn down on their
+-- own — independent of the window — should call the returned function from
+-- Destroy() so a destroyed component's ApplyTheme closure stops firing on
+-- every future theme change.
 function Theme:Subscribe(fn)
-    table.insert(self._subscribers, fn)
+    local subscribers = self._subscribers
+    table.insert(subscribers, fn)
     fn(self.Color, self.Accent, true)
+    local unsubscribed = false
+    return function()
+        if unsubscribed then return end
+        unsubscribed = true
+        for i, f in ipairs(subscribers) do
+            if f == fn then
+                table.remove(subscribers, i)
+                break
+            end
+        end
+    end
 end
 
 function Theme:Apply(color, accent)
@@ -790,9 +810,14 @@ function Components.Slider(parent, theme, connMgr, opts)
     frame.Parent = parent
     Utils.AddCorner(frame, UDim.new(0, 8))
 
-    -- Row 1: label, full width.
+    -- Row 1: label on the left, value TextBox anchored top-right (same
+    -- row), so the box sits up next to the label instead of down by the
+    -- bar. BOX_WIDTH matches NumberStepper's box; label width is trimmed
+    -- so it never runs under the box.
+    local BOX_WIDTH = 60
+
     local label = Instance.new("TextLabel")
-    label.Size = UDim2.new(1, -20, 0, 20)
+    label.Size = UDim2.new(1, -(BOX_WIDTH + 30), 0, 20)
     label.Position = UDim2.new(0, 10, 0, 6)
     label.BackgroundTransparency = 1
     label.TextColor3 = Color3.fromRGB(255, 255, 255)
@@ -805,14 +830,11 @@ function Components.Slider(parent, theme, connMgr, opts)
     local function labelText() return (opts.Text or "Giá trị") .. ": " .. fmt(value) .. suffix end
     label.Text = labelText()
 
-    -- Row 2: drag bar + a TextBox for direct entry, side by side. Box is
-    -- anchored to the right (same 60px width as NumberStepper's box) and
-    -- the bar fills the remaining width to its left with a small gap.
+    -- Row 2: drag bar, full width now that the box moved up to row 1.
     local ROW2_Y = 40
-    local BOX_WIDTH = 60
 
     local bar = Instance.new("Frame")
-    bar.Size = UDim2.new(1, -(BOX_WIDTH + 20), 0, 4)
+    bar.Size = UDim2.new(1, -20, 0, 4)
     bar.Position = UDim2.new(0, 10, 0, ROW2_Y)
     bar.BorderSizePixel = 0
     bar.Parent = frame
@@ -835,9 +857,9 @@ function Components.Slider(parent, theme, connMgr, opts)
     Utils.AddCorner(drag, UDim.new(1, 0))
 
     local box = Instance.new("TextBox")
-    box.AnchorPoint = Vector2.new(1, 0.5)
-    box.Position = UDim2.new(1, -10, 0, ROW2_Y)
-    box.Size = UDim2.new(0, BOX_WIDTH, 0, 28)
+    box.AnchorPoint = Vector2.new(1, 0)
+    box.Position = UDim2.new(1, -10, 0, 4)
+    box.Size = UDim2.new(0, BOX_WIDTH, 0, 24)
     box.Text = fmt(value) .. suffix
     box.TextColor3 = Color3.fromRGB(255, 255, 255)
     box.Font = Enum.Font.Gotham
@@ -852,8 +874,8 @@ function Components.Slider(parent, theme, connMgr, opts)
     -- shrinks the font instead.
     box.TextScaled = true
     local boxSizeConstraint = Instance.new("UITextSizeConstraint")
-    boxSizeConstraint.MinTextSize = 9
-    boxSizeConstraint.MaxTextSize = 14
+    boxSizeConstraint.MinTextSize = 8
+    boxSizeConstraint.MaxTextSize = 12
     boxSizeConstraint.Parent = box
 
     -- Shared commit path for both the drag bar and the box, so dragging
@@ -1843,8 +1865,11 @@ function Components.Dropdown(parent, theme, connMgr, opts)
         rebuildOptions()
         valueLabel.Text = selected or NOT_SELECTED_TEXT
     end
+    local unsubscribeTheme
     function self:Destroy()
         rowConnMgr:DisconnectAll()
+        if unsubscribeTheme then unsubscribeTheme() end
+        exp.Container:Destroy()
     end
     function self:ApplyTheme(color, accent, isInitial)
         local panelBg, darkBg, headerTextColor, searchTextColor = Utils.PanelColors(color, accent)
@@ -1862,7 +1887,7 @@ function Components.Dropdown(parent, theme, connMgr, opts)
         end
         Animator.ApplyTheme(isInitial, entries)
     end
-    theme:Subscribe(function(c, a, initial) self:ApplyTheme(c, a, initial) end)
+    unsubscribeTheme = theme:Subscribe(function(c, a, initial) self:ApplyTheme(c, a, initial) end)
     return self
 end
 
@@ -2077,8 +2102,11 @@ function Components.MultiDropdown(parent, theme, connMgr, opts)
         valueLabel.Text = summaryText()
     end
     -- See Dropdown:Destroy above.
+    local unsubscribeTheme
     function self:Destroy()
         rowConnMgr:DisconnectAll()
+        if unsubscribeTheme then unsubscribeTheme() end
+        exp.Container:Destroy()
     end
     function self:ApplyTheme(color, accent, isInitial)
         local panelBg, darkBg, headerTextColor, searchTextColor = Utils.PanelColors(color, accent)
@@ -2096,7 +2124,7 @@ function Components.MultiDropdown(parent, theme, connMgr, opts)
         end
         Animator.ApplyTheme(isInitial, entries)
     end
-    theme:Subscribe(function(c, a, initial) self:ApplyTheme(c, a, initial) end)
+    unsubscribeTheme = theme:Subscribe(function(c, a, initial) self:ApplyTheme(c, a, initial) end)
     return self
 end
 
@@ -3190,7 +3218,12 @@ function Components.TableList(parent, theme, connMgr, opts)
         items = newItems or {}
         rebuild()
     end
-    function self:Destroy() rowConnMgr:DisconnectAll() end
+    local unsubscribeTheme
+    function self:Destroy()
+        rowConnMgr:DisconnectAll()
+        if unsubscribeTheme then unsubscribeTheme() end
+        container:Destroy()
+    end
     function self:ApplyTheme(color, accent, isInitial)
         local panelBg, _, textColor = Utils.PanelColors(color, accent)
         local darkBg = Utils.Darken(color, 0.75)
@@ -3211,7 +3244,7 @@ function Components.TableList(parent, theme, connMgr, opts)
         end
         Animator.ApplyTheme(isInitial, entries)
     end
-    theme:Subscribe(function(c, a, initial) self:ApplyTheme(c, a, initial) end)
+    unsubscribeTheme = theme:Subscribe(function(c, a, initial) self:ApplyTheme(c, a, initial) end)
     return self
 end
 
@@ -3913,6 +3946,24 @@ end
 -- a window configured larger than the screen never spawns off-screen or
 -- clipped. Used both for the initial Size and for re-fitting on a
 -- ViewportSize change (device rotation, window resize, etc).
+--
+-- workspace.CurrentCamera.ViewportSize is the RAW screen resolution,
+-- including the strip the Roblox topbar covers. With the default
+-- ScreenGui.IgnoreGuiInset = false, GUI coordinates already start below
+-- that strip, so every clamp/fit below was measuring against more space
+-- than actually exists inside the ScreenGui — off by the inset amount
+-- (worse on devices with a tall topbar or a notch), which is why the fit
+-- window size / drag clamp didn't line up with the real screen. GetGuiInset
+-- returns that top-left inset so it can be subtracted out here.
+local function getUsableViewportSize()
+    local viewport = workspace.CurrentCamera.ViewportSize
+    local ok, inset = pcall(function() return GuiService:GetGuiInset() end)
+    if ok and typeof(inset) == "Vector2" then
+        return viewport - inset
+    end
+    return viewport
+end
+
 local VIEWPORT_MARGIN = 40
 -- Shared with _setupResize's resize-drag clamp below so a window can never
 -- be fit smaller than the size the resize handle itself allows shrinking
@@ -3923,7 +3974,7 @@ local VIEWPORT_MARGIN = 40
 local MIN_WINDOW_W, MIN_WINDOW_H = 340, 260
 local MIN_FIT_W, MIN_FIT_H = MIN_WINDOW_W, MIN_WINDOW_H
 local function fitToViewport(size)
-    local viewport = workspace.CurrentCamera.ViewportSize
+    local viewport = getUsableViewportSize()
     local maxW = math.max(viewport.X - VIEWPORT_MARGIN, MIN_FIT_W)
     local maxH = math.max(viewport.Y - VIEWPORT_MARGIN, MIN_FIT_H)
     local w = math.min(size.X.Offset, maxW)
@@ -3938,7 +3989,7 @@ end
 -- resizing the game window) could end up stuck partly off-screen with no
 -- way to recover short of dragging it back manually.
 local function clampFramePosition(pos, size, anchor)
-    local viewport = workspace.CurrentCamera.ViewportSize
+    local viewport = getUsableViewportSize()
     local w, h = size.X.Offset, size.Y.Offset
 
     local scaleX = pos.X.Scale * viewport.X
@@ -4417,7 +4468,7 @@ function Window:_setupResize(mainFrame, originalSize)
     self._resizing = false
 
     local function maxSize()
-        local viewport = workspace.CurrentCamera.ViewportSize
+        local viewport = getUsableViewportSize()
         return math.max(viewport.X - VIEWPORT_MARGIN, MIN_WINDOW_W),
                math.max(viewport.Y - VIEWPORT_MARGIN, MIN_WINDOW_H)
     end
