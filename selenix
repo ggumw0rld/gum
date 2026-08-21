@@ -763,6 +763,12 @@ end
 -- values (e.g. 0.0-1.0 uniforms) instead of always rounding to whole
 -- numbers — previously `value = math.round(...)` made it impossible to
 -- drive a 0-1 float parameter from this control at all.
+--
+-- Layout: label sits on its own row at the top; the drag bar moved to a
+-- second row below it, with a small TextBox next to the bar so the value
+-- can be typed in directly instead of only ever being draggable (handy
+-- when the exact number matters, or dragging precisely is awkward on
+-- touch — same reasoning Components.NumberStepper exists for).
 function Components.Slider(parent, theme, connMgr, opts)
     -- Utils.ClampRange swaps a misconfigured Min > Max instead of erroring
     -- out / producing NaN positions, sizes, and drag values; Utils.MakeRounder
@@ -773,20 +779,25 @@ function Components.Slider(parent, theme, connMgr, opts)
 
     local value = roundTo(math.clamp(opts.Default or min, min, max))
     local suffix = opts.Suffix or "%"
+    local function escapePattern(s)
+        return (s:gsub("[%(%)%.%%%+%-%*%?%[%]%^%$]", "%%%1"))
+    end
+    local suffixPattern = escapePattern(suffix) .. "$"
 
     local frame = Instance.new("Frame")
-    frame.Size = opts.Size or UDim2.new(1, 0, 0, 40)
+    frame.Size = opts.Size or UDim2.new(1, 0, 0, 64)
     frame.LayoutOrder = opts.LayoutOrder or 0
     frame.Parent = parent
     Utils.AddCorner(frame, UDim.new(0, 8))
 
+    -- Row 1: label, full width.
     local label = Instance.new("TextLabel")
-    label.Size = UDim2.new(0.45, 0, 1, 0)
-    label.Position = UDim2.new(0, 10, 0, 0)
+    label.Size = UDim2.new(1, -20, 0, 20)
+    label.Position = UDim2.new(0, 10, 0, 6)
     label.BackgroundTransparency = 1
     label.TextColor3 = Color3.fromRGB(255, 255, 255)
     label.TextXAlignment = Enum.TextXAlignment.Left
-    label.TextTruncate = Enum.TextTruncate.AtEnd -- long opts.Text used to overflow into the bar/drag handle to its right
+    label.TextTruncate = Enum.TextTruncate.AtEnd -- long opts.Text used to overflow past the row
     label.Font = Enum.Font.GothamBold
     label.TextSize = 15
     label.Parent = frame
@@ -794,9 +805,15 @@ function Components.Slider(parent, theme, connMgr, opts)
     local function labelText() return (opts.Text or "Giá trị") .. ": " .. fmt(value) .. suffix end
     label.Text = labelText()
 
+    -- Row 2: drag bar + a TextBox for direct entry, side by side. Box is
+    -- anchored to the right (same 60px width as NumberStepper's box) and
+    -- the bar fills the remaining width to its left with a small gap.
+    local ROW2_Y = 40
+    local BOX_WIDTH = 60
+
     local bar = Instance.new("Frame")
-    bar.Size = UDim2.new(0.35, 0, 0, 4)
-    bar.Position = UDim2.new(0.58, 0, 0, 18)
+    bar.Size = UDim2.new(1, -(BOX_WIDTH + 20), 0, 4)
+    bar.Position = UDim2.new(0, 10, 0, ROW2_Y)
     bar.BorderSizePixel = 0
     bar.Parent = frame
     Utils.AddCorner(bar, UDim.new(1, 0))
@@ -817,16 +834,48 @@ function Components.Slider(parent, theme, connMgr, opts)
     drag.Parent = bar
     Utils.AddCorner(drag, UDim.new(1, 0))
 
-    local dragging = false
-    local function update(inputPos)
-        local absPos, absSize = bar.AbsolutePosition, bar.AbsoluteSize
-        local alpha = math.clamp((inputPos.X - absPos.X) / absSize.X, 0, 1)
-        value = roundTo(min + alpha * range)
-        alpha = (value - min) / range
+    local box = Instance.new("TextBox")
+    box.AnchorPoint = Vector2.new(1, 0.5)
+    box.Position = UDim2.new(1, -10, 0, ROW2_Y)
+    box.Size = UDim2.new(0, BOX_WIDTH, 0, 28)
+    box.Text = fmt(value) .. suffix
+    box.TextColor3 = Color3.fromRGB(255, 255, 255)
+    box.Font = Enum.Font.Gotham
+    box.TextSize = 14
+    box.ClearTextOnFocus = false
+    box.Parent = frame
+    Utils.AddCorner(box, UDim.new(0, 6))
+    -- Same fix as Components.NumberStepper: a TextBox silently clips text
+    -- that doesn't fit its width instead of showing an ellipsis, so a
+    -- longer opts.Suffix (or a large value with several Decimals) could
+    -- lose characters with no indication. TextScaled + a size constraint
+    -- shrinks the font instead.
+    box.TextScaled = true
+    local boxSizeConstraint = Instance.new("UITextSizeConstraint")
+    boxSizeConstraint.MinTextSize = 9
+    boxSizeConstraint.MaxTextSize = 14
+    boxSizeConstraint.Parent = box
+
+    -- Shared commit path for both the drag bar and the box, so dragging
+    -- and typing can never disagree about what "the value" is. Skips the
+    -- box's own Text write while it's focused (mid-typing) so the user's
+    -- in-progress keystrokes aren't clobbered by a drag happening
+    -- elsewhere, or by this same commit re-writing what they're typing.
+    local function commit(newValue)
+        value = roundTo(math.clamp(newValue, min, max))
+        local alpha = (value - min) / range
         label.Text = labelText()
         fill.Size = UDim2.new(alpha, 0, 1, 0)
         drag.Position = UDim2.new(alpha, 0, 0.5, 0)
+        if not box:IsFocused() then box.Text = fmt(value) .. suffix end
         if opts.Callback then opts.Callback(value) end
+    end
+
+    local dragging = false
+    local function updateFromDrag(inputPos)
+        local absPos, absSize = bar.AbsolutePosition, bar.AbsoluteSize
+        local alpha = math.clamp((inputPos.X - absPos.X) / absSize.X, 0, 1)
+        commit(min + alpha * range)
     end
 
     connMgr:Track(drag.InputBegan:Connect(function(input)
@@ -837,7 +886,7 @@ function Components.Slider(parent, theme, connMgr, opts)
     connMgr:Track(bar.InputBegan:Connect(function(input)
         if Utils.IsPointerDown(input) then
             dragging = true
-            update(input.Position)
+            updateFromDrag(input.Position)
         end
     end))
     connMgr:Track(UserInputService.InputEnded:Connect(function(input)
@@ -847,28 +896,29 @@ function Components.Slider(parent, theme, connMgr, opts)
     end))
     connMgr:Track(UserInputService.InputChanged:Connect(function(input)
         if dragging and Utils.IsPointerMove(input) then
-            update(input.Position)
+            updateFromDrag(input.Position)
         end
+    end))
+
+    connMgr:Track(box.FocusLost:Connect(function()
+        local numStr = box.Text:gsub(suffixPattern, ""):gsub("[^%d%.%-]", "")
+        local n = tonumber(numStr)
+        if n then commit(n) else box.Text = fmt(value) .. suffix end
     end))
 
     local self = { Instance = frame }
     function self:Get() return value end
     -- Programmatically set the value (used by Window:LoadConfig). Clamps
     -- to [min, max] and rounds to the same precision as manual dragging,
-    -- then updates the visuals/label the same way update() does, and fires
-    -- opts.Callback so consumer code stays in sync.
+    -- then updates the visuals/label/box the same way commit() does, and
+    -- fires opts.Callback so consumer code stays in sync.
     function self:Set(v)
         v = roundTo(math.clamp(v, min, max))
         if v == value then return end
-        value = v
-        local alpha = (value - min) / range
-        label.Text = labelText()
-        fill.Size = UDim2.new(alpha, 0, 1, 0)
-        drag.Position = UDim2.new(alpha, 0, 0.5, 0)
-        if opts.Callback then opts.Callback(value) end
+        commit(v)
     end
     function self:ApplyTheme(color, accent, isInitial)
-        local panelBg, darkBg, textColor = Utils.PanelColors(color, accent)
+        local panelBg, darkBg, textColor, boxTextColor = Utils.PanelColors(color, accent)
         -- The drag handle is 20px tall against a 4px bar, so most of its
         -- visible area actually sits over the panel background rather than
         -- the thin track/fill strip beneath it — same contrast-safe color
@@ -880,6 +930,7 @@ function Components.Slider(parent, theme, connMgr, opts)
             { bar, { BackgroundColor3 = darkBg } },
             { fill, { BackgroundColor3 = accent } },
             { drag, { BackgroundColor3 = textColor } },
+            { box, { BackgroundColor3 = darkBg, TextColor3 = boxTextColor } },
         })
     end
     theme:Subscribe(function(c, a, initial) self:ApplyTheme(c, a, initial) end)
