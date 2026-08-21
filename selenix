@@ -1692,7 +1692,12 @@ function Components.Dropdown(parent, theme, connMgr, opts)
     valueLabel.Position = UDim2.new(1, -35, 0.5, 0)
     valueLabel.Size = UDim2.new(0, 110, 1, 0)
     valueLabel.BackgroundTransparency = 1
-    valueLabel.Text = selected or ""
+    -- CHANGE: same empty-state text as MultiDropdown's summaryText() —
+    -- previously this fell back to "" when nothing was selected, so an
+    -- unselected Dropdown just showed a blank value slot instead of an
+    -- explicit "not selected" state like its MultiDropdown sibling.
+    local NOT_SELECTED_TEXT = "Chưa chọn"
+    valueLabel.Text = selected or NOT_SELECTED_TEXT
     valueLabel.TextColor3 = Color3.fromRGB(190, 190, 200)
     valueLabel.TextXAlignment = Enum.TextXAlignment.Right
     valueLabel.Font = Enum.Font.Gotham
@@ -1721,7 +1726,7 @@ function Components.Dropdown(parent, theme, connMgr, opts)
 
     local function select(text)
         selected = text
-        valueLabel.Text = text or ""
+        valueLabel.Text = text or NOT_SELECTED_TEXT
         for _, row in ipairs(optionButtons) do
             local isSel = (row.text == text)
             TweenService:Create(row.btn, TweenInfo.new(0.25, EASE, EASE_OUT), {
@@ -1836,7 +1841,7 @@ function Components.Dropdown(parent, theme, connMgr, opts)
         end
         exp.SetBodyHeight(bodyHeightFor(#options))
         rebuildOptions()
-        valueLabel.Text = selected or ""
+        valueLabel.Text = selected or NOT_SELECTED_TEXT
     end
     function self:Destroy()
         rowConnMgr:DisconnectAll()
@@ -4176,12 +4181,17 @@ function Window:_buildChrome(title, originalSize)
         -- transparency. The result was indistinguishable from plain black,
         -- which is why the color change wasn't visible.
         --
-        -- Blending the ACCENT color toward black with :Lerp instead fixes
-        -- both problems: accent is almost always more saturated/brighter
-        -- than the near-black background (it's the theme's "signature"
-        -- color), and Lerp keeps a genuine fraction of that hue rather than
-        -- scaling small numbers down to smaller numbers.
-        local shadowColor = accent:Lerp(Color3.new(0, 0, 0), 0.6)
+        -- CHANGE: shadow now follows the BACKGROUND color (theme.Color)
+        -- instead of accent — tying the shadow to accent meant every
+        -- window's shadow tinted itself to whatever accent was picked
+        -- (often clashing/too saturated for a shadow), instead of quietly
+        -- matching the window's own base color the way a real drop shadow
+        -- would. Same near-black-background problem as the old flat-black
+        -- attempt applies here too, so we still Brighten(color) first to
+        -- pull the hue up out of the near-black range before Lerp'ing back
+        -- down toward black — that keeps the shadow visibly tinted by the
+        -- background's hue instead of collapsing to plain black.
+        local shadowColor = Utils.Brighten(color, 1.4):Lerp(Color3.new(0, 0, 0), 0.55)
 
         -- Only Color is themed here, not Transparency: Transparency is
         -- driven separately by the loading-screen fade-in
