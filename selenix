@@ -4100,13 +4100,30 @@ function Window:_buildChrome(title, originalSize)
         -- Shadow color used to be a flat Color3.fromRGB(0, 0, 0) regardless
         -- of theme — every other outline/background in the chrome (stroke,
         -- titleBar, tabContainer) tracks the live theme, but the shadow sat
-        -- there fixed black no matter what color/accent was picked. Only
-        -- Color is themed here, not Transparency: Transparency is driven
-        -- separately by the loading-screen fade-in (_buildLoadingScreen)
-        -- and the Destroy() fade-out, and folding it into this isInitial
-        -- snap/tween would fight those sequences (e.g. popping the shadow
-        -- instantly visible before loading finishes).
-        local shadowColor = Utils.Darken(color, 0.35)
+        -- there fixed black no matter what color/accent was picked.
+        --
+        -- FIX: the first attempt at this used Utils.Darken(color, 0.35) —
+        -- a straight R/G/B *multiply*. theme.Color (the background) is
+        -- itself already near-black for most themes here (e.g. the default
+        -- (30,30,35)), so multiplying it by 0.35 drove it down to roughly
+        -- (10,10,12) no matter which theme was picked — the hue difference
+        -- between themes gets lost entirely at that point, and what little
+        -- remains is further hidden by the shadow's own blur + partial
+        -- transparency. The result was indistinguishable from plain black,
+        -- which is why the color change wasn't visible.
+        --
+        -- Blending the ACCENT color toward black with :Lerp instead fixes
+        -- both problems: accent is almost always more saturated/brighter
+        -- than the near-black background (it's the theme's "signature"
+        -- color), and Lerp keeps a genuine fraction of that hue rather than
+        -- scaling small numbers down to smaller numbers.
+        local shadowColor = accent:Lerp(Color3.new(0, 0, 0), 0.6)
+
+        -- Only Color is themed here, not Transparency: Transparency is
+        -- driven separately by the loading-screen fade-in
+        -- (_buildLoadingScreen) and the Destroy() fade-out, and folding it
+        -- into this isInitial snap/tween would fight those sequences (e.g.
+        -- popping the shadow instantly visible before loading finishes).
 
         Animator.ApplyTheme(isInitial, {
             { mainFrame, { BackgroundColor3 = color } },
