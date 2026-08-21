@@ -1766,10 +1766,23 @@ function Components.Dropdown(parent, theme, connMgr, opts)
                 TweenService:Create(btn, TweenInfo.new(0.18, EASE, EASE_OUT), { BackgroundColor3 = baseColorFor(text) }):Play()
             end))
 
-            -- SỬA: logic click có điều kiện AllowDeselect
+            -- FIX: this used to be `select(text == selected and nil or text)`
+            -- — the classic Lua `cond and nil or fallback` trap. When
+            -- `text == selected` is true, `true and nil` evaluates to nil,
+            -- and since nil is falsy, Lua's `or` falls through and
+            -- evaluates the right side anyway — so the whole expression
+            -- always resolved to `text`, NEVER `nil`. select(nil) was
+            -- consequently unreachable: clicking the already-selected
+            -- option just re-selected itself (a visible no-op), so
+            -- deselect silently never fired no matter how AllowDeselect
+            -- was set. Explicit if/else avoids the trap.
             rowConnMgr:Track(btn.MouseButton1Click:Connect(function()
                 if allowDeselect then
-                    select(text == selected and nil or text)
+                    if text == selected then
+                        select(nil)
+                    else
+                        select(text)
+                    end
                 else
                     if text ~= selected then select(text) end
                 end
